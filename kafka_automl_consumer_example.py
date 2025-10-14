@@ -43,32 +43,6 @@ MAIN_AUTOML_URL = f"http://localhost:{AUTOML_PORT}"
 AUTOML_TABULAR_URL = f"{MAIN_AUTOML_URL}/automl_tabular/best_model"
 
 
-def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_path: str, 
-                       model_type: str, framework: str = "sklearn", accuracy: float = None) -> dict:
-    """
-    Upload trained model to Data Warehouse
-    This will automatically trigger an automl-events message
-    Version is auto-incremented by the DW
-    """
-    url = f"{API_BASE}/ai-models/upload/single/{user_id}"
-
-    with open(model_file_path, 'rb') as f:
-        files = {'file': (os.path.basename(model_file_path), f)}
-        data = {
-            'model_id': model_id,
-            'name': f"AutoML Model - {model_id}",
-            'description': f"AutoML trained model for {model_type}",
-            'framework': framework,
-            'model_type': model_type,
-            'training_dataset': dataset_id,  # Link to dataset
-            'training_accuracy': accuracy,
-        }
-
-        r = requests.post(url, files=files, data=data, timeout=120)
-        r.raise_for_status()
-        return r.json()
-
-
 async def process_automl_trigger(event: dict) -> None:
     """
     Process an AutoML trigger event from Agentic Core
@@ -118,43 +92,6 @@ async def process_automl_trigger(event: dict) -> None:
         else:
             logger.error("Task category does not exist")
             return
-
-    #     # generate model id
-    #     model_id = f"automl_{dataset_id}_{int(datetime.utcnow().timestamp())}"
-    #
-    #     # Use dummy model.pkl file for testing
-    #     dummy_model_path = "model.pkl"
-    #
-    #     if not os.path.exists(dummy_model_path):
-    #         logger.warning(f"Dummy model file not found: {dummy_model_path}")
-    #         logger.info("Skipping model upload - create a dummy model.pkl file in the root directory to test")
-    #         return
-    #
-    #     # Upload the trained model to DW
-    #     try:
-    #         logger.info(f"Uploading model to DW: {model_id}")
-    #         result = upload_model_to_dw(
-    #             user_id=user_id,
-    #             model_id=model_id,
-    #             dataset_id=dataset_id,
-    #             model_file_path=dummy_model_path,
-    #             model_type=task_type,
-    #             framework="sklearn",
-    #             accuracy=0.92  # Dummy accuracy for testing
-    #         )
-    #         logger.info(f"✅ Model uploaded to DW successfully!")
-    #         logger.info(f"   Model ID: {model_id}")
-    #         logger.info(f"   Response: {json.dumps(result, indent=2, default=str)}")
-    #         logger.info("   AutoML event will be automatically sent by the DW")
-    #     except Exception as e:
-    #         logger.error(f"Failed to upload model to DW: {e}", exc_info=True)
-    #         return
-    #
-    #     logger.info(f"AutoML processing completed for dataset {dataset_id}")
-    #
-    # except Exception as e:
-    #     logger.error(f"Error processing AutoML trigger event: {e}", exc_info=True)
-    #
 
 async def run_consumer() -> None:
     """Main consumer loop"""
