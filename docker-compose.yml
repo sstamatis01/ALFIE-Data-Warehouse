@@ -126,6 +126,7 @@ services:
     volumes:
       - ./app:/app/app:ro
 
+
 volumes:
   mongodb_data:
   minio_data:
