@@ -20,6 +20,16 @@ PyObjectId = Annotated[
 ]
 
 
+class DatasetFile(BaseModel):
+    """Represents a single file within a dataset folder"""
+    filename: str = Field(..., description="Original filename")
+    file_path: str = Field(..., description="Path in MinIO storage")
+    file_size: int = Field(..., description="File size in bytes")
+    file_type: str = Field(..., description="File extension")
+    file_hash: str = Field(..., description="MD5 hash of the file")
+    content_type: Optional[str] = Field(None, description="MIME type of the file")
+
+
 class DatasetMetadata(BaseModel):
     id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
     dataset_id: str = Field(..., description="Unique dataset identifier")
@@ -27,15 +37,21 @@ class DatasetMetadata(BaseModel):
     name: str = Field(..., description="Dataset name")
     description: Optional[str] = Field(None, description="Dataset description")
     version: str = Field(default="v1", description="Dataset version")
-    file_type: str = Field(..., description="Type of file (csv, xlsx, json, etc.)")
-    file_size: int = Field(..., description="File size in bytes")
-    file_path: str = Field(..., description="Path in MinIO storage")
+    
+    # Single file metadata (for backward compatibility)
+    file_type: str = Field(..., description="Type of file (csv, xlsx, json, folder, etc.)")
+    file_size: int = Field(..., description="Total file size in bytes")
+    file_path: str = Field(..., description="Path in MinIO storage (single file or folder)")
     original_filename: str = Field(..., description="Original filename when uploaded")
     
-    # Metadata extracted from file content
-    columns: Optional[List[str]] = Field(None, description="Column names for structured data")
-    row_count: Optional[int] = Field(None, description="Number of rows for structured data")
-    data_types: Optional[Dict[str, str]] = Field(None, description="Data types for each column")
+    # Multiple files support (for folder uploads)
+    files: Optional[List[DatasetFile]] = Field(None, description="List of files (for folder uploads)")
+    is_folder: bool = Field(default=False, description="Whether this is a folder upload")
+    
+    # Metadata extracted from file content (single file only)
+    columns: Optional[List[str]] = Field(None, description="Column names for structured data (single file)")
+    row_count: Optional[int] = Field(None, description="Number of rows for structured data (single file)")
+    data_types: Optional[Dict[str, str]] = Field(None, description="Data types for each column (single file)")
     
     # Additional metadata
     tags: List[str] = Field(default_factory=list, description="Tags for categorization")
@@ -80,6 +96,8 @@ class DatasetResponse(BaseModel):
     file_type: str
     file_size: int
     original_filename: str
+    files: Optional[List[DatasetFile]] = None
+    is_folder: bool = False
     columns: Optional[List[str]]
     row_count: Optional[int]
     data_types: Optional[Dict[str, str]]

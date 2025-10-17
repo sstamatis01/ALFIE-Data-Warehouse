@@ -18,6 +18,8 @@ class BiasReportCreate(BaseModel):
     report: Any
     target_column_name: Optional[str] = None
     task_type: Optional[str] = None
+    is_folder: Optional[bool] = False
+    file_count: Optional[int] = 1
 
 
 class BiasReportResponse(BaseModel):

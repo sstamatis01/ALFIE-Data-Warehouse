@@ -71,6 +71,8 @@ class AIModelMetadata(BaseModel):
     # Model files
     files: List[ModelFile] = Field(default_factory=list, description="List of model files")
     primary_file_path: Optional[str] = Field(None, description="Path to the primary model file")
+    is_model_folder: bool = Field(default=False, description="Whether this is a folder upload (multiple files)")
+    model_file_count: int = Field(default=1, description="Number of model files")
     
     # Model metadata
     input_shape: Optional[List[int]] = Field(None, description="Expected input shape")
