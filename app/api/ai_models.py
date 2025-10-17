@@ -16,6 +16,34 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ai-models", tags=["AI Models"])
 
 
+async def _get_dataset_folder_info(user_id: str, dataset_id: str) -> tuple:
+    """
+    Get is_folder and file_count from dataset metadata
+    
+    Returns:
+        Tuple of (is_folder, file_count)
+    """
+    if not dataset_id:
+        return False, 1
+    
+    try:
+        db = get_database()
+        dataset = await db.datasets.find_one({
+            "user_id": user_id,
+            "dataset_id": dataset_id
+        }, sort=[("created_at", -1)])  # Get latest version
+        
+        if dataset:
+            is_folder = dataset.get("is_folder", False)
+            file_count = dataset.get("custom_metadata", {}).get("file_count", 1) if is_folder else 1
+            return is_folder, file_count
+        
+        return False, 1
+    except Exception as e:
+        logger.warning(f"Could not fetch dataset folder info: {e}")
+        return False, 1
+
+
 async def _get_next_model_version(user_id: str, model_id: str) -> str:
     """
     Auto-detect the next version number for a model.
@@ -127,6 +155,8 @@ async def upload_single_model_file(
             algorithm=algorithm,
             files=[model_file],
             primary_file_path=file_path if is_primary else None,
+            is_model_folder=False,
+            model_file_count=1,
             model_size_mb=model_size_mb,
             training_dataset=training_dataset,
             training_accuracy=training_accuracy,
@@ -148,6 +178,9 @@ async def upload_single_model_file(
         
         # Send Kafka AutoML event (non-blocking)
         try:
+            # Get dataset folder info if training_dataset is provided
+            is_folder, file_count = await _get_dataset_folder_info(user_id, model_metadata.training_dataset)
+            
             await kafka_producer_service.send_automl_event(
                 user_id=user_id,
                 model_id=model_id,
@@ -159,7 +192,11 @@ async def upload_single_model_file(
                 model_size_mb=model_size_mb,
                 training_accuracy=training_accuracy,
                 validation_accuracy=validation_accuracy,
-                test_accuracy=test_accuracy
+                test_accuracy=test_accuracy,
+                is_folder=is_folder,
+                file_count=file_count,
+                is_model_folder=model_metadata.is_model_folder,
+                model_file_count=model_metadata.model_file_count
             )
         except Exception as e:
             logger.warning(f"Failed to send AutoML Kafka event: {e}")
@@ -244,6 +281,8 @@ async def upload_model_folder(
             algorithm=algorithm,
             files=model_files,
             primary_file_path=primary_file.file_path if primary_file else None,
+            is_model_folder=True,
+            model_file_count=len(model_files),
             model_size_mb=model_size_mb,
             training_dataset=training_dataset,
             training_accuracy=training_accuracy,
@@ -265,6 +304,9 @@ async def upload_model_folder(
         
         # Send Kafka AutoML event (non-blocking)
         try:
+            # Get dataset folder info if training_dataset is provided
+            is_folder, file_count = await _get_dataset_folder_info(user_id, model_metadata.training_dataset)
+            
             await kafka_producer_service.send_automl_event(
                 user_id=user_id,
                 model_id=model_id,
@@ -276,7 +318,11 @@ async def upload_model_folder(
                 model_size_mb=model_size_mb,
                 training_accuracy=training_accuracy,
                 validation_accuracy=validation_accuracy,
-                test_accuracy=test_accuracy
+                test_accuracy=test_accuracy,
+                is_folder=is_folder,
+                file_count=file_count,
+                is_model_folder=model_metadata.is_model_folder,
+                model_file_count=model_metadata.model_file_count
             )
         except Exception as e:
             logger.warning(f"Failed to send AutoML Kafka event: {e}")

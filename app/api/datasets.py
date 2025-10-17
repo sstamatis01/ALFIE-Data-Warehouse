@@ -1,8 +1,9 @@
 from typing import List, Optional
+from datetime import datetime
 from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, Query, Form
 from fastapi.responses import StreamingResponse
 from io import BytesIO
-from ..models.dataset import DatasetCreate, DatasetUpdate, DatasetResponse, DatasetMetadata
+from ..models.dataset import DatasetCreate, DatasetUpdate, DatasetResponse, DatasetMetadata, DatasetFile
 from ..services.file_service import file_service
 from ..services.metadata_service import metadata_service
 from ..services.kafka_service import kafka_producer_service
@@ -148,6 +149,96 @@ async def upload_dataset(
     except Exception as e:
         logger.error(f"Error uploading dataset: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload dataset")
+
+
+@router.post("/upload/folder/{user_id}", response_model=DatasetResponse)
+async def upload_dataset_folder(
+    user_id: str,
+    zip_file: UploadFile = File(...),
+    dataset_id: str = Form(...),
+    name: str = Form(...),
+    description: Optional[str] = Form(None),
+    preserve_structure: bool = Form(True),
+    tags: Optional[str] = Form(None)
+):
+    """
+    Upload a folder of dataset files (as zip)
+    
+    For folder uploads:
+    - Auto-detects next version
+    - Extracts and uploads all files
+    - Simplified metadata (no column/row analysis)
+    - Lists all files with sizes and types
+    """
+    try:
+        if not zip_file.filename or not zip_file.filename.endswith('.zip'):
+            raise HTTPException(status_code=400, detail="File must be a ZIP archive")
+        
+        tag_list = []
+        if tags:
+            tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+        
+        # Auto-detect next version
+        version = await _get_next_dataset_version(user_id, dataset_id)
+        logger.info(f"Auto-detected version: {version} for dataset folder {dataset_id}")
+        
+        # Upload folder to MinIO
+        dataset_files, total_size = await file_service.upload_dataset_folder(
+            zip_file=zip_file,
+            user_id=user_id,
+            dataset_id=dataset_id,
+            version=version,
+            preserve_structure=preserve_structure
+        )
+        
+        if not dataset_files:
+            raise HTTPException(status_code=400, detail="No valid files found in ZIP")
+        
+        # Simplified metadata for folder
+        file_types = list(set([f.file_type for f in dataset_files]))
+        folder_path = f"datasets/{user_id}/{dataset_id}/{version}/"
+        
+        dataset_metadata = DatasetMetadata(
+            dataset_id=dataset_id,
+            user_id=user_id,
+            name=name,
+            description=description,
+            version=version,
+            file_type=", ".join(file_types),
+            file_size=total_size,
+            file_path=folder_path,
+            original_filename=zip_file.filename,
+            files=dataset_files,
+            is_folder=True,
+            columns=None,
+            row_count=None,
+            data_types=None,
+            tags=tag_list,
+            custom_metadata={"file_count": len(dataset_files), "preserve_structure": preserve_structure},
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+            file_hash=None
+        )
+        
+        from ..core.database import get_database
+        db = get_database()
+        result = await db.datasets.insert_one(dataset_metadata.dict(by_alias=True, exclude={'id'}))
+        created_dataset = await db.datasets.find_one({"_id": result.inserted_id})
+        
+        logger.info(f"Dataset folder uploaded: {dataset_id} ({len(dataset_files)} files)")
+        
+        try:
+            await kafka_producer_service.send_dataset_uploaded_event(DatasetMetadata(**created_dataset))
+        except Exception as kafka_error:
+            logger.warning(f"Failed to send Kafka event: {kafka_error}")
+        
+        return DatasetResponse(**created_dataset)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading dataset folder: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload dataset folder")
 
 
 @router.get("/search/{user_id}", response_model=List[DatasetResponse])
@@ -304,12 +395,19 @@ async def delete_dataset(user_id: str, dataset_id: str):
     files_failed = 0
     for dataset in datasets:
         try:
-            if await file_service.delete_file(dataset.file_path):
-                files_deleted += 1
+            if dataset.is_folder:
+                # Delete all files in folder
+                deleted_count = await file_service.delete_folder_files(dataset.file_path)
+                files_deleted += deleted_count
+                logger.info(f"Deleted {deleted_count} files from folder: {dataset.file_path}")
             else:
-                files_failed += 1
+                # Delete single file
+                if await file_service.delete_file(dataset.file_path):
+                    files_deleted += 1
+                else:
+                    files_failed += 1
         except Exception as e:
-            logger.warning(f"Failed to delete file {dataset.file_path}: {e}")
+            logger.warning(f"Failed to delete files for {dataset.file_path}: {e}")
             files_failed += 1
     
     # Delete all metadata from MongoDB
@@ -327,45 +425,169 @@ async def delete_dataset(user_id: str, dataset_id: str):
 
 
 @router.get("/{user_id}/{dataset_id}/download")
-async def download_dataset(user_id: str, dataset_id: str):
-    """Download latest dataset file"""
+async def download_dataset(
+    user_id: str, 
+    dataset_id: str,
+    filename: Optional[str] = Query(None, description="Specific filename to download (for folders)")
+):
+    """
+    Download latest dataset file or folder
+    
+    - For single files: downloads the file
+    - For folders without filename: downloads all files as ZIP
+    - For folders with filename: downloads specific file from folder
+    """
     # Get latest dataset metadata
     dataset = await metadata_service.get_latest_dataset(dataset_id, user_id)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
     
-    # Download file from MinIO
-    file_data = await file_service.download_file(dataset.file_path)
-    
-    # Return file as streaming response
-    return StreamingResponse(
-        BytesIO(file_data),
-        media_type='application/octet-stream',
-        headers={
-            "Content-Disposition": f"attachment; filename={dataset.original_filename}"
-        }
-    )
+    # Handle folder downloads
+    if dataset.is_folder:
+        if filename:
+            # Download specific file from folder
+            dataset_files = dataset.files or []
+            target_file = None
+            
+            for file_info in dataset_files:
+                if file_info.filename == filename:
+                    target_file = file_info
+                    break
+            
+            if not target_file:
+                raise HTTPException(status_code=404, detail=f"File '{filename}' not found in dataset")
+            
+            file_data = await file_service.download_file(target_file.file_path)
+            
+            return StreamingResponse(
+                BytesIO(file_data),
+                media_type='application/octet-stream',
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
+        else:
+            # Download all files as ZIP
+            zip_data = await file_service.download_folder_as_zip(dataset.file_path)
+            
+            return StreamingResponse(
+                BytesIO(zip_data),
+                media_type='application/zip',
+                headers={"Content-Disposition": f"attachment; filename={dataset_id}_{dataset.version}.zip"}
+            )
+    else:
+        # Single file download
+        file_data = await file_service.download_file(dataset.file_path)
+        
+        return StreamingResponse(
+            BytesIO(file_data),
+            media_type='application/octet-stream',
+            headers={"Content-Disposition": f"attachment; filename={dataset.original_filename}"}
+        )
 
 
 @router.get("/{user_id}/{dataset_id}/version/{version}/download")
-async def download_dataset_by_version(user_id: str, dataset_id: str, version: str):
-    """Download a specific version of a dataset file"""
+async def download_dataset_by_version(
+    user_id: str, 
+    dataset_id: str, 
+    version: str,
+    filename: Optional[str] = Query(None, description="Specific filename to download (for folders)")
+):
+    """
+    Download a specific version of a dataset file or folder
+    
+    - For single files: downloads the file
+    - For folders without filename: downloads all files as ZIP
+    - For folders with filename: downloads specific file from folder
+    """
     # Get dataset metadata for the specific version
     dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset version not found")
     
-    # Download file from MinIO
-    file_data = await file_service.download_file(dataset.file_path)
+    # Handle folder downloads
+    if dataset.is_folder:
+        if filename:
+            # Download specific file from folder
+            dataset_files = dataset.files or []
+            target_file = None
+            
+            for file_info in dataset_files:
+                if file_info.filename == filename:
+                    target_file = file_info
+                    break
+            
+            if not target_file:
+                raise HTTPException(status_code=404, detail=f"File '{filename}' not found in dataset")
+            
+            file_data = await file_service.download_file(target_file.file_path)
+            
+            return StreamingResponse(
+                BytesIO(file_data),
+                media_type='application/octet-stream',
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
+        else:
+            # Download all files as ZIP
+            zip_data = await file_service.download_folder_as_zip(dataset.file_path)
+            
+            return StreamingResponse(
+                BytesIO(zip_data),
+                media_type='application/zip',
+                headers={"Content-Disposition": f"attachment; filename={dataset_id}_{version}.zip"}
+            )
+    else:
+        # Single file download
+        file_data = await file_service.download_file(dataset.file_path)
+        
+        return StreamingResponse(
+            BytesIO(file_data),
+            media_type='application/octet-stream',
+            headers={"Content-Disposition": f"attachment; filename={dataset.original_filename}"}
+        )
+
+
+@router.get("/{user_id}/{dataset_id}/files", response_model=List[DatasetFile])
+async def list_dataset_files(
+    user_id: str, 
+    dataset_id: str,
+    version: Optional[str] = Query(None, description="Specific version (defaults to latest)")
+):
+    """
+    List all files in a dataset folder
     
-    # Return file as streaming response
-    return StreamingResponse(
-        BytesIO(file_data),
-        media_type='application/octet-stream',
-        headers={
-            "Content-Disposition": f"attachment; filename={dataset.original_filename}"
-        }
-    )
+    For single file datasets, returns a single-item list.
+    For folder datasets, returns all files with metadata.
+    """
+    try:
+        # Get dataset metadata
+        if version:
+            dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
+        else:
+            dataset = await metadata_service.get_latest_dataset(dataset_id, user_id)
+        
+        if not dataset:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        
+        # Return files list
+        if dataset.is_folder and dataset.files:
+            logger.info(f"Listed {len(dataset.files)} files for dataset {dataset_id} version {dataset.version}")
+            return dataset.files
+        else:
+            # For single files, create a single-item list
+            single_file = DatasetFile(
+                filename=dataset.original_filename,
+                file_path=dataset.file_path,
+                file_size=dataset.file_size,
+                file_type=dataset.file_type,
+                file_hash=dataset.file_hash or "",
+                content_type="application/octet-stream"
+            )
+            return [single_file]
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing dataset files: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list dataset files")
 
 
 @router.get("/{user_id}/{dataset_id}/versions", response_model=List[DatasetResponse])
@@ -424,17 +646,27 @@ async def get_dataset_by_version(user_id: str, dataset_id: str, version: str):
 
 @router.delete("/{user_id}/{dataset_id}/version/{version}")
 async def delete_dataset_by_version(user_id: str, dataset_id: str, version: str):
-    """Delete a specific version of a dataset and its file"""
+    """Delete a specific version of a dataset and its file(s)"""
     dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    file_deleted = await file_service.delete_file(dataset.file_path)
+    
+    # Handle folder vs single file deletion
+    files_deleted = 0
+    if dataset.is_folder:
+        files_deleted = await file_service.delete_folder_files(dataset.file_path)
+        logger.info(f"Deleted {files_deleted} files from folder: {dataset.file_path}")
+    else:
+        file_deleted = await file_service.delete_file(dataset.file_path)
+        files_deleted = 1 if file_deleted else 0
+    
     metadata_deleted = await metadata_service.delete_dataset_by_version(dataset_id, user_id, version)
     if not metadata_deleted:
         raise HTTPException(status_code=500, detail="Failed to delete dataset metadata")
+    
     return {
         "message": "Dataset deleted successfully",
-        "file_deleted": file_deleted,
+        "files_deleted": files_deleted,
         "metadata_deleted": metadata_deleted
     }
 

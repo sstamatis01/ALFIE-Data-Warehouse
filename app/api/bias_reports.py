@@ -31,6 +31,8 @@ async def create_or_update_bias_report(payload: BiasReportCreate):
                 has_transformation_report=has_transform,
                 target_column_name=payload.target_column_name,
                 task_type=payload.task_type,
+                is_folder=payload.is_folder,
+                file_count=payload.file_count,
             )
             logger.info(f"Bias Kafka event sent for dataset_id={payload.dataset_id}")
         except Exception as e:
