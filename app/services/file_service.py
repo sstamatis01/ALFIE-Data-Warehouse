@@ -6,8 +6,10 @@ from typing import Optional, Dict, Any, List, Tuple
 from minio.error import S3Error
 from fastapi import UploadFile, HTTPException
 from ..core.minio_client import minio_client
-from ..models.dataset import DatasetMetadata
+from ..models.dataset import DatasetMetadata, DatasetFile
 import logging
+import tempfile
+import zipfile
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +183,172 @@ class FileService:
             logger.warning(f"Failed to extract metadata from {filename}: {e}")
             
         return metadata
+    
+    async def upload_dataset_folder(
+        self,
+        zip_file: UploadFile,
+        user_id: str,
+        dataset_id: str,
+        version: str = "v1",
+        preserve_structure: bool = True
+    ) -> Tuple[List[DatasetFile], int]:
+        """
+        Upload a folder of dataset files (as zip) to MinIO
+        
+        Returns:
+            Tuple of (List of DatasetFile objects, total size in bytes)
+        """
+        try:
+            # Read zip file data
+            zip_data = await zip_file.read()
+            
+            dataset_files = []
+            total_size = 0
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Extract zip file
+                zip_path = os.path.join(temp_dir, "dataset_files.zip")
+                with open(zip_path, 'wb') as f:
+                    f.write(zip_data)
+                
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
+                
+                # Walk through extracted files
+                for root, dirs, files in os.walk(temp_dir):
+                    for file in files:
+                        if file == "dataset_files.zip":
+                            continue
+                        
+                        # Skip hidden files and directories
+                        if file.startswith('.') or '__MACOSX' in root:
+                            continue
+                        
+                        file_path = os.path.join(root, file)
+                        relative_path = os.path.relpath(file_path, temp_dir)
+                        
+                        # Read file data
+                        with open(file_path, 'rb') as f:
+                            file_data = f.read()
+                        
+                        file_size = len(file_data)
+                        total_size += file_size
+                        
+                        # Calculate file hash
+                        file_hash = self.calculate_file_hash(file_data)
+                        
+                        # Generate MinIO path
+                        if preserve_structure:
+                            minio_path = self.generate_file_path(user_id, dataset_id, version, relative_path)
+                        else:
+                            minio_path = self.generate_file_path(user_id, dataset_id, version, file)
+                        
+                        # Upload to MinIO
+                        self.client.put_object(
+                            bucket_name=self.bucket_name,
+                            object_name=minio_path,
+                            data=BytesIO(file_data),
+                            length=file_size,
+                            content_type='application/octet-stream'
+                        )
+                        
+                        # Create DatasetFile object
+                        dataset_file = DatasetFile(
+                            filename=file,
+                            file_path=minio_path,
+                            file_size=file_size,
+                            file_type=self._get_file_extension(file),
+                            file_hash=file_hash,
+                            content_type='application/octet-stream'
+                        )
+                        dataset_files.append(dataset_file)
+                        
+                        logger.info(f"Uploaded dataset file: {minio_path}")
+            
+            logger.info(f"Uploaded {len(dataset_files)} dataset files, total size: {total_size} bytes")
+            return dataset_files, total_size
+            
+        except zipfile.BadZipFile:
+            logger.error("Invalid zip file")
+            raise HTTPException(status_code=400, detail="Invalid zip file")
+        except S3Error as e:
+            logger.error(f"MinIO error during folder upload: {e}")
+            raise HTTPException(status_code=500, detail=f"Folder upload failed: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error during folder upload: {e}")
+            raise HTTPException(status_code=500, detail=f"Folder upload failed: {str(e)}")
+    
+    async def delete_folder_files(self, folder_path: str) -> int:
+        """
+        Delete all files in a folder from MinIO
+        
+        Returns:
+            Number of files deleted
+        """
+        try:
+            objects = self.client.list_objects(self.bucket_name, prefix=folder_path, recursive=True)
+            deleted_count = 0
+            
+            for obj in objects:
+                try:
+                    self.client.remove_object(self.bucket_name, obj.object_name)
+                    logger.info(f"Deleted file: {obj.object_name}")
+                    deleted_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to delete {obj.object_name}: {e}")
+            
+            return deleted_count
+            
+        except S3Error as e:
+            logger.error(f"MinIO error during folder deletion: {e}")
+            return 0
+        except Exception as e:
+            logger.error(f"Unexpected error during folder deletion: {e}")
+            return 0
+    
+    async def download_folder_as_zip(self, folder_path: str) -> bytes:
+        """
+        Download all files in a folder as a zip archive
+        
+        Args:
+            folder_path: Path to folder in MinIO (e.g., "datasets/user1/dataset1/v1/")
+            
+        Returns:
+            ZIP archive as bytes
+        """
+        try:
+            # List all files in the folder
+            objects = self.client.list_objects(self.bucket_name, prefix=folder_path, recursive=True)
+            
+            # Create zip file in memory
+            zip_buffer = BytesIO()
+            
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                has_files = False
+                for obj in objects:
+                    # Download file
+                    file_data = self.client.get_object(self.bucket_name, obj.object_name)
+                    
+                    # Add to zip (remove the prefix from the path)
+                    zip_path = obj.object_name.replace(folder_path, "")
+                    if zip_path:  # Skip empty paths
+                        zip_file.writestr(zip_path, file_data.read())
+                        has_files = True
+                
+                if not has_files:
+                    raise HTTPException(status_code=404, detail="No files found in folder")
+            
+            zip_buffer.seek(0)
+            return zip_buffer.getvalue()
+            
+        except S3Error as e:
+            logger.error(f"MinIO error during folder zip download: {e}")
+            raise HTTPException(status_code=404, detail="Folder not found")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during folder zip download: {e}")
+            raise HTTPException(status_code=500, detail="Folder zip download failed")
 
 
 # Global file service instance

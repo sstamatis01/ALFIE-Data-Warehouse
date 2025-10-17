@@ -62,6 +62,8 @@ class KafkaProducerService:
                     "file_size": dataset_metadata.file_size,
                     "file_path": dataset_metadata.file_path,
                     "original_filename": dataset_metadata.original_filename,
+                    "is_folder": dataset_metadata.is_folder,
+                    "file_count": len(dataset_metadata.files) if dataset_metadata.files else 1,
                     "columns": dataset_metadata.columns,
                     "row_count": dataset_metadata.row_count,
                     "data_types": dataset_metadata.data_types,
@@ -98,7 +100,9 @@ class KafkaProducerService:
         bias_report_id: str | None, 
         has_transformation_report: bool,
         target_column_name: Optional[str] = None,
-        task_type: Optional[str] = None
+        task_type: Optional[str] = None,
+        is_folder: Optional[bool] = False,
+        file_count: Optional[int] = 1
     ) -> None:
         if not self.producer:
             logger.warning("Kafka producer not initialized; skipping bias event")
@@ -111,6 +115,8 @@ class KafkaProducerService:
             "has_transformation_report": has_transformation_report,
             "target_column_name": target_column_name,
             "task_type": task_type,
+            "is_folder": is_folder,
+            "file_count": file_count,
             "timestamp": datetime.utcnow().isoformat(),
         }
         try:
@@ -132,7 +138,11 @@ class KafkaProducerService:
         model_size_mb: Optional[float] = None,
         training_accuracy: Optional[float] = None,
         validation_accuracy: Optional[float] = None,
-        test_accuracy: Optional[float] = None
+        test_accuracy: Optional[float] = None,
+        is_folder: Optional[bool] = False,
+        file_count: Optional[int] = 1,
+        is_model_folder: Optional[bool] = False,
+        model_file_count: Optional[int] = 1
     ) -> None:
         """Send AutoML event when a model is uploaded"""
         if not self.producer:
@@ -154,6 +164,10 @@ class KafkaProducerService:
             "training_accuracy": training_accuracy,
             "validation_accuracy": validation_accuracy,
             "test_accuracy": test_accuracy,
+            "is_folder": is_folder,
+            "file_count": file_count,
+            "is_model_folder": is_model_folder,
+            "model_file_count": model_file_count,
         }
         
         try:
