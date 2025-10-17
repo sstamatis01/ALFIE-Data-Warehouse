@@ -25,9 +25,11 @@ from aiokafka import AIOKafkaConsumer
 import requests
 import pandas as pd
 from io import BytesIO
-
+from dotenv import load_dotenv, find_dotenv
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger("kafka_automl_consumer")
+
+load_dotenv(find_dotenv())
 
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -35,48 +37,10 @@ KAFKA_AUTOML_TRIGGER_TOPIC = os.getenv("KAFKA_AUTOML_TRIGGER_TOPIC", "automl-tri
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "automl-consumer")
 
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
-
-
-def fetch_dataset_metadata(user_id: str, dataset_id: str) -> dict:
-    """Fetch dataset metadata from the Data Warehouse API"""
-    url = f"{API_BASE}/datasets/{user_id}/{dataset_id}"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def download_dataset_file(user_id: str, dataset_id: str) -> bytes:
-    """Download dataset file from the Data Warehouse API"""
-    url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    return r.content
-
-
-def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_path: str, 
-                       model_type: str, framework: str = "sklearn", accuracy: float = None) -> dict:
-    """
-    Upload trained model to Data Warehouse
-    This will automatically trigger an automl-events message
-    Version is auto-incremented by the DW
-    """
-    url = f"{API_BASE}/ai-models/upload/single/{user_id}"
-    
-    with open(model_file_path, 'rb') as f:
-        files = {'file': (os.path.basename(model_file_path), f)}
-        data = {
-            'model_id': model_id,
-            'name': f"AutoML Model - {model_id}",
-            'description': f"AutoML trained model for {model_type}",
-            'framework': framework,
-            'model_type': model_type,
-            'training_dataset': dataset_id,  # Link to dataset
-            'training_accuracy': accuracy,
-        }
-        
-        r = requests.post(url, files=files, data=data, timeout=120)
-        r.raise_for_status()
-        return r.json()
+# AutoML ports
+AUTOML_PORT = os.getenv("AUTOML_PORT", 8001)
+MAIN_AUTOML_URL = f"http://localhost:{AUTOML_PORT}"
+AUTOML_TABULAR_URL = f"{MAIN_AUTOML_URL}/automl_tabular/best_model"
 
 
 async def process_automl_trigger(event: dict) -> None:
@@ -100,6 +64,7 @@ async def process_automl_trigger(event: dict) -> None:
         target_column = event.get("target_column_name")
         task_type = event.get("task_type")
         time_budget = event.get("time_budget", "10")
+        task_category = event.get("task_category", "tabular")
         
         if not user_id or not dataset_id:
             logger.warning("Missing user_id or dataset_id in event; skipping")
@@ -111,70 +76,22 @@ async def process_automl_trigger(event: dict) -> None:
         logger.info(f"  Task type: {task_type}")
         logger.info(f"  Time budget: {time_budget} minutes")
         
-        # Step 1: Fetch dataset metadata and download file
-        try:
-            metadata = fetch_dataset_metadata(user_id, dataset_id)
-            file_bytes = download_dataset_file(user_id, dataset_id)
-            logger.info(f"Dataset downloaded: {len(file_bytes)} bytes")
-        except Exception as e:
-            logger.error(f"Failed to fetch dataset: {e}")
+        
+        if task_category == "tabular":
+            data = {
+                "user_id" : user_id,
+                "dataset_id": dataset_id,
+                "target_column_name": target_column,
+                "task_type": task_type,
+                "time_budget": time_budget
+            }
+            
+            r = requests.post(AUTOML_TABULAR_URL, data=data, timeout=120)
+            r.raise_for_status()
+            logger.info("Automl processing done and uploaded models to AutoDW")
+        else:
+            logger.error("Task category does not exist")
             return
-        
-        # Step 2: Load dataset into pandas
-        try:
-            df = pd.read_csv(BytesIO(file_bytes))
-            logger.info(f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns")
-        except Exception as e:
-            logger.error(f"Failed to parse dataset as CSV: {e}")
-            return
-        
-        # Step 3: Identify the problem and train model
-        # TODO: Replace this with actual AutoML training logic
-        # For now, we'll use a dummy model.pkl file for testing
-        
-        logger.info("=" * 80)
-        logger.info("Training model (using dummy model.pkl for testing)")
-        logger.info(f"  - Target column: {target_column}")
-        logger.info(f"  - Task type: {task_type}")
-        logger.info(f"  - Dataset shape: {df.shape}")
-        logger.info("=" * 80)
-        
-        # Generate model ID
-        model_id = f"automl_{dataset_id}_{int(datetime.utcnow().timestamp())}"
-        
-        # Use dummy model.pkl file for testing
-        dummy_model_path = "model.pkl"
-        
-        if not os.path.exists(dummy_model_path):
-            logger.warning(f"Dummy model file not found: {dummy_model_path}")
-            logger.info("Skipping model upload - create a dummy model.pkl file in the root directory to test")
-            return
-        
-        # Upload the trained model to DW
-        try:
-            logger.info(f"Uploading model to DW: {model_id}")
-            result = upload_model_to_dw(
-                user_id=user_id,
-                model_id=model_id,
-                dataset_id=dataset_id,
-                model_file_path=dummy_model_path,
-                model_type=task_type,
-                framework="sklearn",
-                accuracy=0.92  # Dummy accuracy for testing
-            )
-            logger.info(f"✅ Model uploaded to DW successfully!")
-            logger.info(f"   Model ID: {model_id}")
-            logger.info(f"   Response: {json.dumps(result, indent=2, default=str)}")
-            logger.info("   AutoML event will be automatically sent by the DW")
-        except Exception as e:
-            logger.error(f"Failed to upload model to DW: {e}", exc_info=True)
-            return
-        
-        logger.info(f"AutoML processing completed for dataset {dataset_id}")
-        
-    except Exception as e:
-        logger.error(f"Error processing AutoML trigger event: {e}", exc_info=True)
-
 
 async def run_consumer() -> None:
     """Main consumer loop"""
@@ -221,3 +138,4 @@ if __name__ == "__main__":
         asyncio.run(run_consumer())
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+
