@@ -15,6 +15,52 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
 
+async def _get_next_dataset_name(user_id: str) -> str:
+    """
+    Generate the next automatic dataset name for a user.
+    Returns names like: user_uploaded_dataset_1, user_uploaded_dataset_2, etc.
+    """
+    try:
+        from ..core.database import get_database
+        db = get_database()
+        
+        # Find all datasets with auto-generated names for this user
+        cursor = db.datasets.find({
+            "user_id": user_id,
+            "name": {"$regex": r"^user_uploaded_dataset_\d+$"}
+        }, {"name": 1})
+        
+        datasets = await cursor.to_list(length=1000)
+        
+        if not datasets:
+            return "user_uploaded_dataset_1"
+        
+        # Extract numbers from names (user_uploaded_dataset_1 -> 1, etc.)
+        numbers = []
+        for doc in datasets:
+            name = doc.get("name", "")
+            if name.startswith("user_uploaded_dataset_"):
+                try:
+                    number = int(name.split("_")[-1])
+                    numbers.append(number)
+                except (ValueError, IndexError):
+                    pass
+        
+        # Get the max number and increment
+        if numbers:
+            next_number = max(numbers) + 1
+        else:
+            next_number = 1
+        
+        return f"user_uploaded_dataset_{next_number}"
+        
+    except Exception as e:
+        logger.error(f"Error generating dataset name: {e}")
+        # Fallback to timestamp-based name
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        return f"user_uploaded_dataset_{timestamp}"
+
+
 async def _get_next_dataset_version(user_id: str, dataset_id: str) -> str:
     """
     Auto-detect the next version number for a dataset.
@@ -63,7 +109,7 @@ async def upload_dataset(
     user_id: str,
     file: UploadFile = File(...),
     dataset_id: Optional[str] = Form(None),  # Made optional
-    name: str = Form(...),
+    name: Optional[str] = Form(None),  # Made optional
     description: Optional[str] = Form(None),
     tags: Optional[str] = Form(None)  # Comma-separated tags
 ):
@@ -72,13 +118,15 @@ async def upload_dataset(
     
     This endpoint handles the main flow:
     1. Generate dataset_id (UUID) if not provided
-    2. Auto-detect next version number for this dataset
-    3. Upload file to MinIO with organized path structure
-    4. Extract metadata from file content
-    5. Store metadata in MongoDB
+    2. Generate dataset_name if not provided (user_uploaded_dataset_1, user_uploaded_dataset_2, etc.)
+    3. Auto-detect next version number for this dataset
+    4. Upload file to MinIO with organized path structure
+    5. Extract metadata from file content
+    6. Store metadata in MongoDB
     
     Version is automatically incremented (v1, v2, v3, etc.)
     dataset_id is optional - if not provided, a UUID will be generated automatically.
+    dataset_name is optional - if not provided, an automatic name will be generated.
     """
     try:
         # Validate file type
@@ -89,6 +137,11 @@ async def upload_dataset(
         if not dataset_id:
             dataset_id = str(uuid.uuid4())
             logger.info(f"Generated new dataset_id: {dataset_id}")
+        
+        # Generate dataset_name if not provided
+        if not name:
+            name = await _get_next_dataset_name(user_id)
+            logger.info(f"Generated new dataset_name: {name}")
         
         # Parse tags if provided
         tag_list = []
@@ -164,7 +217,7 @@ async def upload_dataset_folder(
     user_id: str,
     zip_file: UploadFile = File(...),
     dataset_id: Optional[str] = Form(None),  # Made optional
-    name: str = Form(...),
+    name: Optional[str] = Form(None),  # Made optional
     description: Optional[str] = Form(None),
     preserve_structure: bool = Form(True),
     tags: Optional[str] = Form(None)
@@ -174,12 +227,14 @@ async def upload_dataset_folder(
     
     For folder uploads:
     - Generate dataset_id (UUID) if not provided
+    - Generate dataset_name if not provided (user_uploaded_dataset_1, user_uploaded_dataset_2, etc.)
     - Auto-detects next version
     - Extracts and uploads all files
     - Simplified metadata (no column/row analysis)
     - Lists all files with sizes and types
     
     dataset_id is optional - if not provided, a UUID will be generated automatically.
+    dataset_name is optional - if not provided, an automatic name will be generated.
     """
     try:
         if not zip_file.filename or not zip_file.filename.endswith('.zip'):
@@ -189,6 +244,11 @@ async def upload_dataset_folder(
         if not dataset_id:
             dataset_id = str(uuid.uuid4())
             logger.info(f"Generated new dataset_id: {dataset_id}")
+        
+        # Generate dataset_name if not provided
+        if not name:
+            name = await _get_next_dataset_name(user_id)
+            logger.info(f"Generated new dataset_name: {name}")
         
         tag_list = []
         if tags:
