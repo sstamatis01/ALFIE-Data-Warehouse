@@ -92,6 +92,30 @@ services:
     networks:
       - data-warehouse-network
 
+  # GraphDB for semantic knowledge graphs
+  graphdb:
+    image: ontotext/graphdb:10.6.0
+    container_name: data-warehouse-graphdb
+    restart: unless-stopped
+    ports:
+      - "7200:7200"
+    environment:
+      GDB_HEAP_SIZE: 1g
+      GDB_MIN_MEM: 1g
+      GDB_MAX_MEM: 1g
+      GDB_MASTER_PASSWORD: admin
+    volumes:
+      - graphdb_data:/opt/graphdb/home/data
+      - graphdb_logs:/opt/graphdb/home/logs
+    networks:
+      - data-warehouse-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:7200/rest/repositories || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
   # Data Warehouse API
   api:
     build: .
@@ -126,10 +150,11 @@ services:
     volumes:
       - ./app:/app/app:ro
 
-
 volumes:
   mongodb_data:
   minio_data:
+  graphdb_data:
+  graphdb_logs:
 
 networks:
   data-warehouse-network:
