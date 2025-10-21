@@ -8,6 +8,7 @@ from ..services.file_service import file_service
 from ..services.metadata_service import metadata_service
 from ..services.kafka_service import kafka_producer_service
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ async def _get_next_dataset_version(user_id: str, dataset_id: str) -> str:
 async def upload_dataset(
     user_id: str,
     file: UploadFile = File(...),
-    dataset_id: str = Form(...),
+    dataset_id: Optional[str] = Form(None),  # Made optional
     name: str = Form(...),
     description: Optional[str] = Form(None),
     tags: Optional[str] = Form(None)  # Comma-separated tags
@@ -70,17 +71,24 @@ async def upload_dataset(
     Upload a dataset file and create metadata
     
     This endpoint handles the main flow:
-    1. Auto-detect next version number for this dataset
-    2. Upload file to MinIO with organized path structure
-    3. Extract metadata from file content
-    4. Store metadata in MongoDB
+    1. Generate dataset_id (UUID) if not provided
+    2. Auto-detect next version number for this dataset
+    3. Upload file to MinIO with organized path structure
+    4. Extract metadata from file content
+    5. Store metadata in MongoDB
     
     Version is automatically incremented (v1, v2, v3, etc.)
+    dataset_id is optional - if not provided, a UUID will be generated automatically.
     """
     try:
         # Validate file type
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
+        
+        # Generate dataset_id if not provided
+        if not dataset_id:
+            dataset_id = str(uuid.uuid4())
+            logger.info(f"Generated new dataset_id: {dataset_id}")
         
         # Parse tags if provided
         tag_list = []
@@ -155,7 +163,7 @@ async def upload_dataset(
 async def upload_dataset_folder(
     user_id: str,
     zip_file: UploadFile = File(...),
-    dataset_id: str = Form(...),
+    dataset_id: Optional[str] = Form(None),  # Made optional
     name: str = Form(...),
     description: Optional[str] = Form(None),
     preserve_structure: bool = Form(True),
@@ -165,14 +173,22 @@ async def upload_dataset_folder(
     Upload a folder of dataset files (as zip)
     
     For folder uploads:
+    - Generate dataset_id (UUID) if not provided
     - Auto-detects next version
     - Extracts and uploads all files
     - Simplified metadata (no column/row analysis)
     - Lists all files with sizes and types
+    
+    dataset_id is optional - if not provided, a UUID will be generated automatically.
     """
     try:
         if not zip_file.filename or not zip_file.filename.endswith('.zip'):
             raise HTTPException(status_code=400, detail="File must be a ZIP archive")
+        
+        # Generate dataset_id if not provided
+        if not dataset_id:
+            dataset_id = str(uuid.uuid4())
+            logger.info(f"Generated new dataset_id: {dataset_id}")
         
         tag_list = []
         if tags:
