@@ -13,16 +13,23 @@ Welcome to the Data Warehouse documentation! This index will help you find the r
 ### 🏗️ Architecture & Orchestration
 - **[KAFKA_ORCHESTRATION_COMPLETE.md](KAFKA_ORCHESTRATION_COMPLETE.md)** - Complete Kafka architecture and flow
 - **[KAFKA_QUICK_REFERENCE.md](KAFKA_QUICK_REFERENCE.md)** - Quick reference for topics and payloads
+- **[KAFKA_FOLDER_SUPPORT.md](KAFKA_FOLDER_SUPPORT.md)** - Kafka support for folder datasets
+- **[FOLDER_INFO_IN_ALL_KAFKA_MESSAGES.md](FOLDER_INFO_IN_ALL_KAFKA_MESSAGES.md)** - Folder info in all messages
+- **[MODEL_FOLDER_SUPPORT_KAFKA.md](MODEL_FOLDER_SUPPORT_KAFKA.md)** - Model folder support in Kafka
 
 ### 🔌 API Documentation
 - **[API_CHANGES_USER_ID_AND_VERSIONING.md](API_CHANGES_USER_ID_AND_VERSIONING.md)** - API changes and auto-versioning
 - **[AI_MODELS_README.md](AI_MODELS_README.md)** - AI Models API documentation
 - **[XAI_REPORTS_README.md](XAI_REPORTS_README.md)** - XAI Reports API documentation
+- **[DATASET_FOLDER_UPLOAD.md](DATASET_FOLDER_UPLOAD.md)** - Dataset folder upload guide
+- **[DATASET_DOWNLOAD_DELETE.md](DATASET_DOWNLOAD_DELETE.md)** - Download and delete operations
+- **[DATASET_FOLDER_COMPLETE.md](DATASET_FOLDER_COMPLETE.md)** - Complete folder implementation
 
 ### 🧪 Testing Guides
 - **[TEST_COMPLETE_FLOW.md](TEST_COMPLETE_FLOW.md)** - Complete end-to-end testing guide
 - **[TEST_NEW_API_ENDPOINTS.md](TEST_NEW_API_ENDPOINTS.md)** - Testing new API endpoints
 - **[END_TO_END_TESTING_UPDATE.md](END_TO_END_TESTING_UPDATE.md)** - End-to-end testing updates
+- **[AUTOML_CONSUMER_V2.md](AUTOML_CONSUMER_V2.md)** - AutoML consumer V2 with real model folder
 
 ### 🤝 Partner Integration
 - **[SHARING_WITH_PARTNERS_README.md](SHARING_WITH_PARTNERS_README.md)** - Guide for sharing with partners
@@ -32,6 +39,8 @@ Welcome to the Data Warehouse documentation! This index will help you find the r
 
 ### 🐛 Bug Fixes & Updates
 - **[BUG_FIX_BIAS_EVENTS.md](BUG_FIX_BIAS_EVENTS.md)** - Bias events bug fix documentation
+- **[CSV_ENCODING_FIX.md](CSV_ENCODING_FIX.md)** - CSV encoding error fix
+- **[FOLDER_INFO_PARSING_FIX.md](FOLDER_INFO_PARSING_FIX.md)** - Folder info parsing location fix
 
 ### 📜 Historical/Reference
 - **[KAFKA_AUTOML_IMPLEMENTATION.md](KAFKA_AUTOML_IMPLEMENTATION.md)** - AutoML Kafka implementation (outdated - see orchestration docs)
