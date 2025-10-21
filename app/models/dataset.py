@@ -72,7 +72,7 @@ class DatasetMetadata(BaseModel):
 class DatasetCreate(BaseModel):
     dataset_id: str
     user_id: str
-    name: str
+    name: str  # This will be set by the API before creating the model
     description: Optional[str] = None
     version: str = "v1"
     tags: List[str] = Field(default_factory=list)
