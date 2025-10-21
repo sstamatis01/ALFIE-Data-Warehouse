@@ -25,11 +25,9 @@ from aiokafka import AIOKafkaConsumer
 import requests
 import pandas as pd
 from io import BytesIO
-from dotenv import load_dotenv, find_dotenv
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger("kafka_automl_consumer")
-
-load_dotenv(find_dotenv())
 
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -37,10 +35,106 @@ KAFKA_AUTOML_TRIGGER_TOPIC = os.getenv("KAFKA_AUTOML_TRIGGER_TOPIC", "automl-tri
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "automl-consumer")
 
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
-# AutoML ports
-AUTOML_PORT = os.getenv("AUTOML_PORT", 8001)
-MAIN_AUTOML_URL = f"http://localhost:{AUTOML_PORT}"
-AUTOML_TABULAR_URL = f"{MAIN_AUTOML_URL}/automl_tabular/best_model"
+
+
+def fetch_dataset_metadata(user_id: str, dataset_id: str) -> dict:
+    """Fetch dataset metadata from the Data Warehouse API"""
+    url = f"{API_BASE}/datasets/{user_id}/{dataset_id}"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
+    """
+    Try to read CSV with multiple encodings
+    
+    Handles files with different encodings:
+    - utf-8: Standard
+    - latin-1 (ISO-8859-1): Western European
+    - cp1252 (Windows-1252): Windows default
+    - utf-16: Some Excel exports
+    """
+    from io import BytesIO
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1', 'utf-16']
+    
+    for encoding in encodings:
+        try:
+            df = pd.read_csv(BytesIO(file_data), encoding=encoding)
+            logger.info(f"Successfully read CSV with encoding: {encoding}")
+            return df
+        except (UnicodeDecodeError, Exception):
+            continue
+    
+    # If all encodings fail, try with error handling
+    try:
+        df = pd.read_csv(BytesIO(file_data), encoding='utf-8', encoding_errors='ignore')
+        logger.warning("Read CSV with 'ignore' errors - some characters may be missing")
+        return df
+    except Exception as e:
+        logger.error(f"Failed to read CSV with all encodings: {e}")
+        raise
+
+
+def download_dataset_file(user_id: str, dataset_id: str) -> bytes:
+    """Download dataset file (single file or folder as ZIP)"""
+    url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+
+def extract_dataset_folder(zip_bytes: bytes, extract_to: str = "temp_dataset") -> list:
+    """
+    Extract ZIP file containing dataset folder
+    
+    Returns:
+        List of extracted file paths
+    """
+    import zipfile
+    from io import BytesIO
+    
+    # Create extraction directory
+    os.makedirs(extract_to, exist_ok=True)
+    
+    # Extract ZIP
+    with zipfile.ZipFile(BytesIO(zip_bytes), 'r') as zip_ref:
+        zip_ref.extractall(extract_to)
+    
+    # List extracted files
+    extracted_files = []
+    for root, dirs, files in os.walk(extract_to):
+        for file in files:
+            file_path = os.path.join(root, file)
+            extracted_files.append(file_path)
+    
+    return extracted_files
+
+
+def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_path: str, 
+                       model_type: str, framework: str = "sklearn", accuracy: float = None) -> dict:
+    """
+    Upload trained model to Data Warehouse
+    This will automatically trigger an automl-events message
+    Version is auto-incremented by the DW
+    """
+    url = f"{API_BASE}/ai-models/upload/single/{user_id}"
+    
+    with open(model_file_path, 'rb') as f:
+        files = {'file': (os.path.basename(model_file_path), f)}
+        data = {
+            'model_id': model_id,
+            'name': f"AutoML Model - {model_id}",
+            'description': f"AutoML trained model for {model_type}",
+            'framework': framework,
+            'model_type': model_type,
+            'training_dataset': dataset_id,  # Link to dataset
+            'training_accuracy': accuracy,
+        }
+        
+        r = requests.post(url, files=files, data=data, timeout=120)
+        r.raise_for_status()
+        return r.json()
 
 
 async def process_automl_trigger(event: dict) -> None:
@@ -64,7 +158,6 @@ async def process_automl_trigger(event: dict) -> None:
         target_column = event.get("target_column_name")
         task_type = event.get("task_type")
         time_budget = event.get("time_budget", "10")
-        task_category = event.get("task_category", "tabular")
         
         if not user_id or not dataset_id:
             logger.warning("Missing user_id or dataset_id in event; skipping")
@@ -76,22 +169,105 @@ async def process_automl_trigger(event: dict) -> None:
         logger.info(f"  Task type: {task_type}")
         logger.info(f"  Time budget: {time_budget} minutes")
         
-        
-        if task_category == "tabular":
-            data = {
-                "user_id" : user_id,
-                "dataset_id": dataset_id,
-                "target_column_name": target_column,
-                "task_type": task_type,
-                "time_budget": time_budget
-            }
+        # Step 1: Fetch dataset metadata and download file
+        try:
+            metadata = fetch_dataset_metadata(user_id, dataset_id)
             
-            r = requests.post(AUTOML_TABULAR_URL, data=data, timeout=120)
-            r.raise_for_status()
-            logger.info("Automl processing done and uploaded models to AutoDW")
-        else:
-            logger.error("Task category does not exist")
+            # Get is_folder from trigger event (not from fetched metadata)
+            is_folder = event.get("is_folder", False)
+            file_count = event.get("file_count", 1)
+            
+            logger.info(f"Dataset type: {'FOLDER' if is_folder else 'SINGLE FILE'}")
+            if is_folder:
+                logger.info(f"File count: {file_count}")
+            
+            file_bytes = download_dataset_file(user_id, dataset_id)
+            logger.info(f"Dataset downloaded: {len(file_bytes)} bytes")
+        except Exception as e:
+            logger.error(f"Failed to fetch dataset: {e}")
             return
+        
+        # Step 2: Load dataset into pandas
+        df = None
+        extracted_files = []
+        
+        try:
+            if is_folder:
+                # Handle folder dataset - extract ZIP
+                logger.info("Extracting folder dataset...")
+                extracted_files = extract_dataset_folder(file_bytes, f"temp_automl_{dataset_id}")
+                logger.info(f"Extracted {len(extracted_files)} files:")
+                for file_path in extracted_files:
+                    logger.info(f"  - {file_path}")
+                
+                # TODO: Process multiple files for AutoML training
+                # For now, find and load a CSV file
+                csv_files = [f for f in extracted_files if f.endswith('.csv')]
+                if csv_files:
+                    logger.info(f"Found {len(csv_files)} CSV file(s), loading first one for training")
+                    with open(csv_files[0], 'rb') as f:
+                        csv_bytes = f.read()
+                    df = read_csv_with_encoding(csv_bytes)
+                    logger.info(f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns")
+                else:
+                    logger.error("No CSV files found in folder for training")
+                    return
+            else:
+                # Handle single file dataset
+                df = read_csv_with_encoding(file_bytes)
+                logger.info(f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns")
+                
+        except Exception as e:
+            logger.error(f"Failed to parse dataset: {e}")
+            return
+        
+        # Step 3: Identify the problem and train model
+        # TODO: Replace this with actual AutoML training logic
+        # For now, we'll use a dummy model.pkl file for testing
+        
+        logger.info("=" * 80)
+        logger.info("Training model (using dummy model.pkl for testing)")
+        logger.info(f"  - Target column: {target_column}")
+        logger.info(f"  - Task type: {task_type}")
+        logger.info(f"  - Dataset shape: {df.shape}")
+        logger.info("=" * 80)
+        
+        # Generate model ID
+        model_id = f"automl_{dataset_id}_{int(datetime.utcnow().timestamp())}"
+        
+        # Use dummy model.pkl file for testing
+        dummy_model_path = "model.pkl"
+        
+        if not os.path.exists(dummy_model_path):
+            logger.warning(f"Dummy model file not found: {dummy_model_path}")
+            logger.info("Skipping model upload - create a dummy model.pkl file in the root directory to test")
+            return
+        
+        # Upload the trained model to DW
+        try:
+            logger.info(f"Uploading model to DW: {model_id}")
+            result = upload_model_to_dw(
+                user_id=user_id,
+                model_id=model_id,
+                dataset_id=dataset_id,
+                model_file_path=dummy_model_path,
+                model_type=task_type,
+                framework="sklearn",
+                accuracy=0.92  # Dummy accuracy for testing
+            )
+            logger.info(f"✅ Model uploaded to DW successfully!")
+            logger.info(f"   Model ID: {model_id}")
+            logger.info(f"   Response: {json.dumps(result, indent=2, default=str)}")
+            logger.info("   AutoML event will be automatically sent by the DW")
+        except Exception as e:
+            logger.error(f"Failed to upload model to DW: {e}", exc_info=True)
+            return
+        
+        logger.info(f"AutoML processing completed for dataset {dataset_id}")
+        
+    except Exception as e:
+        logger.error(f"Error processing AutoML trigger event: {e}", exc_info=True)
+
 
 async def run_consumer() -> None:
     """Main consumer loop"""
@@ -138,4 +314,3 @@ if __name__ == "__main__":
         asyncio.run(run_consumer())
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
-
