@@ -16,7 +16,17 @@ mongodb = MongoDB()
 async def connect_to_mongo():
     """Create database connection"""
     try:
-        mongodb.client = AsyncIOMotorClient(settings.mongodb_url)
+        # Build MongoDB URL with authentication if credentials are provided
+        mongodb_url = settings.mongodb_url
+        if settings.mongodb_username and settings.mongodb_password:
+            # Parse the URL and add authentication
+            if "://" in mongodb_url:
+                protocol, rest = mongodb_url.split("://", 1)
+                mongodb_url = f"{protocol}://{settings.mongodb_username}:{settings.mongodb_password}@{rest}"
+            else:
+                mongodb_url = f"mongodb://{settings.mongodb_username}:{settings.mongodb_password}@{mongodb_url}"
+        
+        mongodb.client = AsyncIOMotorClient(mongodb_url)
         mongodb.database = mongodb.client[settings.mongodb_database]
         
         # Test the connection

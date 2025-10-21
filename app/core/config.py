@@ -6,6 +6,8 @@ class Settings(BaseSettings):
     # MongoDB Configuration
     mongodb_url: str = "mongodb://localhost:27017"
     mongodb_database: str = "data_warehouse"
+    mongodb_username: Optional[str] = None
+    mongodb_password: Optional[str] = None
     
     # MinIO Configuration
     minio_endpoint: str = "localhost:9000"
