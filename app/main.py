@@ -15,6 +15,10 @@ from .api import transformation_reports
 from .services.ai_model_service import ai_model_service
 from .services.xai_report_service import xai_report_service
 from .api import xai_reports
+from .services.etd_hub_service import etd_hub_service
+from .api import etd_hub, etd_hub_import
+from .services.graphdb_service import graphdb_service
+from .api import graphdb
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +42,8 @@ async def lifespan(app: FastAPI):
         await transformation_report_service.initialize()
         await ai_model_service.initialize()
         await xai_report_service.initialize()
+        await etd_hub_service.initialize()
+        await graphdb_service.initialize()
         
         # Initialize Kafka (non-fatal)
         try:
@@ -75,11 +81,26 @@ app = FastAPI(
     - Support for various file types (CSV, Excel, images, videos, audio, AI models)
     - User-based access control and dataset management
     - Advanced search and filtering capabilities
+    - ETD-Hub: Reddit-like forum for ethical AI discussions with themes, questions, answers, and voting
+    - GraphDB: SPARQL endpoint management for semantic knowledge graphs and triple stores
     
     File Organization Structure:
     - datasets/{user_id}/{dataset_id}/{version}/{filename}
     
     Example: datasets/user1/drowsiness/v1/heart_rate.csv
+    
+    ETD-Hub Features:
+    - Themes: Case studies and ethical AI topics
+    - Questions: Forum discussions on AI ethics
+    - Answers: Expert responses with voting system
+    - Experts: User profiles with expertise areas
+    - Documents: File uploads for discussions (future feature)
+    
+    GraphDB Features:
+    - SPARQL endpoint configuration and management
+    - Support for SELECT and UPDATE queries
+    - Connection testing and health monitoring
+    - Repository management for semantic knowledge graphs
     """,
     version="1.0.0",
     lifespan=lifespan
@@ -101,6 +122,9 @@ app.include_router(bias_reports.router)
 app.include_router(transformation_reports.router)
 app.include_router(ai_models.router)
 app.include_router(xai_reports.router)
+app.include_router(etd_hub.router)
+app.include_router(etd_hub_import.router)
+app.include_router(graphdb.router)
 
 
 @app.get("/")
