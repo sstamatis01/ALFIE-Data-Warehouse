@@ -150,6 +150,31 @@ services:
     volumes:
       - ./app:/app/app:ro
 
+  # Bias Detector Consumer Service
+  bias-detector:
+    build: .
+    env_file:
+      - .env
+    container_name: data-warehouse-bias-detector
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_BIAS_TRIGGER_TOPIC: bias-detection-trigger-events
+      KAFKA_BIAS_TRIGGER_CONSUMER_GROUP: bias-trigger-consumer
+      API_BASE: http://api:8000
+    depends_on:
+      api:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - data-warehouse-network
+    command: >
+      sh -c "sleep 15 && python kafka_bias_detector_consumer_example.py"
+    volumes:
+      - ./app:/app/app:ro
+      - ./kafka_bias_detector_consumer_example.py:/app/kafka_bias_detector_consumer_example.py:ro
+
 volumes:
   mongodb_data:
   minio_data:

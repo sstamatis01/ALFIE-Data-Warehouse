@@ -13,6 +13,9 @@ import os
 import asyncio
 import json
 import logging
+from importlib.metadata import distribution
+
+import numpy as np
 from aiokafka import AIOKafkaConsumer
 import requests
 import pandas as pd
@@ -21,10 +24,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("kafka_consumer_example")
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-KAFKA_BIAS_TRIGGER_TOPIC = os.getenv("KAFKA_BIAS_TRIGGER_TOPIC", "bias-trigger-events")
+KAFKA_BIAS_TRIGGER_TOPIC = os.getenv("KAFKA_BIAS_TRIGGER_TOPIC", "bias-detection-trigger-events")
 KAFKA_BIAS_TRIGGER_CONSUMER_GROUP = os.getenv("KAFKA_BIAS_TRIGGER_CONSUMER_GROUP", "bias-trigger-consumer")
 
-API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+# Use Docker service name if KAFKA_BOOTSTRAP_SERVERS points to kafka:29092, otherwise use localhost
+if "kafka:" in KAFKA_BOOTSTRAP_SERVERS:
+    API_BASE = os.getenv("API_BASE", "http://api:8000")
+else:
+    API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
 
 def fetch_dataset_metadata(user_id: str, dataset_id: str) -> dict:
@@ -41,8 +48,27 @@ def download_dataset_file(user_id: str, dataset_id: str) -> bytes:
     return r.content
 
 
+def clean_for_json(obj):
+    """Recursively clean data structure to be JSON serializable by replacing NaN/inf with None"""
+    if isinstance(obj, dict):
+        return {k: clean_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_for_json(v) for v in obj]
+    elif isinstance(obj, (np.floating, float)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, (np.integer, int)):
+        return int(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    else:
+        return obj
+
+
 def post_bias_report(user_id: str, dataset_id: str, report: dict, 
-                     target_column_name: str = None, task_type: str = None) -> dict:
+                     target_column_name: str = None, task_type: str = None,
+                     task_id: str | None = None) -> dict:
     url = f"{API_BASE}/bias-reports/"
     payload = {
         "user_id": user_id,
@@ -51,7 +77,10 @@ def post_bias_report(user_id: str, dataset_id: str, report: dict,
         "target_column_name": target_column_name,
         "task_type": task_type,
     }
-    r = requests.post(url, json=payload, timeout=30)
+    headers = {}
+    if task_id:
+        headers["X-Task-ID"] = task_id
+    r = requests.post(url, json=payload, headers=headers, timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -61,13 +90,14 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
     report: dict = {}
     try:
         if df is not None:
+            # 1. Basic info
             report["shape"] = [int(df.shape[0]), int(df.shape[1])]  # JSON-friendly
             report["columns"] = list(df.columns.astype(str))
             report["dtypes"] = {col: str(dtype) for col, dtype in df.dtypes.items()}
             # Memory in MB
             mem_bytes = df.memory_usage(deep=True).sum()
             report["memory_usage_MB"] = float(mem_bytes / (1024 * 1024))
-            # Summary statistics for numeric columns
+            # 2. Summary statistics for numeric columns
             try:
                 desc = df.describe(percentiles=[0.25, 0.5, 0.75], include=["number"]).to_dict()
                 # Ensure JSON-friendly floats
@@ -77,6 +107,98 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
                 report["summary_statistics"] = clean_desc
             except Exception:
                 report["summary_statistics"] = {}
+            # 3. Missing Values
+            missing = df.isnull().sum()
+            missing_percent = (missing / len(df)) * 100
+            report["missing_values"] = {
+                col: {"count": int(missing[col]), "percent": float(missing_percent[col])}
+                for col in df.columns if missing[col] > 0
+            }
+            # 4. Unique values
+            report['unique_values'] = {col: df[col].nunique() for col in df.columns}
+            # 5. Duplicate Rows
+            duplicates = df[df.duplicated()]
+            report['duplicate_rows_count'] = duplicates.shape[0]
+            report['sample_duplicate_rows'] = duplicates.head().to_dict(orient='records')
+            # 6. Correlation Matrix (Only numerical)
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                # Select numeric columns from DataFrame and compute correlation
+                numeric_df = df[numeric_cols]
+                report['correlation_matrix'] = numeric_df.corr(method="pearson").round(3).to_dict()
+            else:
+                report['correlation_matrix'] = {}
+            # 7. Distribution Stats
+            distribution_stats = {}
+            for col in numeric_cols:
+                series = df[col].dropna()
+                if len(series) > 0:
+                    distribution_stats[col] = {
+                        "mean": float(series.mean()) if not np.isnan(series.mean()) else None,
+                        "median": float(series.median()) if not np.isnan(series.median()) else None,
+                        "std": float(series.std()) if not np.isnan(series.std()) else None,
+                        "min": float(series.min()) if not np.isnan(series.min()) else None,
+                        "max": float(series.max()) if not np.isnan(series.max()) else None,
+                        "skew": float(series.skew()) if not np.isnan(series.skew()) else None,
+                        "kurtosis": float(series.kurt()) if not np.isnan(series.kurt()) else None
+                    }
+            report['distribution_statistics'] = distribution_stats
+            # 8. Categorical value count (top5)
+            cat_cols = df.select_dtypes(include='object')
+            report['categorical_value_counts'] = {
+                col: df[col].value_counts(dropna=False).head(5).to_dict() for col in cat_cols.columns
+            }
+            # 9. Outlier Detection (IQR)
+            outlier_summary = {}
+            for col in numeric_cols:
+                try:
+                    Q1 = df[col].quantile(0.25)
+                    Q3 = df[col].quantile(0.75)
+                    IQR = Q3 - Q1
+                    lower = Q1 - 1.5 * IQR
+                    upper = Q3 + 1.5 * IQR
+                    outliers = df[(df[col] < lower) | (df[col] > upper)]
+                    outlier_summary[col] = {
+                        "count": int(outliers.shape[0]),
+                        "percent": float((outliers.shape[0] / df.shape[0]) * 100)
+                    }
+                except Exception:
+                    outlier_summary[col] = {"count": 0, "percent": 0.0}
+            report['outlier_detection'] = outlier_summary
+            # 10. Data Drift
+            try:
+                from river import drift
+                # Simple drift detection on first numeric column if available
+                if len(numeric_cols) > 0:
+                    first_col = numeric_cols[0]
+                    series = df[first_col].dropna()
+                    ddm = drift.dummy.DummyDriftDetector(t_0=min(1000, len(series)//2), seed=42)
+                    drifts = {
+                        "index": [],
+                        "value": [],
+                        "column_analyzed": first_col
+                    }
+                    
+                    # Iterate over the numeric values
+                    for i, val in enumerate(series.iloc[:min(1000, len(series))]):  # Limit to first 1000 values
+                        if not np.isnan(val):
+                            ddm.update(float(val))
+                            if ddm.drift_detected:
+                                drifts["index"].append(int(i))
+                                drifts["value"].append(float(val))
+                    
+                    report['data_drift'] = drifts
+                else:
+                    report['data_drift'] = {"message": "No numeric columns available for drift detection"}
+                    
+            except ImportError:
+                logger.warning("River library not available, skipping drift detection")
+                report['data_drift'] = {"message": "River library not installed, drift detection skipped"}
+            except Exception as e:
+                logger.warning(f"Error in drift detection: {e}")
+                report['data_drift'] = {"message": f"Drift detection failed: {str(e)}"}
+
+            logger.info("Bias report generation complete")
         else:
             # Fallback if we couldn't parse with pandas
             report["shape"] = [int(meta.get("row_count", 0)), len(meta.get("columns", []) or [])]
@@ -86,8 +208,12 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
             report["summary_statistics"] = {}
     except Exception as e:
         logger.warning(f"Failed to build bias report: {e}")
-    return report
+    
+    # Clean the report to ensure JSON serialization compatibility
+    return clean_for_json(report)
 
+
+    
 
 async def run_consumer() -> None:
     consumer = AIOKafkaConsumer(
@@ -116,19 +242,26 @@ async def run_consumer() -> None:
             logger.info(f"  Event={json.dumps(value, indent=2)}")
 
             try:
-                dataset = value.get("metadata", {})
-                user_id = dataset.get("user_id")
-                dataset_id = dataset.get("dataset_id")
-                target_column_name = value.get("target_column_name")
-                task_type = value.get("task_type")
+                # Parse new Kafka message format
+                task_id = value.get("task_id")
+                input_data = value.get("input", {})
+                
+                user_id = input_data.get("user_id")
+                dataset_id = input_data.get("dataset_id")
+                target_column_name = input_data.get("target_column_name")
+                task_type = input_data.get("task_type")
+                
+                logger.info(f"Task ID={task_id}")
                 logger.info(f"Target column={target_column_name}")
                 logger.info(f"Task type={task_type}")
+                
                 if not user_id or not dataset_id:
                     logger.warning("Missing user_id/dataset_id in event; skipping")
                     continue
 
                 # Fetch metadata (optional) and download file
                 meta = fetch_dataset_metadata(user_id, dataset_id)
+
                 file_bytes = download_dataset_file(user_id, dataset_id)
 
                 # Try to read as CSV with pandas (fallback to bytes length)
@@ -149,50 +282,13 @@ async def run_consumer() -> None:
                     dataset_id=dataset_id, 
                     report=bias_report,
                     target_column_name=target_column_name,
-                    task_type=task_type
+                    task_type=task_type,
+                    task_id=task_id
                 )
                 logger.info(f"Saved bias report: {json.dumps(saved, indent=2, default=str)}")
                 
-                # --- Transformation mitigator placeholder (COMMENTED OUT) ---
-                # If a mitigator runs here, you could generate:
-                # 1) A transformed dataset (e.g., df_transformed or bytes)
-                # 2) A transformation report similar to the provided example
-                #
-                # Example transformation report structure (numbers as floats):
-                # transformation_report = [
-                #     {"column": "all", "transformation": "duplicate_removal", "method": "drop_duplicates", "original_value": "15 duplicates", "modified_value": "duplicates removed"},
-                #     {"column": "feature_0", "transformation": "skew_correction", "method": "yeo-johnson", "original_value": float(-0.818), "modified_value": float(-0.036)},
-                #     ...
-                # ]
-                #
-                # Post transformation report to API:
-                # requests.post(
-                #     f"{API_BASE}/transformation-reports/",
-                #     json={
-                #         "user_id": user_id,
-                #         "dataset_id": dataset_id,
-                #         "version": "v2",
-                #         "report": transformation_report,
-                #     },
-                #     timeout=30,
-                # ).raise_for_status()
-                #
-                # Optionally, upload v2 dataset (disabled to avoid re-triggering consumer):
-                # If you export df_transformed to CSV bytes:
-                # from io import BytesIO
-                # buf = BytesIO()
-                # df_transformed.to_csv(buf, index=False)
-                # buf.seek(0)
-                # files = {"file": ("dataset_v2.csv", buf.getvalue(), "text/csv")}
-                # data = {
-                #     "user_id": user_id,
-                #     "dataset_id": dataset_id,
-                #     "name": meta.get("name", dataset_id),
-                #     "description": "Mitigated dataset v2",
-                #     "version": "v2",
-                # }
-                # requests.post(f"{API_BASE}/datasets/upload", files=files, data=data, timeout=120).raise_for_status()
-                # --- End transformation placeholder ---
+                # Transformation step temporarily disabled to avoid re-trigger loops
+                logger.info("Transformation step skipped (temporarily disabled)")
 
             except Exception as proc_err:
                 logger.error(f"Processing error: {proc_err}")

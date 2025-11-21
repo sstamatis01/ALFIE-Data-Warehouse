@@ -112,7 +112,8 @@ def extract_dataset_folder(zip_bytes: bytes, extract_to: str = "temp_dataset") -
 
 
 def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_path: str, 
-                       model_type: str, framework: str = "sklearn", accuracy: float = None) -> dict:
+                       model_type: str, framework: str = "sklearn", accuracy: float = None,
+                       task_id: str | None = None) -> dict:
     """
     Upload trained model to Data Warehouse
     This will automatically trigger an automl-events message
@@ -132,7 +133,8 @@ def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_
             'training_accuracy': accuracy,
         }
         
-        r = requests.post(url, files=files, data=data, timeout=120)
+        headers = {"X-Task-ID": task_id} if task_id else None
+        r = requests.post(url, files=files, data=data, headers=headers, timeout=120)
         r.raise_for_status()
         return r.json()
 
@@ -141,22 +143,26 @@ async def process_automl_trigger(event: dict) -> None:
     """
     Process an AutoML trigger event from Agentic Core
     
-    Event structure:
+    Simplified event structure:
     {
-        "event_type": "automl-trigger.reported",
-        "dataset_id": "dataset123",
-        "user_id": "user123",
-        "target_column_name": "target",
-        "task_type": "classification",
-        "time_budget": "10",
-        "timestamp": "2025-10-10T12:00:00.000000"
+        "task_id": "automl_task_<...>",
+        "event_type": "automl-trigger",
+        "timestamp": "...",
+        "input": {
+            "dataset_id": "...",
+            "user_id": "...",
+            "target_column_name": "target",
+            "task_type": "classification"
+        }
     }
     """
     try:
-        user_id = event.get("user_id")
-        dataset_id = event.get("dataset_id")
-        target_column = event.get("target_column_name")
-        task_type = event.get("task_type")
+        task_id = event.get("task_id")
+        input_obj = event.get("input", {})
+        user_id = input_obj.get("user_id")
+        dataset_id = input_obj.get("dataset_id")
+        target_column = input_obj.get("target_column_name")
+        task_type = input_obj.get("task_type")
         time_budget = event.get("time_budget", "10")
         
         if not user_id or not dataset_id:
@@ -173,9 +179,9 @@ async def process_automl_trigger(event: dict) -> None:
         try:
             metadata = fetch_dataset_metadata(user_id, dataset_id)
             
-            # Get is_folder from trigger event (not from fetched metadata)
-            is_folder = event.get("is_folder", False)
-            file_count = event.get("file_count", 1)
+            # Simplified schema doesn't include these; default values
+            is_folder = False
+            file_count = 1
             
             logger.info(f"Dataset type: {'FOLDER' if is_folder else 'SINGLE FILE'}")
             if is_folder:
@@ -253,7 +259,8 @@ async def process_automl_trigger(event: dict) -> None:
                 model_file_path=dummy_model_path,
                 model_type=task_type,
                 framework="sklearn",
-                accuracy=0.92  # Dummy accuracy for testing
+                accuracy=0.92,  # Dummy accuracy for testing
+                task_id=task_id
             )
             logger.info(f"✅ Model uploaded to DW successfully!")
             logger.info(f"   Model ID: {model_id}")

@@ -23,6 +23,8 @@ import logging
 from datetime import datetime
 from aiokafka import AIOKafkaConsumer
 import requests
+import pandas as pd
+from io import BytesIO
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger("kafka_xai_consumer")
@@ -43,12 +45,70 @@ def fetch_dataset_metadata(user_id: str, dataset_id: str) -> dict:
     return r.json()
 
 
+def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
+    """
+    Try to read CSV with multiple encodings
+    
+    Handles files with different encodings:
+    - utf-8: Standard
+    - latin-1 (ISO-8859-1): Western European
+    - cp1252 (Windows-1252): Windows default
+    - utf-16: Some Excel exports
+    """
+    from io import BytesIO
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1', 'utf-16']
+    
+    for encoding in encodings:
+        try:
+            df = pd.read_csv(BytesIO(file_data), encoding=encoding)
+            logger.info(f"Successfully read CSV with encoding: {encoding}")
+            return df
+        except (UnicodeDecodeError, Exception):
+            continue
+    
+    # If all encodings fail, try with error handling
+    try:
+        df = pd.read_csv(BytesIO(file_data), encoding='utf-8', encoding_errors='ignore')
+        logger.warning("Read CSV with 'ignore' errors - some characters may be missing")
+        return df
+    except Exception as e:
+        logger.error(f"Failed to read CSV with all encodings: {e}")
+        raise
+
+
 def download_dataset_file(user_id: str, dataset_id: str) -> bytes:
-    """Download dataset file from the Data Warehouse API"""
+    """Download dataset file (single file or folder as ZIP)"""
     url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
+
+
+def extract_dataset_folder(zip_bytes: bytes, extract_to: str = "temp_dataset") -> list:
+    """
+    Extract ZIP file containing dataset folder
+    
+    Returns:
+        List of extracted file paths
+    """
+    import zipfile
+    from io import BytesIO
+    
+    # Create extraction directory
+    os.makedirs(extract_to, exist_ok=True)
+    
+    # Extract ZIP
+    with zipfile.ZipFile(BytesIO(zip_bytes), 'r') as zip_ref:
+        zip_ref.extractall(extract_to)
+    
+    # List extracted files
+    extracted_files = []
+    for root, dirs, files in os.walk(extract_to):
+        for file in files:
+            file_path = os.path.join(root, file)
+            extracted_files.append(file_path)
+    
+    return extracted_files
 
 
 def fetch_model_metadata(user_id: str, model_id: str, version: str = "v1") -> dict:
@@ -61,7 +121,7 @@ def fetch_model_metadata(user_id: str, model_id: str, version: str = "v1") -> di
 
 
 def download_model_file(user_id: str, model_id: str, version: str = "v1", filename: str = None) -> bytes:
-    """Download AI model file from the Data Warehouse API"""
+    """Download AI model file (single file or folder as ZIP)"""
     url = f"{API_BASE}/ai-models/{user_id}/{model_id}/download"
     params = {"version": version}
     if filename:
@@ -71,8 +131,36 @@ def download_model_file(user_id: str, model_id: str, version: str = "v1", filena
     return r.content
 
 
+def extract_model_folder(zip_bytes: bytes, extract_to: str = "temp_model") -> list:
+    """
+    Extract ZIP file containing model folder
+    
+    Returns:
+        List of extracted file paths
+    """
+    import zipfile
+    from io import BytesIO
+    
+    # Create extraction directory
+    os.makedirs(extract_to, exist_ok=True)
+    
+    # Extract ZIP
+    with zipfile.ZipFile(BytesIO(zip_bytes), 'r') as zip_ref:
+        zip_ref.extractall(extract_to)
+    
+    # List extracted files
+    extracted_files = []
+    for root, dirs, files in os.walk(extract_to):
+        for file in files:
+            file_path = os.path.join(root, file)
+            extracted_files.append(file_path)
+    
+    return extracted_files
+
+
 def upload_xai_report(user_id: str, dataset_id: str, model_id: str, 
-                     report_type: str, level: str, html_file_path: str) -> dict:
+                     report_type: str, level: str, html_file_path: str,
+                     task_id: str | None = None) -> dict:
     """
     Upload XAI report to Data Warehouse
     This will automatically trigger an xai-events message
@@ -88,7 +176,8 @@ def upload_xai_report(user_id: str, dataset_id: str, model_id: str,
             'level': level
         }
         
-        r = requests.post(url, files=files, data=data, timeout=120)
+        headers = {"X-Task-ID": task_id} if task_id else None
+        r = requests.post(url, files=files, data=data, headers=headers, timeout=120)
         r.raise_for_status()
         return r.json()
 
@@ -97,23 +186,36 @@ async def process_xai_trigger(event: dict) -> None:
     """
     Process an XAI trigger event from Agentic Core
     
-    Event structure:
+    Simplified event structure:
     {
-        "event_type": "xai-trigger.reported",
-        "user_id": "user123",
-        "dataset_id": "dataset123",
-        "model_id": "model123",
-        "version": "v1",
-        "level": "beginner",
-        "timestamp": "2025-10-10T12:00:00.000000"
+        "task_id": "xai_task_<...>",
+        "event_type": "xai-trigger",
+        "timestamp": "...",
+        "input": {
+            "user_id": "user123",
+            "dataset_id": "dataset123",
+            "model_id": "model123",
+            "report_type": "lime",
+            "level": "beginner"
+        }
     }
     """
     try:
-        user_id = event.get("user_id")
-        dataset_id = event.get("dataset_id")
-        model_id = event.get("model_id")
-        version = event.get("version", "v1")
-        level = event.get("level", "beginner")
+        task_id = event.get("task_id")
+        input_obj = event.get("input", {})
+        user_id = input_obj.get("user_id")
+        dataset_id = input_obj.get("dataset_id")
+        model_id = input_obj.get("model_id")
+        # version not part of simplified schema; default v1
+        version = "v1"
+        level = input_obj.get("level", "beginner")
+        report_type = input_obj.get("report_type", "lime")
+        
+        # Simplified schema doesn't include these; default values
+        is_folder = False
+        file_count = 1
+        is_model_folder = False
+        model_file_count = 1
         
         if not user_id or not dataset_id or not model_id:
             logger.warning("Missing required fields in event; skipping")
@@ -123,22 +225,56 @@ async def process_xai_trigger(event: dict) -> None:
         logger.info(f"  User: {user_id}")
         logger.info(f"  Dataset: {dataset_id}")
         logger.info(f"  Level: {level}")
+        logger.info(f"  Dataset type: {'FOLDER' if is_folder else 'SINGLE FILE'} ({file_count} file(s))")
+        logger.info(f"  Model type: {'FOLDER' if is_model_folder else 'SINGLE FILE'} ({model_file_count} file(s))")
         
-        # Step 1: Fetch dataset
+        # Step 1: Fetch and download dataset
         try:
             dataset_meta = fetch_dataset_metadata(user_id, dataset_id)
+            logger.info(f"Dataset metadata fetched: {dataset_meta.get('name')}")
+            
+            # Download dataset (single file or ZIP)
             dataset_bytes = download_dataset_file(user_id, dataset_id)
             logger.info(f"Dataset downloaded: {len(dataset_bytes)} bytes")
+            
+            # Handle dataset based on type
+            dataset_extracted_files = []
+            if is_folder:
+                logger.info("Extracting folder dataset...")
+                dataset_extracted_files = extract_dataset_folder(dataset_bytes, f"temp_xai_dataset_{dataset_id}")
+                logger.info(f"Extracted {len(dataset_extracted_files)} dataset files:")
+                for file_path in dataset_extracted_files:
+                    logger.info(f"  - {file_path}")
+            else:
+                logger.info("Dataset is single file - ready for XAI analysis")
+            
         except Exception as e:
             logger.error(f"Failed to fetch dataset: {e}")
             return
         
-        # Step 2: Fetch model
+        # Step 2: Fetch and download model
         try:
             model_meta = fetch_model_metadata(user_id, model_id, version)
-            # Optionally download model file if needed
-            # model_bytes = download_model_file(user_id, model_id, version)
             logger.info(f"Model metadata fetched: {model_meta.get('name')}")
+            logger.info(f"  Framework: {model_meta.get('framework')}")
+            logger.info(f"  Files: {len(model_meta.get('files', []))}")
+            
+            # Download model (single file or folder as ZIP)
+            model_bytes = download_model_file(user_id, model_id, version)
+            logger.info(f"Model downloaded: {len(model_bytes)} bytes")
+            
+            # Handle model based on type
+            model_extracted_files = []
+            if is_model_folder:
+                logger.info("Extracting model folder...")
+                model_extracted_files = extract_model_folder(model_bytes, f"temp_xai_model_{model_id}")
+                logger.info(f"Extracted {len(model_extracted_files)} model files:")
+                for file_path in model_extracted_files:
+                    logger.info(f"  - {file_path}")
+                logger.info("NOTE: All model files are available for XAI analysis")
+            else:
+                logger.info("Model is single file - ready for XAI analysis")
+            
         except Exception as e:
             logger.error(f"Failed to fetch model: {e}")
             return
@@ -154,6 +290,39 @@ async def process_xai_trigger(event: dict) -> None:
         logger.info(f"  - Level: {level}")
         logger.info("=" * 80)
         
+        # 4 Possible Combinations:
+        # 1. Single Dataset + Single Model (most common)
+        # 2. Single Dataset + Model Folder (model.pkl + label_encoders.pkl)
+        # 3. Folder Dataset + Single Model (train.csv, test.csv + model.pkl)
+        # 4. Folder Dataset + Model Folder (multiple data files + multiple model files)
+        
+        logger.info("XAI Resources Available:")
+        if is_folder:
+            logger.info(f"  Dataset: {len(dataset_extracted_files)} files extracted")
+            # Example: Load CSV for XAI
+            # csv_files = [f for f in dataset_extracted_files if f.endswith('.csv')]
+            # df = pd.read_csv(csv_files[0])
+        else:
+            logger.info(f"  Dataset: Single file ({len(dataset_bytes)} bytes)")
+            # Example: Load dataset
+            # df = pd.read_csv(BytesIO(dataset_bytes))
+        
+        if is_model_folder:
+            logger.info(f"  Model: {len(model_extracted_files)} files extracted")
+            # Example: Load model and encoders
+            # import pickle
+            # model_pkl = [f for f in model_extracted_files if f.endswith('model.pkl')][0]
+            # encoder_pkl = [f for f in model_extracted_files if 'encoder' in f.lower()][0]
+            # with open(model_pkl, 'rb') as f:
+            #     model = pickle.load(f)
+            # with open(encoder_pkl, 'rb') as f:
+            #     encoders = pickle.load(f)
+        else:
+            logger.info(f"  Model: Single file ({len(model_bytes)} bytes)")
+            # Example: Load single model
+            # import pickle
+            # model = pickle.loads(model_bytes)
+        
         # Use dummy HTML files for testing
         html_file_path_model = f"model-{level}.html"
         html_file_path_data = f"data-{level}.html"
@@ -168,7 +337,8 @@ async def process_xai_trigger(event: dict) -> None:
                     model_id=model_id,
                     report_type="model_explanation",
                     level=level,
-                    html_file_path=html_file_path_model
+                    html_file_path=html_file_path_model,
+                    task_id=task_id
                 )
                 logger.info(f"✅ Model explanation report uploaded successfully!")
                 logger.info(f"   Report type: model_explanation")
@@ -190,7 +360,8 @@ async def process_xai_trigger(event: dict) -> None:
                     model_id=model_id,
                     report_type="data_explanation",
                     level=level,
-                    html_file_path=html_file_path_data
+                    html_file_path=html_file_path_data,
+                    task_id=task_id
                 )
                 logger.info(f"✅ Data explanation report uploaded successfully!")
                 logger.info(f"   Report type: data_explanation")
