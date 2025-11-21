@@ -84,7 +84,6 @@ class DatasetUpdate(BaseModel):
     description: Optional[str] = None
     tags: Optional[List[str]] = None
     custom_metadata: Optional[Dict[str, Any]] = None
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class DatasetResponse(BaseModel):

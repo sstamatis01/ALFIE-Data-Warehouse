@@ -256,7 +256,6 @@ class VoteCreate(BaseModel):
 
 class VoteUpdate(BaseModel):
     vote_value: int
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class VoteResponse(BaseModel):

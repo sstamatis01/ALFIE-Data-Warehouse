@@ -150,7 +150,6 @@ class ModelUpdate(BaseModel):
     custom_metadata: Optional[Dict[str, Any]] = None
     is_active: Optional[bool] = None
     is_production_ready: Optional[bool] = None
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class ModelResponse(BaseModel):

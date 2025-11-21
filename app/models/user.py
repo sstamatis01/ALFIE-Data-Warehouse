@@ -49,7 +49,6 @@ class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
     full_name: Optional[str] = None
     is_active: Optional[bool] = None
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class UserResponse(BaseModel):
