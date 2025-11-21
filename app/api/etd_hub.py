@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query, Path
+from fastapi.responses import StreamingResponse
 from typing import Optional, List
 import logging
 
@@ -12,6 +13,7 @@ from ..models.etd_hub import (
     ProblemCategory, ModelCategory, DomainCategory, AreaOfExpertise
 )
 from ..services.etd_hub_service import etd_hub_service
+from ..services.etd_hub_export_service import etd_hub_export_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/etd-hub", tags=["ETD-Hub"])
@@ -513,3 +515,33 @@ async def get_overview_stats():
     except Exception as e:
         logger.error(f"Error getting overview stats: {e}")
         raise HTTPException(status_code=500, detail="Failed to get overview statistics")
+
+
+# Export endpoints
+@router.get("/export/excel", response_class=StreamingResponse)
+async def export_etd_hub_data_to_excel():
+    """
+    Export all ETD-Hub data to an Excel file for download.
+    
+    This endpoint collects all available data from the ETD-Hub section including:
+    - Themes (case studies)
+    - Documents
+    - Questions and Answers
+    - Votes
+    - Expert profiles
+    - Summary statistics
+    
+    Returns an Excel file with multiple sheets containing all the data.
+    """
+    try:
+        # Initialize the export service
+        await etd_hub_export_service.initialize()
+        
+        # Generate and return the Excel file
+        return await etd_hub_export_service.export_all_data_to_excel()
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error exporting ETD-Hub data: {e}")
+        raise HTTPException(status_code=500, detail="Failed to export ETD-Hub data to Excel")

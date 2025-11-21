@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from typing import List, Optional
 import logging
@@ -23,7 +23,8 @@ async def upload_xai_report(
     dataset_id: str = Form(...),
     model_id: str = Form(...),
     report_type: ReportType = Form(...),
-    level: ExpertiseLevel = Form(...)
+    level: ExpertiseLevel = Form(...),
+    task_id: Optional[str] = Header(None, alias="X-Task-ID")
 ):
     """
     Upload an XAI report HTML file
@@ -46,24 +47,41 @@ async def upload_xai_report(
 
         result = await xai_report_service.upload_report(file, report_data)
         
-        # Send Kafka XAI event (non-blocking)
-        try:
-            await kafka_producer_service.send_xai_event(
-                user_id=user_id,
-                dataset_id=dataset_id,
-                model_id=model_id,
-                report_type=report_type.value,
-                level=level.value,
-                xai_report_id=str(result.id) if hasattr(result, 'id') else None
-            )
-        except Exception as e:
-            logger.warning(f"Failed to send XAI Kafka event: {e}")
+        # Send Kafka XAI completion event if task_id is provided
+        if task_id:
+            try:
+                await kafka_producer_service.send_xai_complete_event(
+                    task_id=task_id,
+                    user_id=user_id,
+                    dataset_id=dataset_id,
+                    model_id=model_id,
+                    xai_report_id=str(result.id) if hasattr(result, 'id') else str(result),
+                    success=True
+                )
+                logger.info(f"XAI completion event sent for task_id={task_id}")
+            except Exception as e:
+                logger.error(f"Failed to send XAI completion event: {e}", exc_info=True)
         
         return result
 
     except HTTPException:
         raise
     except Exception as e:
+        # Send failure event if task_id is provided
+        if task_id:
+            try:
+                await kafka_producer_service.send_xai_complete_event(
+                    task_id=task_id,
+                    user_id=user_id,
+                    dataset_id=dataset_id,
+                    model_id=model_id,
+                    xai_report_id="",
+                    success=False,
+                    error_message="Failed to upload XAI report"
+                )
+                logger.info(f"XAI failure event sent for task_id={task_id}")
+            except Exception as kafka_error:
+                logger.error(f"Failed to send XAI failure event: {kafka_error}", exc_info=True)
         logger.error(f"Error uploading XAI report: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload XAI report")
 

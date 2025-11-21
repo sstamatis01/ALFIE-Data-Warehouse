@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Query
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Query, Header
 from fastapi.responses import StreamingResponse
 from typing import Optional, List
 import io
 import logging
+from datetime import datetime
 
 from ..models.ai_model import (
     AIModelMetadata, ModelCreate, ModelUpdate, ModelResponse, 
@@ -104,7 +105,8 @@ async def upload_single_model_file(
     test_accuracy: Optional[float] = Form(None),
     training_loss: Optional[float] = Form(None),
     python_version: Optional[str] = Form(None),
-    hardware_requirements: Optional[str] = Form(None)
+    hardware_requirements: Optional[str] = Form(None),
+    task_id: Optional[str] = Header(None, alias="X-Task-ID")
 ):
     """
     Upload a single AI model file
@@ -176,36 +178,39 @@ async def upload_single_model_file(
         # Return the created model
         created_model = await collection.find_one({"_id": result.inserted_id})
         
-        # Send Kafka AutoML event (non-blocking)
-        try:
-            # Get dataset folder info if training_dataset is provided
-            is_folder, file_count = await _get_dataset_folder_info(user_id, model_metadata.training_dataset)
-            
-            await kafka_producer_service.send_automl_event(
-                user_id=user_id,
-                model_id=model_id,
-                dataset_id=model_metadata.training_dataset,
-                version=version,
-                framework=framework.value if framework else None,
-                model_type=model_type.value if model_type else None,
-                algorithm=algorithm,
-                model_size_mb=model_size_mb,
-                training_accuracy=training_accuracy,
-                validation_accuracy=validation_accuracy,
-                test_accuracy=test_accuracy,
-                is_folder=is_folder,
-                file_count=file_count,
-                is_model_folder=model_metadata.is_model_folder,
-                model_file_count=model_metadata.model_file_count
-            )
-        except Exception as e:
-            logger.warning(f"Failed to send AutoML Kafka event: {e}")
+        # Send Kafka AutoML completion event if task_id is provided
+        if task_id:
+            try:
+                await kafka_producer_service.send_automl_complete_event(
+                    task_id=task_id,
+                    user_id=user_id,
+                    model_id=model_id,
+                    dataset_id=model_metadata.training_dataset,
+                    success=True
+                )
+                logger.info(f"AutoML completion event sent for task_id={task_id}")
+            except Exception as e:
+                logger.error(f"Failed to send AutoML completion event: {e}", exc_info=True)
         
         return ModelResponse(**created_model)
         
     except HTTPException:
         raise
     except Exception as e:
+        # Send failure event if task_id is provided
+        if task_id:
+            try:
+                await kafka_producer_service.send_automl_complete_event(
+                    task_id=task_id,
+                    user_id=user_id,
+                    model_id=model_id,
+                    dataset_id=training_dataset,
+                    success=False,
+                    error_message="Failed to upload AI model"
+                )
+                logger.info(f"AutoML failure event sent for task_id={task_id}")
+            except Exception as kafka_error:
+                logger.error(f"Failed to send AutoML failure event: {kafka_error}", exc_info=True)
         logger.error(f"Error uploading AI model: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload AI model")
 
@@ -553,6 +558,7 @@ async def update_model(
         
         # Prepare update data
         update_data = model_update.dict(exclude_unset=True)
+        update_data['updated_at'] = datetime.utcnow()
         
         # Update model
         result = await collection.update_one(
