@@ -68,11 +68,12 @@ def clean_for_json(obj):
 
 def post_bias_report(user_id: str, dataset_id: str, report: dict, 
                      target_column_name: str = None, task_type: str = None,
-                     task_id: str | None = None) -> dict:
+                     dataset_version: str = "v1", task_id: str | None = None) -> dict:
     url = f"{API_BASE}/bias-reports/"
     payload = {
         "user_id": user_id,
         "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
         "report": report,
         "target_column_name": target_column_name,
         "task_type": task_type,
@@ -259,6 +260,9 @@ async def run_consumer() -> None:
                     logger.warning("Missing user_id/dataset_id in event; skipping")
                     continue
 
+                # Extract dataset version from input (if provided)
+                dataset_version = input_data.get("dataset_version", "v1")  # Default to v1 for backward compatibility
+                
                 # Fetch metadata (optional) and download file
                 meta = fetch_dataset_metadata(user_id, dataset_id)
 
@@ -276,13 +280,14 @@ async def run_consumer() -> None:
                 # Build bias report (profile) per the corrected example
                 bias_report = build_bias_report(df, meta)
 
-                # POST bias report to API (include target_column_name and task_type)
+                # POST bias report to API (include target_column_name, task_type, and dataset_version)
                 saved = post_bias_report(
                     user_id=user_id, 
                     dataset_id=dataset_id, 
                     report=bias_report,
                     target_column_name=target_column_name,
                     task_type=task_type,
+                    dataset_version=dataset_version,
                     task_id=task_id
                 )
                 logger.info(f"Saved bias report: {json.dumps(saved, indent=2, default=str)}")

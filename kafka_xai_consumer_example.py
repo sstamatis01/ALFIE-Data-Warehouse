@@ -37,9 +37,12 @@ KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "xai-consumer")
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
 
-def fetch_dataset_metadata(user_id: str, dataset_id: str) -> dict:
-    """Fetch dataset metadata from the Data Warehouse API"""
-    url = f"{API_BASE}/datasets/{user_id}/{dataset_id}"
+def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -> dict:
+    """Fetch dataset metadata from the Data Warehouse API (specific version or latest)"""
+    if version:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}"
+    else:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
@@ -76,9 +79,12 @@ def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
         raise
 
 
-def download_dataset_file(user_id: str, dataset_id: str) -> bytes:
-    """Download dataset file (single file or folder as ZIP)"""
-    url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
+def download_dataset_file(user_id: str, dataset_id: str, version: str = None) -> bytes:
+    """Download dataset file (single file or folder as ZIP) - specific version or latest"""
+    if version:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}/download"
+    else:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
@@ -158,7 +164,8 @@ def extract_model_folder(zip_bytes: bytes, extract_to: str = "temp_model") -> li
     return extracted_files
 
 
-def upload_xai_report(user_id: str, dataset_id: str, model_id: str, 
+def upload_xai_report(user_id: str, dataset_id: str, dataset_version: str,
+                     model_id: str, model_version: str,
                      report_type: str, level: str, html_file_path: str,
                      task_id: str | None = None) -> dict:
     """
@@ -171,7 +178,9 @@ def upload_xai_report(user_id: str, dataset_id: str, model_id: str,
         files = {'file': (os.path.basename(html_file_path), f, 'text/html')}
         data = {
             'dataset_id': dataset_id,
+            'dataset_version': dataset_version,
             'model_id': model_id,
+            'model_version': model_version,
             'report_type': report_type,
             'level': level
         }
@@ -194,7 +203,9 @@ async def process_xai_trigger(event: dict) -> None:
         "input": {
             "user_id": "user123",
             "dataset_id": "dataset123",
+            "dataset_version": "v1",
             "model_id": "model123",
+            "model_version": "v1",
             "report_type": "lime",
             "level": "beginner"
         }
@@ -205,9 +216,9 @@ async def process_xai_trigger(event: dict) -> None:
         input_obj = event.get("input", {})
         user_id = input_obj.get("user_id")
         dataset_id = input_obj.get("dataset_id")
+        dataset_version = input_obj.get("dataset_version", "v1")  # Default to v1 for backward compatibility
         model_id = input_obj.get("model_id")
-        # version not part of simplified schema; default v1
-        version = "v1"
+        model_version = input_obj.get("model_version", "v1")  # Default to v1 for backward compatibility
         level = input_obj.get("level", "beginner")
         report_type = input_obj.get("report_type", "lime")
         
@@ -221,20 +232,20 @@ async def process_xai_trigger(event: dict) -> None:
             logger.warning("Missing required fields in event; skipping")
             return
         
-        logger.info(f"Processing XAI trigger for model {model_id}")
+        logger.info(f"Processing XAI trigger for model {model_id} version {model_version}")
         logger.info(f"  User: {user_id}")
-        logger.info(f"  Dataset: {dataset_id}")
+        logger.info(f"  Dataset: {dataset_id} version {dataset_version}")
         logger.info(f"  Level: {level}")
         logger.info(f"  Dataset type: {'FOLDER' if is_folder else 'SINGLE FILE'} ({file_count} file(s))")
         logger.info(f"  Model type: {'FOLDER' if is_model_folder else 'SINGLE FILE'} ({model_file_count} file(s))")
         
         # Step 1: Fetch and download dataset
         try:
-            dataset_meta = fetch_dataset_metadata(user_id, dataset_id)
-            logger.info(f"Dataset metadata fetched: {dataset_meta.get('name')}")
+            dataset_meta = fetch_dataset_metadata(user_id, dataset_id, dataset_version)
+            logger.info(f"Dataset metadata fetched: {dataset_meta.get('name')} (version {dataset_version})")
             
             # Download dataset (single file or ZIP)
-            dataset_bytes = download_dataset_file(user_id, dataset_id)
+            dataset_bytes = download_dataset_file(user_id, dataset_id, dataset_version)
             logger.info(f"Dataset downloaded: {len(dataset_bytes)} bytes")
             
             # Handle dataset based on type
@@ -254,13 +265,13 @@ async def process_xai_trigger(event: dict) -> None:
         
         # Step 2: Fetch and download model
         try:
-            model_meta = fetch_model_metadata(user_id, model_id, version)
-            logger.info(f"Model metadata fetched: {model_meta.get('name')}")
+            model_meta = fetch_model_metadata(user_id, model_id, model_version)
+            logger.info(f"Model metadata fetched: {model_meta.get('name')} (version {model_version})")
             logger.info(f"  Framework: {model_meta.get('framework')}")
             logger.info(f"  Files: {len(model_meta.get('files', []))}")
             
             # Download model (single file or folder as ZIP)
-            model_bytes = download_model_file(user_id, model_id, version)
+            model_bytes = download_model_file(user_id, model_id, model_version)
             logger.info(f"Model downloaded: {len(model_bytes)} bytes")
             
             # Handle model based on type
@@ -334,7 +345,9 @@ async def process_xai_trigger(event: dict) -> None:
                 result_model = upload_xai_report(
                     user_id=user_id,
                     dataset_id=dataset_id,
+                    dataset_version=dataset_version,
                     model_id=model_id,
+                    model_version=model_version,
                     report_type="model_explanation",
                     level=level,
                     html_file_path=html_file_path_model,
@@ -357,7 +370,9 @@ async def process_xai_trigger(event: dict) -> None:
                 result_data = upload_xai_report(
                     user_id=user_id,
                     dataset_id=dataset_id,
+                    dataset_version=dataset_version,
                     model_id=model_id,
+                    model_version=model_version,
                     report_type="data_explanation",
                     level=level,
                     html_file_path=html_file_path_data,

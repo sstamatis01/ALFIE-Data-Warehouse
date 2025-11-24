@@ -20,7 +20,7 @@ import os
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from aiokafka import AIOKafkaConsumer
 import requests
 import pandas as pd
@@ -37,9 +37,12 @@ KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "automl-consumer")
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
 
-def fetch_dataset_metadata(user_id: str, dataset_id: str) -> dict:
-    """Fetch dataset metadata from the Data Warehouse API"""
-    url = f"{API_BASE}/datasets/{user_id}/{dataset_id}"
+def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -> dict:
+    """Fetch dataset metadata from the Data Warehouse API (specific version or latest)"""
+    if version:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}"
+    else:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
@@ -76,9 +79,12 @@ def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
         raise
 
 
-def download_dataset_file(user_id: str, dataset_id: str) -> bytes:
-    """Download dataset file (single file or folder as ZIP)"""
-    url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
+def download_dataset_file(user_id: str, dataset_id: str, version: str = None) -> bytes:
+    """Download dataset file (single file or folder as ZIP) - specific version or latest"""
+    if version:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}/download"
+    else:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
@@ -113,7 +119,7 @@ def extract_dataset_folder(zip_bytes: bytes, extract_to: str = "temp_dataset") -
 
 def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_path: str, 
                        model_type: str, framework: str = "sklearn", accuracy: float = None,
-                       task_id: str | None = None) -> dict:
+                       dataset_version: str = None, task_id: str | None = None) -> dict:
     """
     Upload trained model to Data Warehouse
     This will automatically trigger an automl-events message
@@ -121,12 +127,19 @@ def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_
     """
     url = f"{API_BASE}/ai-models/upload/single/{user_id}"
     
+    # Include dataset version in description for data lineage tracking
+    description = f"AutoML trained model for {model_type}"
+    if dataset_version:
+        description += f" (trained on dataset {dataset_id} version {dataset_version})"
+    else:
+        description += f" (trained on dataset {dataset_id})"
+    
     with open(model_file_path, 'rb') as f:
         files = {'file': (os.path.basename(model_file_path), f)}
         data = {
             'model_id': model_id,
             'name': f"AutoML Model - {model_id}",
-            'description': f"AutoML trained model for {model_type}",
+            'description': description,
             'framework': framework,
             'model_type': model_type,
             'training_dataset': dataset_id,  # Link to dataset
@@ -150,6 +163,7 @@ async def process_automl_trigger(event: dict) -> None:
         "timestamp": "...",
         "input": {
             "dataset_id": "...",
+            "dataset_version": "v1",
             "user_id": "...",
             "target_column_name": "target",
             "task_type": "classification"
@@ -161,6 +175,7 @@ async def process_automl_trigger(event: dict) -> None:
         input_obj = event.get("input", {})
         user_id = input_obj.get("user_id")
         dataset_id = input_obj.get("dataset_id")
+        dataset_version = input_obj.get("dataset_version", "v1")  # Default to v1 for backward compatibility
         target_column = input_obj.get("target_column_name")
         task_type = input_obj.get("task_type")
         time_budget = event.get("time_budget", "10")
@@ -169,7 +184,7 @@ async def process_automl_trigger(event: dict) -> None:
             logger.warning("Missing user_id or dataset_id in event; skipping")
             return
         
-        logger.info(f"Processing AutoML trigger for dataset {dataset_id}")
+        logger.info(f"Processing AutoML trigger for dataset {dataset_id} version {dataset_version}")
         logger.info(f"  User: {user_id}")
         logger.info(f"  Target column: {target_column}")
         logger.info(f"  Task type: {task_type}")
@@ -177,7 +192,7 @@ async def process_automl_trigger(event: dict) -> None:
         
         # Step 1: Fetch dataset metadata and download file
         try:
-            metadata = fetch_dataset_metadata(user_id, dataset_id)
+            metadata = fetch_dataset_metadata(user_id, dataset_id, dataset_version)
             
             # Simplified schema doesn't include these; default values
             is_folder = False
@@ -187,7 +202,7 @@ async def process_automl_trigger(event: dict) -> None:
             if is_folder:
                 logger.info(f"File count: {file_count}")
             
-            file_bytes = download_dataset_file(user_id, dataset_id)
+            file_bytes = download_dataset_file(user_id, dataset_id, dataset_version)
             logger.info(f"Dataset downloaded: {len(file_bytes)} bytes")
         except Exception as e:
             logger.error(f"Failed to fetch dataset: {e}")
@@ -239,7 +254,7 @@ async def process_automl_trigger(event: dict) -> None:
         logger.info("=" * 80)
         
         # Generate model ID
-        model_id = f"automl_{dataset_id}_{int(datetime.utcnow().timestamp())}"
+        model_id = f"automl_{dataset_id}_{int(datetime.now(timezone.utc).timestamp())}"
         
         # Use dummy model.pkl file for testing
         dummy_model_path = "model.pkl"
@@ -260,6 +275,7 @@ async def process_automl_trigger(event: dict) -> None:
                 model_type=task_type,
                 framework="sklearn",
                 accuracy=0.92,  # Dummy accuracy for testing
+                dataset_version=dataset_version,
                 task_id=task_id
             )
             logger.info(f"✅ Model uploaded to DW successfully!")
@@ -309,6 +325,7 @@ async def run_consumer() -> None:
             logger.info("=" * 80)
             
             # Process the AutoML trigger event
+            # The process_automl_trigger function extracts input data from the event
             await process_automl_trigger(value)
     
     finally:

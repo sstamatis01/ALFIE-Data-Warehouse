@@ -61,6 +61,7 @@ async def process_automl_trigger(event: dict) -> None:
     try:
         user_id = event.get("user_id")
         dataset_id = event.get("dataset_id")
+        dataset_version = event.get("dataset_version", "v1")  # Default to v1 for backward compatibility
         target_column = event.get("target_column_name")
         task_type = event.get("task_type")
         time_budget = event.get("time_budget", "10")
@@ -70,7 +71,7 @@ async def process_automl_trigger(event: dict) -> None:
             logger.warning("Missing user_id or dataset_id in event; skipping")
             return
         
-        logger.info(f"Processing AutoML trigger for dataset {dataset_id}")
+        logger.info(f"Processing AutoML trigger for dataset {dataset_id} version {dataset_version}")
         logger.info(f"  User: {user_id}")
         logger.info(f"  Target column: {target_column}")
         logger.info(f"  Task type: {task_type}")
@@ -81,6 +82,7 @@ async def process_automl_trigger(event: dict) -> None:
             data = {
                 "user_id" : user_id,
                 "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
                 "target_column_name": target_column,
                 "task_type": task_type,
                 "time_budget": time_budget
@@ -130,7 +132,9 @@ async def run_consumer() -> None:
             logger.info("=" * 80)
             
             # Process the AutoML trigger event
-            await process_automl_trigger(value)
+            # Extract input data from the Kafka message structure
+            input_data = value.get("input", value)  # Fallback to value for backward compatibility
+            await process_automl_trigger(input_data)
     
     finally:
         await consumer.stop()

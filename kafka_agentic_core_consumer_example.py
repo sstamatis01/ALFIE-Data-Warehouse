@@ -19,7 +19,7 @@ import os
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 import requests
 import pandas as pd
@@ -195,14 +195,25 @@ async def consume_dataset_events(producer):
                 logger.info("[User Interaction] TODO: Ask user for target column and task type")
                 
                 # Generate a simple task_id for now (partners will implement proper Task Manager)
-                task_id = f"bias_task_{dataset_id}_{int(datetime.utcnow().timestamp())}"
+                task_id = f"bias_task_{dataset_id}_{int(datetime.now(timezone.utc).timestamp())}"
+                
+                # Get the dataset version from the event dataset object or fetched metadata
+                # First try from the dataset object in the event, then from fetched metadata
+                dataset_version = dataset.get("version")
+                if not dataset_version:
+                    # Try to get from fetched metadata
+                    if meta:
+                        dataset_version = meta.get("version", "v1")
+                    else:
+                        dataset_version = "v1"  # Default fallback
                 
                 payload = {
                     "task_id": task_id,
                     "event_type": "bias-detection-trigger",
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "input": {
                         "dataset_id": dataset_id,
+                        "dataset_version": dataset_version,
                         "user_id": user_id,
                         "target_column_name": "target",  # TODO: Get from user
                         "task_type": "classification"   # TODO: Get from user
@@ -278,15 +289,26 @@ async def consume_bias_events(producer):
                 logger.info("[User Interaction] TODO: Report bias findings and ask if user wants to proceed with AutoML")
                 
                 # Generate a simple task_id for now (partners will implement proper Task Manager)
-                automl_task_id = f"automl_task_{dataset_id}_{int(datetime.utcnow().timestamp())}"
+                automl_task_id = f"automl_task_{dataset_id}_{int(datetime.now(timezone.utc).timestamp())}"
+                
+                # Get dataset version from bias event output or fetch metadata
+                dataset_version = output.get("dataset_version")
+                if not dataset_version:
+                    # Fallback: fetch from API
+                    try:
+                        dataset_metadata = fetch_dataset_metadata(user_id, dataset_id)
+                        dataset_version = dataset_metadata.get("version", "v1")
+                    except Exception:
+                        dataset_version = "v1"  # Default fallback
                 
                 # Produce AutoML trigger event
                 payload = {
                     "task_id": automl_task_id,
                     "event_type": "automl-trigger",
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "input": {
                         "dataset_id": dataset_id,
+                        "dataset_version": dataset_version,
                         "user_id": user_id,
                         "target_column_name": "target",  # TODO: Get from user
                         "task_type": "classification"   # TODO: Get from user
@@ -362,18 +384,32 @@ async def consume_automl_events(producer):
                 logger.info("[User Interaction] TODO: Ask user if they want XAI explanations")
                 
                 # Generate a simple task_id for now (partners will implement proper Task Manager)
-                xai_task_id = f"xai_task_{model_id}_{int(datetime.utcnow().timestamp())}"
+                xai_task_id = f"xai_task_{model_id}_{int(datetime.now(timezone.utc).timestamp())}"
                 
                 # Produce XAI trigger event (if dataset_id is available)
                 if dataset_id:
+                    # Get versions from AutoML event output or fetch metadata
+                    dataset_version = output.get("dataset_version")
+                    model_version = output.get("model_version", "v1")  # Model version from AutoML event
+                    
+                    if not dataset_version:
+                        # Fallback: fetch from API
+                        try:
+                            dataset_metadata = fetch_dataset_metadata(user_id, dataset_id)
+                            dataset_version = dataset_metadata.get("version", "v1")
+                        except Exception:
+                            dataset_version = "v1"  # Default fallback
+                    
                     payload = {
                         "task_id": xai_task_id,
                         "event_type": "xai-trigger",
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                         "input": {
                             "dataset_id": dataset_id,
+                            "dataset_version": dataset_version,
                             "user_id": user_id,
                             "model_id": model_id,
+                            "model_version": model_version,
                             "report_type": "lime",
                             "level": "beginner"  # TODO: Get from user (beginner or expert)
                         }
