@@ -33,13 +33,15 @@ class XAIReportService:
         self,
         user_id: str,
         dataset_id: str,
+        dataset_version: str,
         model_id: str,
+        model_version: str,
         report_type: str,
         level: str
     ) -> str:
-        """Generate organized path for XAI report"""
-        # Format: xai_reports/{user_id}/{dataset_id}/{model_id}/{report_type}/{level}/report.html
-        return f"xai_reports/{user_id}/{dataset_id}/{model_id}/{report_type}/{level}/report.html"
+        """Generate organized path for XAI report with versioning"""
+        # Format: xai_reports/{user_id}/{dataset_id}/{dataset_version}/{model_id}/{model_version}/{report_type}/{level}/report.html
+        return f"xai_reports/{user_id}/{dataset_id}/{dataset_version}/{model_id}/{model_version}/{report_type}/{level}/report.html"
 
     def calculate_file_hash(self, file_data: bytes) -> str:
         """Calculate MD5 hash of file data"""
@@ -64,7 +66,9 @@ class XAIReportService:
             file_path = self.generate_file_path(
                 report_data.user_id,
                 report_data.dataset_id,
+                report_data.dataset_version,
                 report_data.model_id,
+                report_data.model_version,
                 report_data.report_type,
                 report_data.level
             )
@@ -72,11 +76,13 @@ class XAIReportService:
             # Calculate file hash
             file_hash = self.calculate_file_hash(file_data)
 
-            # Check if report already exists
+            # Check if report already exists (now includes versions)
             existing_report = await self.collection.find_one({
                 "user_id": report_data.user_id,
                 "dataset_id": report_data.dataset_id,
+                "dataset_version": report_data.dataset_version,
                 "model_id": report_data.model_id,
+                "model_version": report_data.model_version,
                 "report_type": report_data.report_type,
                 "level": report_data.level
             })
@@ -97,7 +103,9 @@ class XAIReportService:
             metadata = {
                 "user_id": report_data.user_id,
                 "dataset_id": report_data.dataset_id,
+                "dataset_version": report_data.dataset_version,
                 "model_id": report_data.model_id,
+                "model_version": report_data.model_version,
                 "report_type": report_data.report_type,
                 "level": report_data.level,
                 "file_path": file_path,
@@ -133,17 +141,33 @@ class XAIReportService:
         dataset_id: str,
         model_id: str,
         report_type: ReportType,
-        level: ExpertiseLevel
+        level: ExpertiseLevel,
+        dataset_version: str = None,
+        model_version: str = None
     ) -> Optional[XAIReportResponse]:
         """Get specific XAI report metadata"""
         try:
-            report = await self.collection.find_one({
+            query = {
                 "user_id": user_id,
                 "dataset_id": dataset_id,
                 "model_id": model_id,
                 "report_type": report_type,
                 "level": level
-            })
+            }
+            
+            # Add version filters if provided
+            if dataset_version:
+                query["dataset_version"] = dataset_version
+            if model_version:
+                query["model_version"] = model_version
+            
+            # If no versions specified, get the latest one
+            if not dataset_version and not model_version:
+                cursor = self.collection.find(query).sort("created_at", -1).limit(1)
+                reports = await cursor.to_list(length=1)
+                report = reports[0] if reports else None
+            else:
+                report = await self.collection.find_one(query)
 
             if report:
                 return XAIReportResponse(**report)
@@ -157,16 +181,25 @@ class XAIReportService:
         self,
         user_id: str,
         dataset_id: str,
-        model_id: str
+        model_id: str,
+        dataset_version: str = None,
+        model_version: str = None
     ) -> List[XAIReportResponse]:
-        """Get all XAI reports for a specific model and dataset"""
+        """Get all XAI reports for a specific model and dataset (optionally filtered by versions)"""
         try:
-            cursor = self.collection.find({
+            query = {
                 "user_id": user_id,
                 "dataset_id": dataset_id,
                 "model_id": model_id
-            })
-
+            }
+            
+            # Add version filters if provided
+            if dataset_version:
+                query["dataset_version"] = dataset_version
+            if model_version:
+                query["model_version"] = model_version
+            
+            cursor = self.collection.find(query).sort("created_at", -1)
             reports = await cursor.to_list(length=None)
             return [XAIReportResponse(**report) for report in reports]
 
@@ -192,12 +225,14 @@ class XAIReportService:
         dataset_id: str,
         model_id: str,
         report_type: ReportType,
-        level: ExpertiseLevel
+        level: ExpertiseLevel,
+        dataset_version: str = None,
+        model_version: str = None
     ) -> bool:
-        """Delete XAI report and its file"""
+        """Delete XAI report and its file (specific version or latest if no versions specified)"""
         try:
             # Get report metadata
-            report = await self.get_report(user_id, dataset_id, model_id, report_type, level)
+            report = await self.get_report(user_id, dataset_id, model_id, report_type, level, dataset_version, model_version)
             if not report:
                 return False
 
@@ -209,14 +244,21 @@ class XAIReportService:
                 logger.warning(f"Failed to delete file from MinIO: {e}")
 
             # Delete metadata from MongoDB
-            result = await self.collection.delete_one({
+            query = {
                 "user_id": user_id,
                 "dataset_id": dataset_id,
                 "model_id": model_id,
                 "report_type": report_type,
                 "level": level
-            })
-
+            }
+            
+            # Add version filters if provided
+            if dataset_version:
+                query["dataset_version"] = dataset_version
+            if model_version:
+                query["model_version"] = model_version
+            
+            result = await self.collection.delete_one(query)
             return result.deleted_count > 0
 
         except Exception as e:

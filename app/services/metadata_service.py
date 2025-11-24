@@ -57,11 +57,30 @@ class MetadataService:
             raise HTTPException(status_code=500, detail="Failed to create dataset metadata")
 
     async def get_dataset_by_id(self, dataset_id: str, user_id: str) -> Optional[DatasetMetadata]:
-        """Get dataset metadata by dataset_id and user_id"""
+        """Get dataset metadata by dataset_id and user_id (latest version)"""
+        try:
+            # Get the latest version
+            cursor = self.db.datasets.find({
+                "dataset_id": dataset_id,
+                "user_id": user_id
+            }).sort("created_at", -1).limit(1)
+            
+            datasets = await cursor.to_list(length=1)
+            if datasets:
+                return DatasetMetadata(**datasets[0])
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error retrieving dataset {dataset_id}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to retrieve dataset")
+
+    async def get_dataset_by_id_and_version(self, dataset_id: str, user_id: str, version: str) -> Optional[DatasetMetadata]:
+        """Get dataset metadata by dataset_id, user_id, and specific version"""
         try:
             dataset = await self.db.datasets.find_one({
                 "dataset_id": dataset_id,
-                "user_id": user_id
+                "user_id": user_id,
+                "version": version
             })
             
             if dataset:
@@ -69,7 +88,7 @@ class MetadataService:
             return None
             
         except Exception as e:
-            logger.error(f"Error retrieving dataset {dataset_id}: {e}")
+            logger.error(f"Error retrieving dataset {dataset_id} version {version}: {e}")
             raise HTTPException(status_code=500, detail="Failed to retrieve dataset")
 
     async def get_latest_dataset(self, dataset_id: str, user_id: str) -> Optional[DatasetMetadata]:
@@ -125,12 +144,13 @@ class MetadataService:
         user_id: str, 
         update_data: DatasetUpdate
     ) -> Optional[DatasetMetadata]:
-        """Update dataset metadata"""
+        """Update dataset metadata for all versions of the dataset"""
         try:
             update_dict = {k: v for k, v in update_data.dict().items() if v is not None}
             update_dict['updated_at'] = datetime.utcnow()
             
-            result = await self.db.datasets.update_one(
+            # Update all versions of the dataset
+            result = await self.db.datasets.update_many(
                 {"dataset_id": dataset_id, "user_id": user_id},
                 {"$set": update_dict}
             )
@@ -138,13 +158,10 @@ class MetadataService:
             if result.matched_count == 0:
                 return None
                 
-            # Return updated dataset
-            updated_dataset = await self.db.datasets.find_one({
-                "dataset_id": dataset_id,
-                "user_id": user_id
-            })
+            # Return the latest version of the updated dataset
+            updated_dataset = await self.get_latest_dataset(dataset_id, user_id)
             
-            return DatasetMetadata(**updated_dataset)
+            return updated_dataset
             
         except Exception as e:
             logger.error(f"Error updating dataset {dataset_id}: {e}")

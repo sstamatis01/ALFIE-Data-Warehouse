@@ -86,130 +86,247 @@ class KafkaProducerService:
     async def send_dataset_uploaded_event(self, dataset_metadata: DatasetMetadata) -> None:
         await self.send_dataset_event("dataset.uploaded", dataset_metadata)
 
+    async def send_dataset_upload_started_event(
+        self,
+        *,
+        session_id: str,
+        conversation_id: str,
+        user_id: str,
+        dataset_id: str,
+        filename: str,
+        file_size: int
+    ) -> None:
+        """Send dataset upload started event for tracking"""
+        if not self.producer:
+            logger.warning("Kafka producer not initialized; skipping dataset upload started event")
+            return
+        
+        payload = {
+            "event_type": "dataset.upload.started",
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "dataset_id": dataset_id,
+            "filename": filename,
+            "file_size": file_size,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        try:
+            await self.producer.send_and_wait(settings.kafka_dataset_topic, value=payload, key=dataset_id)
+            logger.info(f"Dataset upload started event sent for dataset_id={dataset_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send dataset upload started event: {e}")
+
+    async def send_dataset_upload_completed_event(
+        self,
+        *,
+        session_id: str,
+        conversation_id: str,
+        user_id: str,
+        dataset_id: str,
+        filename: str,
+        file_size: int,
+        record_count: Optional[int] = None,
+        columns: Optional[list] = None
+    ) -> None:
+        """Send dataset upload completed event for tracking"""
+        if not self.producer:
+            logger.warning("Kafka producer not initialized; skipping dataset upload completed event")
+            return
+        
+        payload = {
+            "event_type": "dataset.upload.completed",
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "dataset_id": dataset_id,
+            "filename": filename,
+            "file_size": file_size,
+            "record_count": record_count,
+            "columns": columns,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        try:
+            await self.producer.send_and_wait(settings.kafka_dataset_topic, value=payload, key=dataset_id)
+            logger.info(f"Dataset upload completed event sent for dataset_id={dataset_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send dataset upload completed event: {e}")
+
+    async def send_dataset_upload_failed_event(
+        self,
+        *,
+        session_id: str,
+        conversation_id: str,
+        user_id: str,
+        dataset_id: str,
+        filename: str,
+        error_message: str
+    ) -> None:
+        """Send dataset upload failed event for tracking"""
+        if not self.producer:
+            logger.warning("Kafka producer not initialized; skipping dataset upload failed event")
+            return
+        
+        payload = {
+            "event_type": "dataset.upload.failed",
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "dataset_id": dataset_id,
+            "filename": filename,
+            "error_message": error_message,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        try:
+            await self.producer.send_and_wait(settings.kafka_dataset_topic, value=payload, key=dataset_id)
+            logger.info(f"Dataset upload failed event sent for dataset_id={dataset_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send dataset upload failed event: {e}")
+
     async def send_dataset_updated_event(self, dataset_metadata: DatasetMetadata) -> None:
         await self.send_dataset_event("dataset.updated", dataset_metadata)
 
     async def send_dataset_deleted_event(self, dataset_metadata: DatasetMetadata) -> None:
         await self.send_dataset_event("dataset.deleted", dataset_metadata)
 
-    async def send_bias_event(
-        self, 
-        *, 
-        dataset_id: str, 
-        user_id: str, 
-        bias_report_id: str | None, 
-        has_transformation_report: bool,
-        target_column_name: Optional[str] = None,
-        task_type: Optional[str] = None,
-        is_folder: Optional[bool] = False,
-        file_count: Optional[int] = 1
-    ) -> None:
-        if not self.producer:
-            logger.warning("Kafka producer not initialized; skipping bias event")
-            return
-        payload = {
-            "event_type": "bias.reported",
-            "dataset_id": dataset_id,
-            "user_id": user_id,
-            "bias_report_id": bias_report_id,
-            "has_transformation_report": has_transformation_report,
-            "target_column_name": target_column_name,
-            "task_type": task_type,
-            "is_folder": is_folder,
-            "file_count": file_count,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-        try:
-            await self.producer.send_and_wait(settings.kafka_bias_topic, value=payload, key=dataset_id)
-            logger.info(f"Bias event sent for dataset_id={dataset_id}")
-        except Exception as e:
-            logger.warning(f"Failed to send bias event: {e}")
-
-    async def send_automl_event(
+    async def send_bias_complete_event(
         self,
         *,
+        task_id: str,
+        dataset_id: str,
+        dataset_version: str,
+        user_id: str,
+        bias_report_id: str,
+        success: bool = True,
+        error_message: Optional[str] = None
+    ) -> None:
+        """Send bias detection completion event"""
+        if not self.producer:
+            logger.warning("Kafka producer not initialized; skipping bias completion event")
+            return
+        
+        payload = {
+            "task_id": task_id,
+            "event_type": "bias-detection-complete",
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        
+        if success:
+            payload["output"] = {
+                "bias_report_id": bias_report_id,
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "user_id": user_id
+            }
+            payload["failure"] = None
+        else:
+            payload["output"] = None
+            payload["failure"] = {
+                "error_type": "BiasDetectionError",
+                "error_message": error_message or "Bias detection failed"
+            }
+        
+        try:
+            await self.producer.send_and_wait(settings.kafka_bias_topic, value=payload, key=task_id)
+            logger.info(f"Bias completion event sent for task_id={task_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send bias completion event: {e}")
+
+    async def send_automl_complete_event(
+        self,
+        *,
+        task_id: str,
         user_id: str,
         model_id: str,
+        model_version: str,
         dataset_id: Optional[str] = None,
-        version: str = "v1",
-        framework: Optional[str] = None,
-        model_type: Optional[str] = None,
-        algorithm: Optional[str] = None,
-        model_size_mb: Optional[float] = None,
-        training_accuracy: Optional[float] = None,
-        validation_accuracy: Optional[float] = None,
-        test_accuracy: Optional[float] = None,
-        is_folder: Optional[bool] = False,
-        file_count: Optional[int] = 1,
-        is_model_folder: Optional[bool] = False,
-        model_file_count: Optional[int] = 1
+        dataset_version: Optional[str] = None,
+        success: bool = True,
+        error_message: Optional[str] = None
     ) -> None:
-        """Send AutoML event when a model is uploaded"""
+        """Send AutoML completion event"""
         if not self.producer:
-            logger.warning("Kafka producer not initialized; skipping AutoML event")
+            logger.warning("Kafka producer not initialized; skipping AutoML completion event")
             return
         
         payload = {
-            "event_type": "model.uploaded",
-            "event_id": f"model_uploaded_{model_id}_{int(datetime.utcnow().timestamp())}",
+            "task_id": task_id,
+            "event_type": "automl-complete",
             "timestamp": datetime.utcnow().isoformat(),
-            "user_id": user_id,
-            "model_id": model_id,
-            "dataset_id": dataset_id,
-            "version": version,
-            "framework": framework,
-            "model_type": model_type,
-            "algorithm": algorithm,
-            "model_size_mb": model_size_mb,
-            "training_accuracy": training_accuracy,
-            "validation_accuracy": validation_accuracy,
-            "test_accuracy": test_accuracy,
-            "is_folder": is_folder,
-            "file_count": file_count,
-            "is_model_folder": is_model_folder,
-            "model_file_count": model_file_count,
         }
         
+        if success:
+            payload["output"] = {
+                "model_id": model_id,
+                "model_version": model_version,
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "user_id": user_id
+            }
+            payload["failure"] = None
+        else:
+            payload["output"] = None
+            payload["failure"] = {
+                "error_type": "AutoMLError",
+                "error_message": error_message or "AutoML training failed"
+            }
+        
         try:
-            key = f"{user_id}_{model_id}"
-            await self.producer.send_and_wait(settings.kafka_automl_topic, value=payload, key=key)
-            logger.info(f"AutoML event sent for model_id={model_id}, user_id={user_id}")
+            await self.producer.send_and_wait(settings.kafka_automl_topic, value=payload, key=task_id)
+            logger.info(f"AutoML completion event sent for task_id={task_id}")
         except Exception as e:
-            logger.warning(f"Failed to send AutoML event: {e}")
+            logger.warning(f"Failed to send AutoML completion event: {e}")
 
-    async def send_xai_event(
+    async def send_xai_complete_event(
         self,
         *,
+        task_id: str,
         user_id: str,
         dataset_id: str,
+        dataset_version: str,
         model_id: str,
-        report_type: str,
-        level: str,
-        xai_report_id: Optional[str] = None
+        model_version: str,
+        xai_report_id: str,
+        success: bool = True,
+        error_message: Optional[str] = None
     ) -> None:
-        """Send XAI event when an XAI report is uploaded"""
+        """Send XAI completion event"""
         if not self.producer:
-            logger.warning("Kafka producer not initialized; skipping XAI event")
+            logger.warning("Kafka producer not initialized; skipping XAI completion event")
             return
         
         payload = {
-            "event_type": "xai.reported",
-            "event_id": f"xai_reported_{model_id}_{int(datetime.utcnow().timestamp())}",
+            "task_id": task_id,
+            "event_type": "xai-complete",
             "timestamp": datetime.utcnow().isoformat(),
-            "user_id": user_id,
-            "dataset_id": dataset_id,
-            "model_id": model_id,
-            "report_type": report_type,
-            "level": level,
-            "xai_report_id": xai_report_id,
         }
         
+        if success:
+            payload["output"] = {
+                "xai_report_id": xai_report_id,
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "user_id": user_id,
+                "model_id": model_id,
+                "model_version": model_version
+            }
+            payload["failure"] = None
+        else:
+            payload["output"] = None
+            payload["failure"] = {
+                "error_type": "XAIError",
+                "error_message": error_message or "XAI report generation failed"
+            }
+        
         try:
-            key = f"{user_id}_{model_id}"
-            await self.producer.send_and_wait(settings.kafka_xai_topic, value=payload, key=key)
-            logger.info(f"XAI event sent for model_id={model_id}, user_id={user_id}, report_type={report_type}, level={level}")
+            await self.producer.send_and_wait(settings.kafka_xai_topic, value=payload, key=task_id)
+            logger.info(f"XAI completion event sent for task_id={task_id}")
         except Exception as e:
-            logger.warning(f"Failed to send XAI event: {e}")
+            logger.warning(f"Failed to send XAI completion event: {e}")
 
 
 kafka_producer_service = KafkaProducerService()
+
