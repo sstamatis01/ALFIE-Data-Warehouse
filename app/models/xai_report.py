@@ -20,7 +20,9 @@ class XAIReportMetadata(BaseModel):
     """Metadata for XAI report stored in MongoDB"""
     user_id: str = Field(..., description="User who owns the report")
     dataset_id: str = Field(..., description="Dataset ID associated with the report")
+    dataset_version: str = Field(..., description="Dataset version used for XAI report")
     model_id: str = Field(..., description="AI Model ID associated with the report")
+    model_version: str = Field(..., description="Model version used for XAI report")
     report_type: ReportType = Field(..., description="Type of explanation report")
     level: ExpertiseLevel = Field(..., description="Expertise level of the report")
     file_path: str = Field(..., description="Path to HTML file in MinIO")
@@ -38,7 +40,9 @@ class XAIReportCreate(BaseModel):
     """Schema for creating an XAI report"""
     user_id: str
     dataset_id: str
+    dataset_version: str
     model_id: str
+    model_version: str
     report_type: ReportType
     level: ExpertiseLevel
     custom_metadata: Dict[str, Any] = Field(default_factory=dict)
@@ -51,7 +55,9 @@ class XAIReportResponse(BaseModel):
     """Response schema for XAI report"""
     user_id: str
     dataset_id: str
+    dataset_version: str
     model_id: str
+    model_version: str
     report_type: ReportType
     level: ExpertiseLevel
     file_path: str
