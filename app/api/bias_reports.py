@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Query
 from typing import Optional
 import logging
 from ..models.bias_report import BiasReportCreate, BiasReportResponse
@@ -25,6 +25,7 @@ async def create_or_update_bias_report(
                 await kafka_producer_service.send_bias_complete_event(
                     task_id=task_id,
                     dataset_id=payload.dataset_id,
+                    dataset_version=payload.dataset_version,
                     user_id=payload.user_id,
                     bias_report_id=report.id,
                     success=True
@@ -69,17 +70,37 @@ async def create_or_update_bias_report(
 
 
 @router.get("/{user_id}/{dataset_id}", response_model=BiasReportResponse)
-async def get_bias_report(user_id: str, dataset_id: str):
-    report = await bias_report_service.get_report(user_id, dataset_id)
+async def get_bias_report(
+    user_id: str, 
+    dataset_id: str,
+    version: Optional[str] = Query(None, description="Dataset version (defaults to latest)")
+):
+    """Get bias report for a dataset (specific version or latest)"""
+    report = await bias_report_service.get_report(user_id, dataset_id, version)
     if not report:
-        raise HTTPException(status_code=404, detail="Bias report not found")
+        version_msg = f" version {version}" if version else ""
+        raise HTTPException(status_code=404, detail=f"Bias report not found for dataset {dataset_id}{version_msg}")
     return report
 
 
+@router.get("/{user_id}/{dataset_id}/all", response_model=list[BiasReportResponse])
+async def get_all_bias_reports(user_id: str, dataset_id: str):
+    """Get all bias reports for a dataset (all versions)"""
+    reports = await bias_report_service.get_all_reports(user_id, dataset_id)
+    return reports
+
+
 @router.delete("/{user_id}/{dataset_id}")
-async def delete_bias_report(user_id: str, dataset_id: str):
-    """Delete a bias report"""
-    deleted = await bias_report_service.delete_report(user_id, dataset_id)
+async def delete_bias_report(
+    user_id: str, 
+    dataset_id: str,
+    version: Optional[str] = Query(None, description="Dataset version (deletes all versions if not specified)")
+):
+    """Delete bias report(s) for a dataset"""
+    deleted = await bias_report_service.delete_report(user_id, dataset_id, version)
     if not deleted:
-        raise HTTPException(status_code=404, detail="Bias report not found")
-    return {"message": "Bias report deleted successfully"}
+        version_msg = f" version {version}" if version else "s"
+        raise HTTPException(status_code=404, detail=f"Bias report{version_msg} not found")
+    
+    version_msg = f" for version {version}" if version else "s"
+    return {"message": f"Bias report{version_msg} deleted successfully"}

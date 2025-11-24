@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Header
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Header, Query
 from fastapi.responses import HTMLResponse
 from typing import List, Optional
 import logging
@@ -21,7 +21,9 @@ async def upload_xai_report(
     user_id: str,
     file: UploadFile = File(...),
     dataset_id: str = Form(...),
+    dataset_version: str = Form(...),
     model_id: str = Form(...),
+    model_version: str = Form(...),
     report_type: ReportType = Form(...),
     level: ExpertiseLevel = Form(...),
     task_id: Optional[str] = Header(None, alias="X-Task-ID")
@@ -40,7 +42,9 @@ async def upload_xai_report(
         report_data = XAIReportCreate(
             user_id=user_id,
             dataset_id=dataset_id,
+            dataset_version=dataset_version,
             model_id=model_id,
+            model_version=model_version,
             report_type=report_type,
             level=level
         )
@@ -54,7 +58,9 @@ async def upload_xai_report(
                     task_id=task_id,
                     user_id=user_id,
                     dataset_id=dataset_id,
+                    dataset_version=dataset_version,
                     model_id=model_id,
+                    model_version=model_version,
                     xai_report_id=str(result.id) if hasattr(result, 'id') else str(result),
                     success=True
                 )
@@ -74,7 +80,9 @@ async def upload_xai_report(
                     task_id=task_id,
                     user_id=user_id,
                     dataset_id=dataset_id,
+                    dataset_version=dataset_version,
                     model_id=model_id,
+                    model_version=model_version,
                     xai_report_id="",
                     success=False,
                     error_message="Failed to upload XAI report"
@@ -90,13 +98,17 @@ async def upload_xai_report(
 async def get_all_xai_reports(
     user_id: str,
     dataset_id: str,
-    model_id: str
+    model_id: str,
+    dataset_version: Optional[str] = Query(None, description="Dataset version filter"),
+    model_version: Optional[str] = Query(None, description="Model version filter")
 ):
     """
-    Get all XAI reports for a specific model and dataset
+    Get all XAI reports for a specific model and dataset (optionally filtered by versions)
     """
     try:
-        reports = await xai_report_service.get_all_reports(user_id, dataset_id, model_id)
+        reports = await xai_report_service.get_all_reports(
+            user_id, dataset_id, model_id, dataset_version, model_version
+        )
         return reports
     except Exception as e:
         logger.error(f"Error retrieving XAI reports: {e}")
@@ -109,17 +121,22 @@ async def get_xai_report(
     dataset_id: str,
     model_id: str,
     report_type: ReportType,
-    level: ExpertiseLevel
+    level: ExpertiseLevel,
+    dataset_version: Optional[str] = Query(None, description="Dataset version (defaults to latest)"),
+    model_version: Optional[str] = Query(None, description="Model version (defaults to latest)")
 ):
     """
-    Get a specific XAI report metadata
+    Get a specific XAI report metadata (specific versions or latest)
     """
     report = await xai_report_service.get_report(
-        user_id, dataset_id, model_id, report_type, level
+        user_id, dataset_id, model_id, report_type, level, dataset_version, model_version
     )
     
     if not report:
-        raise HTTPException(status_code=404, detail="XAI report not found")
+        version_msg = ""
+        if dataset_version or model_version:
+            version_msg = f" for dataset v{dataset_version or 'latest'} and model v{model_version or 'latest'}"
+        raise HTTPException(status_code=404, detail=f"XAI report not found{version_msg}")
     
     return report
 
@@ -130,18 +147,23 @@ async def view_xai_report(
     dataset_id: str,
     model_id: str,
     report_type: ReportType,
-    level: ExpertiseLevel
+    level: ExpertiseLevel,
+    dataset_version: Optional[str] = Query(None, description="Dataset version (defaults to latest)"),
+    model_version: Optional[str] = Query(None, description="Model version (defaults to latest)")
 ):
     """
-    View the XAI report HTML content directly in browser
+    View the XAI report HTML content directly in browser (specific versions or latest)
     """
     # Get report metadata
     report = await xai_report_service.get_report(
-        user_id, dataset_id, model_id, report_type, level
+        user_id, dataset_id, model_id, report_type, level, dataset_version, model_version
     )
     
     if not report:
-        raise HTTPException(status_code=404, detail="XAI report not found")
+        version_msg = ""
+        if dataset_version or model_version:
+            version_msg = f" for dataset v{dataset_version or 'latest'} and model v{model_version or 'latest'}"
+        raise HTTPException(status_code=404, detail=f"XAI report not found{version_msg}")
     
     # Download HTML content
     html_content = await xai_report_service.download_report(report.file_path)
@@ -155,17 +177,22 @@ async def delete_xai_report(
     dataset_id: str,
     model_id: str,
     report_type: ReportType,
-    level: ExpertiseLevel
+    level: ExpertiseLevel,
+    dataset_version: Optional[str] = Query(None, description="Dataset version (deletes latest if not specified)"),
+    model_version: Optional[str] = Query(None, description="Model version (deletes latest if not specified)")
 ):
     """
-    Delete a specific XAI report
+    Delete a specific XAI report (specific versions or latest)
     """
     deleted = await xai_report_service.delete_report(
-        user_id, dataset_id, model_id, report_type, level
+        user_id, dataset_id, model_id, report_type, level, dataset_version, model_version
     )
     
     if not deleted:
-        raise HTTPException(status_code=404, detail="XAI report not found")
+        version_msg = ""
+        if dataset_version or model_version:
+            version_msg = f" for dataset v{dataset_version or 'latest'} and model v{model_version or 'latest'}"
+        raise HTTPException(status_code=404, detail=f"XAI report not found{version_msg}")
     
     return {
         "message": "XAI report deleted successfully",
@@ -173,6 +200,8 @@ async def delete_xai_report(
         "dataset_id": dataset_id,
         "model_id": model_id,
         "report_type": report_type,
-        "level": level
+        "level": level,
+        "dataset_version": dataset_version,
+        "model_version": model_version
     }
 

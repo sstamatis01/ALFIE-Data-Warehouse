@@ -11,6 +11,7 @@ from ..models.ai_model import (
 )
 from ..services.ai_model_service import ai_model_service
 from ..services.kafka_service import kafka_producer_service
+from ..services.metadata_service import metadata_service
 from ..core.database import get_database
 
 logger = logging.getLogger(__name__)
@@ -181,11 +182,25 @@ async def upload_single_model_file(
         # Send Kafka AutoML completion event if task_id is provided
         if task_id:
             try:
+                # Get dataset version if training_dataset is provided
+                dataset_version = None
+                if model_metadata.training_dataset:
+                    try:
+                        dataset_meta = await metadata_service.get_dataset_by_id(
+                            model_metadata.training_dataset, user_id
+                        )
+                        if dataset_meta:
+                            dataset_version = dataset_meta.version
+                    except Exception as e:
+                        logger.warning(f"Could not fetch dataset version: {e}, using None")
+                
                 await kafka_producer_service.send_automl_complete_event(
                     task_id=task_id,
                     user_id=user_id,
                     model_id=model_id,
+                    model_version=version,  # Model version from auto-increment
                     dataset_id=model_metadata.training_dataset,
+                    dataset_version=dataset_version,
                     success=True
                 )
                 logger.info(f"AutoML completion event sent for task_id={task_id}")
@@ -200,11 +215,33 @@ async def upload_single_model_file(
         # Send failure event if task_id is provided
         if task_id:
             try:
+                # Get dataset version if training_dataset is provided
+                dataset_version = None
+                if training_dataset:
+                    try:
+                        dataset_meta = await metadata_service.get_dataset_by_id(
+                            training_dataset, user_id
+                        )
+                        if dataset_meta:
+                            dataset_version = dataset_meta.version
+                    except Exception as e:
+                        logger.warning(f"Could not fetch dataset version: {e}, using None")
+                
+                # For failure case, model version might not exist, use "v1" as default
+                # or try to get the next version that would have been used
+                model_version = "v1"  # Default for failure case
+                try:
+                    model_version = await _get_next_model_version(user_id, model_id)
+                except Exception:
+                    pass  # Use default v1 if we can't determine (already set above)
+                
                 await kafka_producer_service.send_automl_complete_event(
                     task_id=task_id,
                     user_id=user_id,
                     model_id=model_id,
+                    model_version=model_version,
                     dataset_id=training_dataset,
+                    dataset_version=dataset_version,
                     success=False,
                     error_message="Failed to upload AI model"
                 )
