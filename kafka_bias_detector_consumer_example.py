@@ -19,6 +19,9 @@ import numpy as np
 from aiokafka import AIOKafkaConsumer
 import requests
 import pandas as pd
+from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
+from scipy.stats import skew, ks_2samp
+from imblearn.over_sampling import SMOTE
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger("kafka_consumer_example")
@@ -34,15 +37,23 @@ else:
     API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
 
-def fetch_dataset_metadata(user_id: str, dataset_id: str) -> dict:
-    url = f"{API_BASE}/datasets/{user_id}/{dataset_id}"
+def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -> dict:
+    """Fetch dataset metadata (specific version or latest)"""
+    if version:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}"
+    else:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
-def download_dataset_file(user_id: str, dataset_id: str) -> bytes:
-    url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
+def download_dataset_file(user_id: str, dataset_id: str, version: str = None) -> bytes:
+    """Download dataset file (specific version or latest)"""
+    if version:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}/download"
+    else:
+        url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
@@ -214,7 +225,206 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
     return clean_for_json(report)
 
 
+def preprocess_data(df: pd.DataFrame, eda_results: dict):
+    """
+    Apply bias mitigation transformations to the dataset
     
+    Returns:
+        tuple: (transformed_dataframe, transformation_log)
+    """
+    df_cleaned = df.copy()
+    transformation_log = []
+    try:
+        # 1. Fill missing values
+        for col in eda_results.get("columns", df_cleaned.columns):
+            if col in df_cleaned.columns and df_cleaned[col].isnull().sum() > 0:
+                method = 'median' if df_cleaned[col].dtype in [np.float64, np.int64] else 'mode'
+                original_null_count = int(df_cleaned[col].isnull().sum())
+                fill_value = df_cleaned[col].median() if method == 'median' else df_cleaned[col].mode().iloc[0] if len(df_cleaned[col].mode()) > 0 else None
+                if fill_value is not None:
+                    df_cleaned[col] = df_cleaned[col].fillna(fill_value)
+                    transformation_log.append({
+                        'column': col,
+                        'transformation': 'missing_value_fill',
+                        'method': method,
+                        'original_missing_values': f"{original_null_count} missing",
+                        'modified_value': str(fill_value)
+                    })
+
+        # 2. Remove duplicates
+        if eda_results.get('duplicate_rows_count', 0) > 0:
+            original_count = len(df_cleaned)
+            df_cleaned = df_cleaned.drop_duplicates()
+            removed_count = original_count - len(df_cleaned)
+            if removed_count > 0:
+                transformation_log.append({
+                    'column': 'all',
+                    'transformation': 'duplicate_removal',
+                    'method': 'drop_duplicates',
+                    'original_value': f"{eda_results['duplicate_rows_count']} duplicates",
+                    'modified_value': f"{removed_count} duplicates removed"
+                })
+
+        # 3. Encode categorical features
+        cat_cols = df_cleaned.select_dtypes(include='object').columns
+        for col in cat_cols:
+            unique_vals = df_cleaned[col].nunique()
+            if unique_vals <= 10:
+                dummies = pd.get_dummies(df_cleaned[col], prefix=col)
+                df_cleaned = pd.concat([df_cleaned.drop(columns=col), dummies], axis=1)
+                transformation_log.append({
+                    'column': col,
+                    'transformation': 'encoding',
+                    'method': 'one-hot',
+                    'original_value': unique_vals,
+                    'modified_value': f"{dummies.shape[1]} binary columns"
+                })
+            else:
+                le = LabelEncoder()
+                df_cleaned[col] = le.fit_transform(df_cleaned[col].astype(str))
+                transformation_log.append({
+                    'column': col,
+                    'transformation': 'encoding',
+                    'method': 'label_encoding',
+                    'original_value': unique_vals,
+                    'modified_value': f"integers from 0 to {unique_vals - 1}"
+                })
+
+        # 4. Handle skewed features
+        numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            col_skew = skew(df_cleaned[col].dropna())
+            if abs(col_skew) > 0.75:
+                original_skew = col_skew
+                if (df_cleaned[col] > 0).all():
+                    transformer = PowerTransformer(method='yeo-johnson')
+                    df_cleaned[col] = transformer.fit_transform(df_cleaned[[col]])
+                    method = 'yeo-johnson'
+                else:
+                    scaler = StandardScaler()
+                    df_cleaned[col] = scaler.fit_transform(df_cleaned[[col]])
+                    method = 'standard_scaler'
+                new_skew = skew(df_cleaned[col])
+                transformation_log.append({
+                    'column': col,
+                    'transformation': 'skew_correction',
+                    'method': method,
+                    'original_value': round(original_skew, 3),
+                    'modified_value': round(new_skew, 3)
+                })
+
+        # 5. Oversampling for target if detected
+        target_col = None
+        for col, stats in eda_results.get("distribution_statistics", {}).items():
+            if abs(stats.get("skew", 0)) > 0.75 and col in df_cleaned.columns:
+                target_col = col
+                break
+
+        if target_col and df_cleaned[target_col].nunique() == 2:
+            X = df_cleaned.drop(columns=[target_col])
+            y = df_cleaned[target_col]
+            smote = SMOTE(random_state=42)
+            X_resampled, y_resampled = smote.fit_resample(X, y)
+            transformation_log.append({
+                'column': target_col,
+                'transformation': 'oversampling',
+                'method': 'SMOTE',
+                'original_value': df_cleaned[target_col].value_counts().to_dict(),
+                'modified_value': pd.Series(y_resampled).value_counts().to_dict()
+            })
+            df_cleaned = pd.concat([pd.DataFrame(X_resampled, columns=X.columns), pd.Series(y_resampled, name=target_col)], axis=1)
+
+        # 6. Data drift detection and mitigation
+        numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            series = df_cleaned[col].dropna()
+            if len(series) > 0:
+                reference = np.random.normal(loc=series.mean(), scale=series.std(), size=min(series.shape[0], 1000))
+                ks_stat, p_value = ks_2samp(series.iloc[:min(1000, len(series))], reference)
+                if p_value < 0.01:
+                    original_mean = series.mean()
+                    scaler = StandardScaler()
+                    df_cleaned[col] = scaler.fit_transform(df_cleaned[[col]])
+                    modified_mean = df_cleaned[col].mean()
+                    transformation_log.append({
+                        'column': col,
+                        'transformation': 'drift_mitigation',
+                        'method': 'standard_scaler',
+                        'original_value': round(original_mean, 3),
+                        'modified_value': round(modified_mean, 3)
+                    })
+    except Exception as e:
+        logger.warning(f"Error in preprocessing: {e}")
+    
+    return df_cleaned, transformation_log
+
+
+def upload_mitigated_dataset(user_id: str, original_dataset_id: str, original_version: str,
+                              df_transformed: pd.DataFrame, meta: dict) -> dict:
+    """
+    Upload mitigated dataset as a new version with flag to prevent re-processing
+    """
+    from io import BytesIO
+    from datetime import datetime, timezone
+    
+    # Convert DataFrame to CSV bytes
+    buf = BytesIO()
+    df_transformed.to_csv(buf, index=False)
+    buf.seek(0)
+    csv_bytes = buf.getvalue()
+    
+    # Get next version for mitigated dataset
+    # Use the same dataset_id but increment version
+    try:
+        # Fetch all versions to determine next version
+        versions_url = f"{API_BASE}/datasets/{user_id}/{original_dataset_id}/versions"
+        versions_resp = requests.get(versions_url, timeout=30)
+        if versions_resp.status_code == 200:
+            versions = versions_resp.json()
+            version_numbers = []
+            for v in versions:
+                v_str = v.get("version", "v1")
+                if v_str.startswith("v"):
+                    try:
+                        version_numbers.append(int(v_str[1:]))
+                    except ValueError:
+                        pass
+            next_version_num = max(version_numbers) + 1 if version_numbers else 2
+            mitigated_version = f"v{next_version_num}"
+        else:
+            # Fallback: try v2
+            mitigated_version = "v2"
+    except Exception:
+        mitigated_version = "v2"  # Default fallback
+    
+    # Upload the mitigated dataset
+    url = f"{API_BASE}/datasets/upload/{user_id}"
+    files = {"file": (f"{original_dataset_id}_mitigated.csv", csv_bytes, "text/csv")}
+    
+    # Combine existing tags with mitigation tags
+    existing_tags = meta.get("tags", [])
+    if isinstance(existing_tags, str):
+        existing_tags = [t.strip() for t in existing_tags.split(",") if t.strip()]
+    mitigation_tags = existing_tags + ["mitigated", "bias-corrected"]
+    
+    data = {
+        "dataset_id": original_dataset_id,  # Same dataset_id, different version
+        "name": f"{meta.get('name', original_dataset_id)} (Mitigated)",
+        "description": f"Bias-mitigated version of {original_dataset_id} {original_version}. Generated automatically by bias mitigation process.",
+        "tags": ",".join(mitigation_tags)
+    }
+    
+    response = requests.post(url, files=files, data=data, timeout=120)
+    response.raise_for_status()
+    result = response.json()
+    
+    # Note: The dataset is marked as mitigated via the "mitigated" tag
+    # The agentic core will check both tags and custom_metadata to detect mitigated datasets
+    # If custom_metadata update is needed in the future, it can be added via a version-specific update endpoint
+    logger.info(f"Mitigated dataset uploaded with 'mitigated' tag to prevent re-processing")
+    
+    return result
+
 
 async def run_consumer() -> None:
     consumer = AIOKafkaConsumer(
@@ -264,9 +474,9 @@ async def run_consumer() -> None:
                 dataset_version = input_data.get("dataset_version", "v1")  # Default to v1 for backward compatibility
                 
                 # Fetch metadata (optional) and download file
-                meta = fetch_dataset_metadata(user_id, dataset_id)
+                meta = fetch_dataset_metadata(user_id, dataset_id, dataset_version)
 
-                file_bytes = download_dataset_file(user_id, dataset_id)
+                file_bytes = download_dataset_file(user_id, dataset_id, dataset_version)
 
                 # Try to read as CSV with pandas (fallback to bytes length)
                 df = None
@@ -292,8 +502,95 @@ async def run_consumer() -> None:
                 )
                 logger.info(f"Saved bias report: {json.dumps(saved, indent=2, default=str)}")
                 
-                # Transformation step temporarily disabled to avoid re-trigger loops
-                logger.info("Transformation step skipped (temporarily disabled)")
+                # Check if mitigator should run (only if dataset is not already mitigated)
+                is_mitigated = meta.get("custom_metadata", {}).get("is_mitigated", False)
+                tags = meta.get("tags", [])
+                if isinstance(tags, str):
+                    tags = [t.strip() for t in tags.split(",") if t.strip()]
+                has_mitigated_tag = "mitigated" in [tag.lower() for tag in tags]
+                
+                # Check if there are issues that need mitigation
+                has_missing_values = len(bias_report.get("missing_values", {})) > 0
+                has_duplicates = bias_report.get("duplicate_rows_count", 0) > 0
+                # Check for skewed distributions (abs(skew) > 0.75)
+                has_skewed_cols = any(
+                    abs(stats.get("skew", 0)) > 0.75 
+                    for stats in bias_report.get("distribution_statistics", {}).values()
+                )
+                needs_mitigation = has_missing_values or has_duplicates or has_skewed_cols
+                
+                if not is_mitigated and not has_mitigated_tag and df is not None and needs_mitigation:
+                    # Run bias mitigation
+                    logger.info("=" * 80)
+                    logger.info("Running bias mitigation transformations...")
+                    logger.info("=" * 80)
+                    
+                    try:
+                        df_transformed, transformation_log = preprocess_data(df, bias_report)
+                        
+                        if transformation_log:
+                            logger.info(f"Applied {len(transformation_log)} transformations")
+                            
+                            # Post transformation report
+                            try:
+                                # Get next version for mitigated dataset
+                                versions_url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/versions"
+                                versions_resp = requests.get(versions_url, timeout=30)
+                                if versions_resp.status_code == 200:
+                                    versions = versions_resp.json()
+                                    version_numbers = []
+                                    for v in versions:
+                                        v_str = v.get("version", "v1")
+                                        if v_str.startswith("v"):
+                                            try:
+                                                version_numbers.append(int(v_str[1:]))
+                                            except ValueError:
+                                                pass
+                                    next_version_num = max(version_numbers) + 1 if version_numbers else 2
+                                    mitigated_version = f"v{next_version_num}"
+                                else:
+                                    mitigated_version = "v2"
+                            except Exception:
+                                mitigated_version = "v2"
+                            
+                            # Post transformation report
+                            transform_url = f"{API_BASE}/transformation-reports/"
+                            transform_payload = {
+                                "user_id": user_id,
+                                "dataset_id": dataset_id,
+                                "version": mitigated_version,
+                                "report": transformation_log
+                            }
+                            transform_resp = requests.post(transform_url, json=transform_payload, timeout=30)
+                            transform_resp.raise_for_status()
+                            logger.info(f"Saved transformation report for version {mitigated_version}")
+                            
+                            # Upload mitigated dataset
+                            logger.info(f"Uploading mitigated dataset as version {mitigated_version}...")
+                            mitigated_result = upload_mitigated_dataset(
+                                user_id=user_id,
+                                original_dataset_id=dataset_id,
+                                original_version=dataset_version,
+                                df_transformed=df_transformed,
+                                meta=meta
+                            )
+                            logger.info(f"✅ Mitigated dataset uploaded successfully!")
+                            logger.info(f"   Dataset ID: {dataset_id}")
+                            logger.info(f"   Version: {mitigated_version}")
+                            logger.info(f"   Original version: {dataset_version}")
+                            logger.info(f"   Transformations applied: {len(transformation_log)}")
+                        else:
+                            logger.info("No transformations needed - dataset is already clean")
+                    except Exception as e:
+                        logger.error(f"Error in bias mitigation: {e}", exc_info=True)
+                        logger.warning("Continuing without mitigation...")
+                else:
+                    if is_mitigated or has_mitigated_tag:
+                        logger.info("Dataset is already mitigated - skipping mitigation step")
+                    elif df is None:
+                        logger.info("No DataFrame available - skipping mitigation step")
+                    elif not needs_mitigation:
+                        logger.info("No bias issues detected that require mitigation - skipping mitigation step")
 
             except Exception as proc_err:
                 logger.error(f"Processing error: {proc_err}")
