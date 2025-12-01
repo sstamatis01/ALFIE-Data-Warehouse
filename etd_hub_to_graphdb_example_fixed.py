@@ -7,7 +7,7 @@ import requests
 import json
 from datetime import datetime
 
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = "http://160.40.52.44:8000"
 GRAPHDB_CONFIG_ID = "68f75db5ebc917f006e16fb9"  # ETD-Hub Knowledge Graph config
 
 def create_etd_hub_ontology():

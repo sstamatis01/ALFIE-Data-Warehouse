@@ -154,6 +154,22 @@ async def consume_dataset_events(producer):
                 # Fetch metadata
                 meta = fetch_dataset_metadata(user_id, dataset_id)
                 
+                # Check if dataset is already mitigated - skip bias detection if so
+                # Check both custom_metadata flag and tags as fallback
+                is_mitigated = meta.get("custom_metadata", {}).get("is_mitigated", False)
+                tags = meta.get("tags", [])
+                if isinstance(tags, str):
+                    tags = [t.strip() for t in tags.split(",") if t.strip()]
+                has_mitigated_tag = "mitigated" in [tag.lower() for tag in tags]
+                
+                if is_mitigated or has_mitigated_tag:
+                    logger.info(f"[Agentic Core] Dataset {dataset_id} is already mitigated - skipping bias detection")
+                    if is_mitigated:
+                        logger.info(f"  Mitigated from version: {meta.get('custom_metadata', {}).get('mitigated_from_version', 'unknown')}")
+                    else:
+                        logger.info(f"  Detected via 'mitigated' tag")
+                    continue
+                
                 # Download dataset (single file or folder as ZIP)
                 file_bytes = download_dataset_file(user_id, dataset_id)
                 logger.info(f"Downloaded dataset: {len(file_bytes)} bytes")
