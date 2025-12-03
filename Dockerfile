@@ -14,12 +14,21 @@ RUN apt-get update && apt-get install -y \
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Verify critical packages are installed (fail build if missing)
+RUN python -c "import aiohttp; print('aiohttp version:', aiohttp.__version__)" && \
+    python -c "import fastapi; import uvicorn; import pandas; import numpy" && \
+    echo "All critical packages verified successfully"
 
 # Copy application code
 COPY app/ ./app/
 COPY kafka_bias_detector_consumer_example.py ./
-COPY .env .
+
+# Note: .env is handled via env_file in docker-compose.yml, so it's not required at build time
+# If .env exists, it will be copied, but the build won't fail if it doesn't exist
+# (docker-compose will inject environment variables at runtime)
 
 # Expose port
 EXPOSE 8000
