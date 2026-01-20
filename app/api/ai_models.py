@@ -3,7 +3,11 @@ from fastapi.responses import StreamingResponse
 from typing import Optional, List
 import io
 import logging
+<<<<<<< HEAD
+from datetime import datetime, timezone
+=======
 from datetime import datetime
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 
 from ..models.ai_model import (
     AIModelMetadata, ModelCreate, ModelUpdate, ModelResponse, 
@@ -101,6 +105,10 @@ async def upload_single_model_file(
     is_primary: bool = Form(False),
     tags: Optional[str] = Form(None),
     training_dataset: Optional[str] = Form(None),
+<<<<<<< HEAD
+    training_dataset_version: Optional[str] = Form(None, description="Version of the training dataset (e.g., v1, v2)"),
+=======
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
     training_accuracy: Optional[float] = Form(None),
     validation_accuracy: Optional[float] = Form(None),
     test_accuracy: Optional[float] = Form(None),
@@ -181,18 +189,43 @@ async def upload_single_model_file(
         
         # Send Kafka AutoML completion event if task_id is provided
         if task_id:
+<<<<<<< HEAD
+            logger.info(f"Task ID received: {task_id} - preparing to send AutoML completion event")
+            try:
+                # Get dataset version - prioritize training_dataset_version parameter over fetching latest
+                dataset_version = training_dataset_version
+                if not dataset_version and model_metadata.training_dataset:
+                    # Fallback: fetch latest version if not provided
+=======
             try:
                 # Get dataset version if training_dataset is provided
                 dataset_version = None
                 if model_metadata.training_dataset:
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                     try:
                         dataset_meta = await metadata_service.get_dataset_by_id(
                             model_metadata.training_dataset, user_id
                         )
                         if dataset_meta:
                             dataset_version = dataset_meta.version
+<<<<<<< HEAD
+                            logger.info(f"Dataset version fetched (latest): {dataset_version} for dataset {model_metadata.training_dataset}")
                     except Exception as e:
                         logger.warning(f"Could not fetch dataset version: {e}, using None")
+                elif dataset_version:
+                    logger.info(f"Using provided training dataset version: {dataset_version} for dataset {model_metadata.training_dataset}")
+                
+                logger.info(f"Sending AutoML completion event with:")
+                logger.info(f"  task_id: {task_id}")
+                logger.info(f"  user_id: {user_id}")
+                logger.info(f"  model_id: {model_id}")
+                logger.info(f"  model_version: {version}")
+                logger.info(f"  dataset_id: {model_metadata.training_dataset}")
+                logger.info(f"  dataset_version: {dataset_version}")
+=======
+                    except Exception as e:
+                        logger.warning(f"Could not fetch dataset version: {e}, using None")
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                 
                 await kafka_producer_service.send_automl_complete_event(
                     task_id=task_id,
@@ -203,9 +236,17 @@ async def upload_single_model_file(
                     dataset_version=dataset_version,
                     success=True
                 )
+<<<<<<< HEAD
+                logger.info(f"✅ AutoML completion event sent successfully for task_id={task_id}")
+            except Exception as e:
+                logger.error(f"❌ Failed to send AutoML completion event: {e}", exc_info=True)
+        else:
+            logger.warning("⚠️ No task_id provided in X-Task-ID header - AutoML completion event will NOT be sent")
+=======
                 logger.info(f"AutoML completion event sent for task_id={task_id}")
             except Exception as e:
                 logger.error(f"Failed to send AutoML completion event: {e}", exc_info=True)
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         
         return ModelResponse(**created_model)
         
@@ -595,7 +636,11 @@ async def update_model(
         
         # Prepare update data
         update_data = model_update.dict(exclude_unset=True)
+<<<<<<< HEAD
+        update_data['updated_at'] = datetime.now(tz=timezone.utc)
+=======
         update_data['updated_at'] = datetime.utcnow()
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         
         # Update model
         result = await collection.update_one(

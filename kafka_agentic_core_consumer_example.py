@@ -231,7 +231,11 @@ async def consume_dataset_events(producer):
                         "dataset_id": dataset_id,
                         "dataset_version": dataset_version,
                         "user_id": user_id,
+<<<<<<< HEAD
+                        "target_column_name": "signature",  # TODO: Get from user
+=======
                         "target_column_name": "target",  # TODO: Get from user
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                         "task_type": "classification"   # TODO: Get from user
                     }
                 }
@@ -294,6 +298,11 @@ async def consume_bias_events(producer):
                 user_id = output.get("user_id")
                 dataset_id = output.get("dataset_id")
                 bias_report_id = output.get("bias_report_id")
+<<<<<<< HEAD
+                mitigated_dataset_version = output.get("mitigated_dataset_version")
+                transformation_report_id = output.get("transformation_report_id")
+=======
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 
                 if not user_id or not dataset_id:
                     logger.warning("Missing user_id/dataset_id in bias completion event; skipping")
@@ -302,11 +311,36 @@ async def consume_bias_events(producer):
                 # TODO: Report bias results to user
                 logger.info(f"[User Report] Bias report completed for dataset {dataset_id}")
                 logger.info(f"  Bias Report ID: {bias_report_id}")
+<<<<<<< HEAD
+                if mitigated_dataset_version:
+                    logger.info(f"  ✅ Mitigation performed - mitigated dataset version: {mitigated_dataset_version}")
+                    logger.info(f"  Transformation Report ID: {transformation_report_id}")
+=======
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                 logger.info("[User Interaction] TODO: Report bias findings and ask if user wants to proceed with AutoML")
                 
                 # Generate a simple task_id for now (partners will implement proper Task Manager)
                 automl_task_id = f"automl_task_{dataset_id}_{int(datetime.now(timezone.utc).timestamp())}"
                 
+<<<<<<< HEAD
+                # Prioritize mitigated_dataset_version over dataset_version
+                # If mitigation was performed, use the mitigated version for AutoML training
+                if mitigated_dataset_version:
+                    dataset_version = mitigated_dataset_version
+                    logger.info(f"[AutoML Trigger] Using MITIGATED dataset version: {dataset_version}")
+                    logger.info(f"  This ensures AutoML trains on the bias-corrected dataset")
+                else:
+                    # Get dataset version from bias event output or fetch metadata
+                    dataset_version = output.get("dataset_version")
+                    if not dataset_version:
+                        # Fallback: fetch from API (get latest version)
+                        try:
+                            dataset_metadata = fetch_dataset_metadata(user_id, dataset_id)
+                            dataset_version = dataset_metadata.get("version", "v1")
+                        except Exception:
+                            dataset_version = "v1"  # Default fallback
+                    logger.info(f"[AutoML Trigger] Using original dataset version: {dataset_version}")
+=======
                 # Get dataset version from bias event output or fetch metadata
                 dataset_version = output.get("dataset_version")
                 if not dataset_version:
@@ -316,6 +350,7 @@ async def consume_bias_events(producer):
                         dataset_version = dataset_metadata.get("version", "v1")
                     except Exception:
                         dataset_version = "v1"  # Default fallback
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                 
                 # Produce AutoML trigger event
                 payload = {
@@ -326,7 +361,11 @@ async def consume_bias_events(producer):
                         "dataset_id": dataset_id,
                         "dataset_version": dataset_version,
                         "user_id": user_id,
+<<<<<<< HEAD
+                        "target_column_name": "signature",  # TODO: Get from user
+=======
                         "target_column_name": "target",  # TODO: Get from user
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                         "task_type": "classification"   # TODO: Get from user
                     }
                 }

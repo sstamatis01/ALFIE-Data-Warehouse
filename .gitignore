@@ -63,6 +63,14 @@ logs/
 *.tmp
 *.temp
 
+# Local artifacts / large binaries
+*.pkl
+*.zip
+
+# Backup files
+*.bak
+*.bak.*
+
 # Environment variables
 .env.local
 .env.production

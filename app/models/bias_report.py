@@ -1,4 +1,8 @@
+<<<<<<< HEAD
+from datetime import datetime, timezone
+=======
 from datetime import datetime
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 from bson import ObjectId
@@ -9,8 +13,13 @@ class BiasReport(BaseModel):
     dataset_id: str = Field(..., description="Dataset ID the report relates to")
     dataset_version: str = Field(..., description="Dataset version used for bias detection")
     report: Any = Field(..., description="Arbitrary bias report structure (JSON-serializable)")
+<<<<<<< HEAD
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
+=======
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 
 
 class BiasReportCreate(BaseModel):

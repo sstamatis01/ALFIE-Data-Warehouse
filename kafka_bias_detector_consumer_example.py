@@ -14,9 +14,16 @@ import asyncio
 import json
 import logging
 from importlib.metadata import distribution
+<<<<<<< HEAD
+from datetime import datetime, timezone
+
+import numpy as np
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+=======
 
 import numpy as np
 from aiokafka import AIOKafkaConsumer
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 import requests
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
@@ -29,6 +36,10 @@ logger = logging.getLogger("kafka_consumer_example")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_BIAS_TRIGGER_TOPIC = os.getenv("KAFKA_BIAS_TRIGGER_TOPIC", "bias-detection-trigger-events")
 KAFKA_BIAS_TRIGGER_CONSUMER_GROUP = os.getenv("KAFKA_BIAS_TRIGGER_CONSUMER_GROUP", "bias-trigger-consumer")
+<<<<<<< HEAD
+KAFKA_BIAS_TOPIC = os.getenv("KAFKA_BIAS_TOPIC", "bias-detection-complete-events")
+=======
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 
 # Use Docker service name if KAFKA_BOOTSTRAP_SERVERS points to kafka:29092, otherwise use localhost
 if "kafka:" in KAFKA_BOOTSTRAP_SERVERS:
@@ -80,6 +91,15 @@ def clean_for_json(obj):
 def post_bias_report(user_id: str, dataset_id: str, report: dict, 
                      target_column_name: str = None, task_type: str = None,
                      dataset_version: str = "v1", task_id: str | None = None) -> dict:
+<<<<<<< HEAD
+    """
+    Post bias report to API
+    
+    Note: If task_id is None, the API will not send the bias-complete event.
+    This allows us to delay the event until after mitigation completes.
+    """
+=======
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
     url = f"{API_BASE}/bias-reports/"
     payload = {
         "user_id": user_id,
@@ -97,6 +117,63 @@ def post_bias_report(user_id: str, dataset_id: str, report: dict,
     return r.json()
 
 
+<<<<<<< HEAD
+async def send_bias_complete_event(
+    producer: AIOKafkaProducer,
+    task_id: str,
+    user_id: str,
+    dataset_id: str,
+    dataset_version: str,
+    bias_report_id: str,
+    mitigated_dataset_version: str | None = None,
+    transformation_report_id: str | None = None,
+    success: bool = True,
+    error_message: str | None = None
+) -> None:
+    """Send bias detection completion event with mitigation metadata"""
+    if not producer:
+        logger.warning("Kafka producer not initialized; skipping bias completion event")
+        return
+    
+    payload = {
+        "task_id": task_id,
+        "event_type": "bias-detection-complete",
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    
+    if success:
+        output = {
+            "bias_report_id": bias_report_id,
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "user_id": user_id
+        }
+        # Add mitigation metadata if available
+        if mitigated_dataset_version:
+            output["mitigated_dataset_version"] = mitigated_dataset_version
+        if transformation_report_id:
+            output["transformation_report_id"] = transformation_report_id
+        
+        payload["output"] = output
+        payload["failure"] = None
+    else:
+        payload["output"] = None
+        payload["failure"] = {
+            "error_type": "BiasDetectionError",
+            "error_message": error_message or "Bias detection failed"
+        }
+    
+    try:
+        await producer.send_and_wait(KAFKA_BIAS_TOPIC, value=payload, key=task_id)
+        logger.info(f"✅ Bias completion event sent for task_id={task_id}")
+        if mitigated_dataset_version:
+            logger.info(f"   Includes mitigation info: version={mitigated_dataset_version}, report_id={transformation_report_id}")
+    except Exception as e:
+        logger.error(f"❌ Failed to send bias completion event: {e}", exc_info=True)
+
+
+=======
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
     # Build a report like the provided example structure
     report: dict = {}
@@ -363,9 +440,17 @@ def upload_mitigated_dataset(user_id: str, original_dataset_id: str, original_ve
                               df_transformed: pd.DataFrame, meta: dict) -> dict:
     """
     Upload mitigated dataset as a new version with flag to prevent re-processing
+<<<<<<< HEAD
+    
+    Returns:
+        dict: Response from the upload endpoint, which includes the actual version assigned by the API
+    """
+    from io import BytesIO
+=======
     """
     from io import BytesIO
     from datetime import datetime, timezone
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
     
     # Convert DataFrame to CSV bytes
     buf = BytesIO()
@@ -373,6 +458,10 @@ def upload_mitigated_dataset(user_id: str, original_dataset_id: str, original_ve
     buf.seek(0)
     csv_bytes = buf.getvalue()
     
+<<<<<<< HEAD
+    # Upload the mitigated dataset - let the API auto-detect the next version
+    # The API will automatically increment the version (v1 -> v2 -> v3, etc.)
+=======
     # Get next version for mitigated dataset
     # Use the same dataset_id but increment version
     try:
@@ -398,6 +487,7 @@ def upload_mitigated_dataset(user_id: str, original_dataset_id: str, original_ve
         mitigated_version = "v2"  # Default fallback
     
     # Upload the mitigated dataset
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
     url = f"{API_BASE}/datasets/upload/{user_id}"
     files = {"file": (f"{original_dataset_id}_mitigated.csv", csv_bytes, "text/csv")}
     
@@ -408,7 +498,11 @@ def upload_mitigated_dataset(user_id: str, original_dataset_id: str, original_ve
     mitigation_tags = existing_tags + ["mitigated", "bias-corrected"]
     
     data = {
+<<<<<<< HEAD
+        "dataset_id": original_dataset_id,  # Same dataset_id, different version (auto-incremented by API)
+=======
         "dataset_id": original_dataset_id,  # Same dataset_id, different version
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         "name": f"{meta.get('name', original_dataset_id)} (Mitigated)",
         "description": f"Bias-mitigated version of {original_dataset_id} {original_version}. Generated automatically by bias mitigation process.",
         "tags": ",".join(mitigation_tags)
@@ -418,15 +512,37 @@ def upload_mitigated_dataset(user_id: str, original_dataset_id: str, original_ve
     response.raise_for_status()
     result = response.json()
     
+<<<<<<< HEAD
+    # Extract the actual version from the API response
+    actual_version = result.get("version", "v1")
+    logger.info(f"Mitigated dataset uploaded successfully")
+    logger.info(f"  Dataset ID: {original_dataset_id}")
+    logger.info(f"  Actual version assigned by API: {actual_version}")
+    logger.info(f"  Original version: {original_version}")
+    logger.info(f"  Tagged with 'mitigated' to prevent re-processing")
+=======
     # Note: The dataset is marked as mitigated via the "mitigated" tag
     # The agentic core will check both tags and custom_metadata to detect mitigated datasets
     # If custom_metadata update is needed in the future, it can be added via a version-specific update endpoint
     logger.info(f"Mitigated dataset uploaded with 'mitigated' tag to prevent re-processing")
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
     
     return result
 
 
 async def run_consumer() -> None:
+<<<<<<< HEAD
+    # Initialize Kafka producer for sending completion events
+    producer = AIOKafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        value_serializer=lambda x: json.dumps(x, default=str).encode('utf-8'),
+        key_serializer=lambda x: x.encode('utf-8') if x else None,
+    )
+    await producer.start()
+    logger.info("Kafka producer started for sending completion events")
+    
+=======
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
     consumer = AIOKafkaConsumer(
         KAFKA_BIAS_TRIGGER_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -490,7 +606,12 @@ async def run_consumer() -> None:
                 # Build bias report (profile) per the corrected example
                 bias_report = build_bias_report(df, meta)
 
+<<<<<<< HEAD
+                # POST bias report to API WITHOUT task_id initially (so no event is sent)
+                # We'll send the event manually after mitigation completes
+=======
                 # POST bias report to API (include target_column_name, task_type, and dataset_version)
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                 saved = post_bias_report(
                     user_id=user_id, 
                     dataset_id=dataset_id, 
@@ -498,9 +619,17 @@ async def run_consumer() -> None:
                     target_column_name=target_column_name,
                     task_type=task_type,
                     dataset_version=dataset_version,
+<<<<<<< HEAD
+                    task_id=None  # Don't send task_id yet - delay event until after mitigation
+                )
+                bias_report_id = saved.get("id", "")
+                logger.info(f"✅ Bias report saved (ID: {bias_report_id})")
+                logger.info(f"   Event will be sent after mitigation completes (if needed)")
+=======
                     task_id=task_id
                 )
                 logger.info(f"Saved bias report: {json.dumps(saved, indent=2, default=str)}")
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                 
                 # Check if mitigator should run (only if dataset is not already mitigated)
                 is_mitigated = meta.get("custom_metadata", {}).get("is_mitigated", False)
@@ -519,6 +648,13 @@ async def run_consumer() -> None:
                 )
                 needs_mitigation = has_missing_values or has_duplicates or has_skewed_cols
                 
+<<<<<<< HEAD
+                # Variables to track mitigation results
+                mitigated_dataset_version = None
+                transformation_report_id = None
+                
+=======
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                 if not is_mitigated and not has_mitigated_tag and df is not None and needs_mitigation:
                     # Run bias mitigation
                     logger.info("=" * 80)
@@ -531,6 +667,10 @@ async def run_consumer() -> None:
                         if transformation_log:
                             logger.info(f"Applied {len(transformation_log)} transformations")
                             
+<<<<<<< HEAD
+                            # Upload mitigated dataset FIRST to get the actual version from the API
+                            logger.info("Uploading mitigated dataset...")
+=======
                             # Post transformation report
                             try:
                                 # Get next version for mitigated dataset
@@ -567,6 +707,7 @@ async def run_consumer() -> None:
                             
                             # Upload mitigated dataset
                             logger.info(f"Uploading mitigated dataset as version {mitigated_version}...")
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                             mitigated_result = upload_mitigated_dataset(
                                 user_id=user_id,
                                 original_dataset_id=dataset_id,
@@ -574,11 +715,71 @@ async def run_consumer() -> None:
                                 df_transformed=df_transformed,
                                 meta=meta
                             )
+<<<<<<< HEAD
+                            
+                            # Extract the ACTUAL version from the upload response
+                            actual_mitigated_version = mitigated_result.get("version")
+                            if not actual_mitigated_version:
+                                logger.error("Upload response missing version field!")
+                                logger.error(f"Response: {json.dumps(mitigated_result, indent=2, default=str)}")
+                                raise ValueError("Failed to get version from dataset upload response")
+                            
+                            mitigated_dataset_version = actual_mitigated_version
+                            
+                            logger.info(f"✅ Mitigated dataset uploaded successfully!")
+                            logger.info(f"   Dataset ID: {dataset_id}")
+                            logger.info(f"   Actual mitigated version: {actual_mitigated_version}")
+                            logger.info(f"   Original version: {dataset_version}")
+                            logger.info(f"   Transformations applied: {len(transformation_log)}")
+                            
+                            # Post transformation report with the ACTUAL version from upload response
+                            transform_url = f"{API_BASE}/transformation-reports/"
+                            transform_payload = {
+                                "user_id": user_id,
+                                "dataset_id": dataset_id,
+                                "version": actual_mitigated_version,  # Use actual version from upload
+                                "report": transformation_log
+                            }
+                            transform_resp = requests.post(transform_url, json=transform_payload, timeout=30)
+                            transform_resp.raise_for_status()
+                            transform_report_result = transform_resp.json()
+                            transformation_report_id = transform_report_result.get("id", "")
+                            
+                            logger.info(f"✅ Transformation report saved successfully!")
+                            logger.info(f"   Dataset ID: {dataset_id}")
+                            logger.info(f"   Version: {actual_mitigated_version}")
+                            logger.info(f"   Transformation report ID: {transformation_report_id}")
+                            
+                            # Update bias report with mitigation metadata
+                            mitigation_metadata = {
+                                "mitigation_performed": True,
+                                "mitigated_dataset_version": actual_mitigated_version,
+                                "transformation_report_id": transformation_report_id,
+                                "transformation_count": len(transformation_log)
+                            }
+                            
+                            # Add mitigation metadata to the bias report
+                            updated_bias_report = bias_report.copy()
+                            updated_bias_report["mitigation"] = mitigation_metadata
+                            
+                            # Update the bias report by posting again (upsert)
+                            updated_saved = post_bias_report(
+                                user_id=user_id,
+                                dataset_id=dataset_id,
+                                report=updated_bias_report,
+                                target_column_name=target_column_name,
+                                task_type=task_type,
+                                dataset_version=dataset_version,
+                                task_id=None  # Still no task_id - we'll send event manually
+                            )
+                            logger.info(f"✅ Bias report updated with mitigation metadata")
+=======
                             logger.info(f"✅ Mitigated dataset uploaded successfully!")
                             logger.info(f"   Dataset ID: {dataset_id}")
                             logger.info(f"   Version: {mitigated_version}")
                             logger.info(f"   Original version: {dataset_version}")
                             logger.info(f"   Transformations applied: {len(transformation_log)}")
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                         else:
                             logger.info("No transformations needed - dataset is already clean")
                     except Exception as e:
@@ -591,15 +792,60 @@ async def run_consumer() -> None:
                         logger.info("No DataFrame available - skipping mitigation step")
                     elif not needs_mitigation:
                         logger.info("No bias issues detected that require mitigation - skipping mitigation step")
+<<<<<<< HEAD
+                
+                # Send bias-complete event AFTER all processing (including mitigation) is done
+                if task_id:
+                    await send_bias_complete_event(
+                        producer=producer,
+                        task_id=task_id,
+                        user_id=user_id,
+                        dataset_id=dataset_id,
+                        dataset_version=dataset_version,
+                        bias_report_id=bias_report_id,
+                        mitigated_dataset_version=mitigated_dataset_version,
+                        transformation_report_id=transformation_report_id,
+                        success=True
+                    )
+                else:
+                    logger.warning("No task_id provided - bias-complete event will not be sent")
+
+            except Exception as proc_err:
+                logger.error(f"Processing error: {proc_err}", exc_info=True)
+                # Send failure event if task_id is available
+                try:
+                    task_id = value.get("task_id") if 'value' in locals() else None
+                    if task_id:
+                        await send_bias_complete_event(
+                            producer=producer,
+                            task_id=task_id,
+                            user_id=value.get("input", {}).get("user_id", "unknown") if 'value' in locals() else "unknown",
+                            dataset_id=value.get("input", {}).get("dataset_id", "unknown") if 'value' in locals() else "unknown",
+                            dataset_version=value.get("input", {}).get("dataset_version", "v1") if 'value' in locals() else "v1",
+                            bias_report_id="",
+                            mitigated_dataset_version=None,
+                            transformation_report_id=None,
+                            success=False,
+                            error_message=str(proc_err)
+                        )
+                except Exception as event_err:
+                    logger.error(f"Failed to send failure event: {event_err}")
+=======
 
             except Exception as proc_err:
                 logger.error(f"Processing error: {proc_err}")
             # Send Kafka event (non-blocking failure)
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 
     
     finally:
         await consumer.stop()
+<<<<<<< HEAD
+        await producer.stop()
+        logger.info("Consumer and producer stopped")
+=======
         logger.info("Consumer stopped")
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 
 
 if __name__ == "__main__":

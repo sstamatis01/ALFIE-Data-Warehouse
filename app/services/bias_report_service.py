@@ -1,5 +1,9 @@
 from typing import Optional
+<<<<<<< HEAD
+from datetime import datetime, timezone
+=======
 from datetime import datetime
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 from .metadata_service import metadata_service
 from ..core.database import get_database
 from ..models.bias_report import BiasReportCreate, BiasReportResponse
@@ -21,7 +25,11 @@ class BiasReportService:
         if not dataset:
             raise ValueError(f"Dataset {data.dataset_id} version {data.dataset_version} not found for bias report")
 
+<<<<<<< HEAD
+        now = datetime.now(tz=timezone.utc)
+=======
         now = datetime.utcnow()
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         update = {
             "$set": {
                 "user_id": data.user_id,
