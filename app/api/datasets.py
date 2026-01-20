@@ -1,5 +1,9 @@
 from typing import List, Optional
+<<<<<<< HEAD
 from datetime import datetime, timezone
+=======
+from datetime import datetime
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, Query, Form
 from fastapi.responses import StreamingResponse
 from io import BytesIO
@@ -57,7 +61,11 @@ async def _get_next_dataset_name(user_id: str) -> str:
     except Exception as e:
         logger.error(f"Error generating dataset name: {e}")
         # Fallback to timestamp-based name
+<<<<<<< HEAD
         timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+=======
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         return f"user_uploaded_dataset_{timestamp}"
 
 
@@ -293,8 +301,13 @@ async def upload_dataset_folder(
             data_types=None,
             tags=tag_list,
             custom_metadata={"file_count": len(dataset_files), "preserve_structure": preserve_structure},
+<<<<<<< HEAD
             created_at=datetime.now(tz=timezone.utc),
             updated_at=datetime.now(tz=timezone.utc),
+=======
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
             file_hash=None
         )
         

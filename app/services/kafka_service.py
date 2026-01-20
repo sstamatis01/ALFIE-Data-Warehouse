@@ -1,6 +1,10 @@
 import json
 import logging
+<<<<<<< HEAD
 from datetime import datetime, timezone
+=======
+from datetime import datetime
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 from typing import Dict, Any, Optional
 from aiokafka import AIOKafkaProducer
 from ..core.config import settings
@@ -50,8 +54,13 @@ class KafkaProducerService:
         try:
             payload: Dict[str, Any] = {
                 "event_type": event_type,
+<<<<<<< HEAD
                 "event_id": f"{event_type}_{dataset_metadata.dataset_id}_{int(datetime.now(tz=timezone.utc).timestamp())}",
                 "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+=======
+                "event_id": f"{event_type}_{dataset_metadata.dataset_id}_{int(datetime.utcnow().timestamp())}",
+                "timestamp": datetime.utcnow().isoformat(),
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
                 "dataset": {
                     "dataset_id": dataset_metadata.dataset_id,
                     "user_id": dataset_metadata.user_id,
@@ -109,7 +118,11 @@ class KafkaProducerService:
             "dataset_id": dataset_id,
             "filename": filename,
             "file_size": file_size,
+<<<<<<< HEAD
             "timestamp": datetime.now(tz=timezone.utc).isoformat()
+=======
+            "timestamp": datetime.utcnow().isoformat()
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         }
         
         try:
@@ -145,7 +158,11 @@ class KafkaProducerService:
             "file_size": file_size,
             "record_count": record_count,
             "columns": columns,
+<<<<<<< HEAD
             "timestamp": datetime.now(tz=timezone.utc).isoformat()
+=======
+            "timestamp": datetime.utcnow().isoformat()
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         }
         
         try:
@@ -177,7 +194,11 @@ class KafkaProducerService:
             "dataset_id": dataset_id,
             "filename": filename,
             "error_message": error_message,
+<<<<<<< HEAD
             "timestamp": datetime.now(tz=timezone.utc).isoformat()
+=======
+            "timestamp": datetime.utcnow().isoformat()
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         }
         
         try:
@@ -211,7 +232,11 @@ class KafkaProducerService:
         payload = {
             "task_id": task_id,
             "event_type": "bias-detection-complete",
+<<<<<<< HEAD
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+=======
+            "timestamp": datetime.utcnow().isoformat(),
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         }
         
         if success:
@@ -249,6 +274,7 @@ class KafkaProducerService:
     ) -> None:
         """Send AutoML completion event"""
         if not self.producer:
+<<<<<<< HEAD
             logger.error("❌ Kafka producer not initialized; skipping AutoML completion event")
             logger.error("   This usually means the Kafka producer failed to start during application initialization")
             return
@@ -259,6 +285,15 @@ class KafkaProducerService:
             "task_id": task_id,
             "event_type": "automl-complete",
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+=======
+            logger.warning("Kafka producer not initialized; skipping AutoML completion event")
+            return
+        
+        payload = {
+            "task_id": task_id,
+            "event_type": "automl-complete",
+            "timestamp": datetime.utcnow().isoformat(),
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         }
         
         if success:
@@ -278,6 +313,7 @@ class KafkaProducerService:
             }
         
         try:
+<<<<<<< HEAD
             logger.info(f"Sending AutoML completion event to topic: {settings.kafka_automl_topic}")
             logger.info(f"Payload: {json.dumps(payload, indent=2, default=str)}")
             await self.producer.send_and_wait(settings.kafka_automl_topic, value=payload, key=task_id)
@@ -287,6 +323,12 @@ class KafkaProducerService:
             logger.error(f"   Topic: {settings.kafka_automl_topic}")
             logger.error(f"   Task ID: {task_id}")
             logger.error(f"   Bootstrap servers: {self.bootstrap_servers}")
+=======
+            await self.producer.send_and_wait(settings.kafka_automl_topic, value=payload, key=task_id)
+            logger.info(f"AutoML completion event sent for task_id={task_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send AutoML completion event: {e}")
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 
     async def send_xai_complete_event(
         self,
@@ -309,7 +351,11 @@ class KafkaProducerService:
         payload = {
             "task_id": task_id,
             "event_type": "xai-complete",
+<<<<<<< HEAD
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+=======
+            "timestamp": datetime.utcnow().isoformat(),
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
         }
         
         if success:

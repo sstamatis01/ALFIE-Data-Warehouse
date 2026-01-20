@@ -1,5 +1,9 @@
 from typing import List, Optional, Dict, Any
+<<<<<<< HEAD
 from datetime import datetime, timezone
+=======
+from datetime import datetime
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
 from fastapi import HTTPException
@@ -31,8 +35,13 @@ class MetadataService:
             metadata_dict = {
                 **dataset_data.dict(),
                 **file_metadata,
+<<<<<<< HEAD
                 'created_at': datetime.now(tz=timezone.utc),
                 'updated_at': datetime.now(tz=timezone.utc)
+=======
+                'created_at': datetime.utcnow(),
+                'updated_at': datetime.utcnow()
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
             }
             
             # Create DatasetMetadata object
@@ -147,7 +156,11 @@ class MetadataService:
         """Update dataset metadata for all versions of the dataset"""
         try:
             update_dict = {k: v for k, v in update_data.dict().items() if v is not None}
+<<<<<<< HEAD
             update_dict['updated_at'] = datetime.now(tz=timezone.utc)
+=======
+            update_dict['updated_at'] = datetime.utcnow()
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
             
             # Update all versions of the dataset
             result = await self.db.datasets.update_many(
@@ -243,8 +256,13 @@ class MetadataService:
             user_dict = user_data.dict()
             # Remove password from stored data (in real app, hash the password)
             user_dict.pop('password', None)
+<<<<<<< HEAD
             user_dict['created_at'] = datetime.now(tz=timezone.utc)
             user_dict['updated_at'] = datetime.now(tz=timezone.utc)
+=======
+            user_dict['created_at'] = datetime.utcnow()
+            user_dict['updated_at'] = datetime.utcnow()
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
             
             user = User(**user_dict)
             result = await self.db.users.insert_one(user.dict(by_alias=True, exclude={'id'}))
@@ -288,7 +306,11 @@ class MetadataService:
         """Update user information"""
         try:
             update_dict = {k: v for k, v in update_data.dict().items() if v is not None}
+<<<<<<< HEAD
             update_dict['updated_at'] = datetime.now(tz=timezone.utc)
+=======
+            update_dict['updated_at'] = datetime.utcnow()
+>>>>>>> 9071a9c69b92669f03f3884d4a945a40b8296d96
             
             result = await self.db.users.update_one(
                 {"user_id": user_id},
