@@ -82,7 +82,6 @@ def clean_for_json(obj):
 def post_bias_report(user_id: str, dataset_id: str, report: dict, 
                      target_column_name: str = None, task_type: str = None,
                      dataset_version: str = "v1", task_id: str | None = None) -> dict:
-<<<<<<< HEAD
     """
     Post bias report to API
     
@@ -106,7 +105,6 @@ def post_bias_report(user_id: str, dataset_id: str, report: dict,
     return r.json()
 
 
-<<<<<<< HEAD
 async def send_bias_complete_event(
     producer: AIOKafkaProducer,
     task_id: str,
