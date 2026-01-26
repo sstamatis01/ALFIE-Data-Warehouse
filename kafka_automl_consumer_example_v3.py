@@ -9,6 +9,9 @@ When an AutoML trigger event is received, this consumer should:
 - Train an AI model using AutoML
 - Save the model to the Data Warehouse (which triggers automl-events)
 
+Multiple instances of this consumer can run in parallel - Kafka will automatically
+distribute partitions among them for concurrent processing.
+
 Usage:
   # Default configuration (runs outside Docker, connects to Docker services via localhost)
   KAFKA_BOOTSTRAP_SERVERS=localhost:9092 python kafka_automl_consumer_example_v3.py
@@ -18,6 +21,7 @@ Usage:
 
   Note: This consumer runs OUTSIDE Docker and connects to Docker services via localhost.
         The Docker services (tabular, data-warehouse-api) expose ports to the host.
+        Multiple instances can run in parallel - Kafka handles load balancing.
 """
 
 import os
@@ -31,7 +35,6 @@ import pandas as pd
 from io import BytesIO
 from dotenv import load_dotenv, find_dotenv
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger("kafka_automl_consumer")
 
 load_dotenv(find_dotenv())
@@ -54,17 +57,14 @@ else:
 
 # AutoML Tabular configuration
 # Default to localhost (for running outside Docker)
+# When running inside Docker, use host.docker.internal (Windows/Mac) or host IP (Linux)
 # Can be overridden with TABULAR_AUTOML_HOST environment variable
 TABULAR_AUTOML_HOST = os.getenv("TABULAR_AUTOML_HOST", "localhost")
 TABULAR_AUTOML_PORT = os.getenv("TABULAR_AUTOML_PORT", "8001")
 MAIN_AUTOML_URL = f"http://{TABULAR_AUTOML_HOST}:{TABULAR_AUTOML_PORT}"
 AUTOML_TABULAR_URL = f"{MAIN_AUTOML_URL}/automl_tabular/best_model"
 
-# Log configuration at module load
-logger.info(f"Configuration:")
-logger.info(f"  Data Warehouse API: {API_BASE} (host: {DW_HOST}, port: {DW_PORT})")
-logger.info(f"  AutoML Tabular: {AUTOML_TABULAR_URL} (host: {TABULAR_AUTOML_HOST}, port: {TABULAR_AUTOML_PORT})")
-logger.info(f"  Note: Running outside Docker - using localhost to connect to Docker services")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 
 def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -> dict:
@@ -311,7 +311,11 @@ async def process_automl_trigger(event: dict) -> None:
                 logger.warning(f"   This might indicate the service is not running or not accessible")
             
             try:
-                r = requests.post(AUTOML_TABULAR_URL, data=data, headers=headers, timeout=120)
+                # Calculate timeout: training time + buffer for download/upload/processing
+                # Add 5 minutes (300 seconds) buffer for dataset download, model upload, and processing overhead
+                request_timeout = time_budget_seconds + 300
+                logger.info(f"Setting request timeout to {request_timeout} seconds ({request_timeout // 60} minutes) to accommodate {time_budget_seconds // 60} minutes of training")
+                r = requests.post(AUTOML_TABULAR_URL, data=data, headers=headers, timeout=request_timeout)
                 r.raise_for_status()
             except requests.exceptions.ConnectionError as e:
                 logger.error(f"Failed to connect to AutoML service at {AUTOML_TABULAR_URL}")
@@ -333,6 +337,11 @@ async def process_automl_trigger(event: dict) -> None:
                             logger.error(f"   Response body: {e.response.text[:500]}")
                 logger.error(f"   If running in Docker, ensure TABULAR_AUTOML_HOST=tabular is set")
                 raise
+            except requests.exceptions.Timeout as e:
+                logger.error(f"Request to AutoML service timed out after {request_timeout} seconds")
+                logger.error(f"   Training may have taken longer than expected")
+                logger.error(f"   Consider increasing time_budget or checking service logs")
+                raise
             
             response_data = r.json() if r.content else {}
             logger.info("✅ AutoML processing completed and models uploaded to Data Warehouse")
@@ -349,7 +358,7 @@ async def process_automl_trigger(event: dict) -> None:
         return
 
 async def run_consumer() -> None:
-    """Main consumer loop"""
+    """Main consumer loop - similar to bias detector consumer"""
     consumer = AIOKafkaConsumer(
         KAFKA_AUTOML_TRIGGER_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -367,6 +376,7 @@ async def run_consumer() -> None:
     logger.info(f"Data Warehouse API: {API_BASE} (host: {DW_HOST}, port: {DW_PORT})")
     logger.info(f"AutoML Tabular service: {AUTOML_TABULAR_URL} (host: {TABULAR_AUTOML_HOST}, port: {TABULAR_AUTOML_PORT})")
     logger.info("Waiting for AutoML trigger events from Agentic Core...")
+    logger.info("Note: Multiple instances can run in parallel - Kafka will distribute partitions among them")
 
     await consumer.start()
     

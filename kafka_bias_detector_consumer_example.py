@@ -81,7 +81,8 @@ def clean_for_json(obj):
 
 def post_bias_report(user_id: str, dataset_id: str, report: dict, 
                      target_column_name: str = None, task_type: str = None,
-                     dataset_version: str = "v1", task_id: str | None = None) -> dict:
+                     dataset_version: str = "v1", task_id: str | None = None,
+                     transformation_report_id: str | None = None) -> dict:
     """
     Post bias report to API
     
@@ -97,6 +98,8 @@ def post_bias_report(user_id: str, dataset_id: str, report: dict,
         "target_column_name": target_column_name,
         "task_type": task_type,
     }
+    if transformation_report_id:
+        payload["transformation_report_id"] = transformation_report_id
     headers = {}
     if task_id:
         headers["X-Task-ID"] = task_id
@@ -654,7 +657,8 @@ async def run_consumer() -> None:
                                 target_column_name=target_column_name,
                                 task_type=task_type,
                                 dataset_version=dataset_version,
-                                task_id=None  # Still no task_id - we'll send event manually
+                                task_id=None,  # Still no task_id - we'll send event manually
+                                transformation_report_id=transformation_report_id
                             )
                             logger.info(f"✅ Bias report updated with mitigation metadata")
                         else:

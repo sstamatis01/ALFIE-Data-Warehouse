@@ -13,7 +13,7 @@ class BiasReportService:
         db = get_database()
         self.collection = db.bias_reports
 
-    async def upsert_report(self, data: BiasReportCreate) -> BiasReportResponse:
+    async def upsert_report(self, data: BiasReportCreate, transformation_report_id: Optional[str] = None) -> BiasReportResponse:
         # Ensure dataset exists with specific version
         dataset = await metadata_service.get_dataset_by_id_and_version(
             data.dataset_id, data.user_id, data.dataset_version
@@ -32,6 +32,10 @@ class BiasReportService:
             },
             "$setOnInsert": {"created_at": now},
         }
+        # Add transformation_report_id if provided
+        if transformation_report_id:
+            update["$set"]["transformation_report_id"] = transformation_report_id
+        
         # Update unique constraint to include dataset_version
         await self.collection.update_one(
             {
@@ -54,6 +58,7 @@ class BiasReportService:
             dataset_id=doc["dataset_id"],
             dataset_version=doc["dataset_version"],
             report=doc["report"],
+            transformation_report_id=doc.get("transformation_report_id"),
             created_at=doc["created_at"],
             updated_at=doc["updated_at"],
         )
@@ -79,6 +84,7 @@ class BiasReportService:
             dataset_id=doc["dataset_id"],
             dataset_version=doc.get("dataset_version", "v1"),  # Backward compatibility
             report=doc["report"],
+            transformation_report_id=doc.get("transformation_report_id"),
             created_at=doc["created_at"],
             updated_at=doc["updated_at"],
         )
@@ -94,6 +100,7 @@ class BiasReportService:
                 dataset_id=doc["dataset_id"],
                 dataset_version=doc.get("dataset_version", "v1"),  # Backward compatibility
                 report=doc["report"],
+                transformation_report_id=doc.get("transformation_report_id"),
                 created_at=doc["created_at"],
                 updated_at=doc["updated_at"],
             )

@@ -25,6 +25,7 @@ RUN python -c "import aiohttp; print('aiohttp version:', aiohttp.__version__)" &
 # Copy application code
 COPY app/ ./app/
 COPY kafka_bias_detector_consumer_example.py ./
+COPY kafka_automl_consumer_example_v3.py ./
 
 # Note: .env is handled via env_file in docker-compose.yml, so it's not required at build time
 # If .env exists, it will be copied, but the build won't fail if it doesn't exist

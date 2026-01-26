@@ -17,7 +17,7 @@ async def create_or_update_bias_report(
     task_id: Optional[str] = Header(None, alias="X-Task-ID")
 ):
     try:
-        report = await bias_report_service.upsert_report(payload)
+        report = await bias_report_service.upsert_report(payload, transformation_report_id=payload.transformation_report_id)
         
         # Send completion event if task_id is provided
         if task_id:

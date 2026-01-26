@@ -175,6 +175,39 @@ services:
       - ./app:/app/app:ro
       - ./kafka_bias_detector_consumer_example.py:/app/kafka_bias_detector_consumer_example.py:ro
 
+  # AutoML Consumer Service (with parallel processing support)
+  automl-consumer:
+    build: .
+    env_file:
+      - .env
+    container_name: data-warehouse-automl-consumer
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_AUTOML_TRIGGER_TOPIC: automl-trigger-events
+      KAFKA_CONSUMER_GROUP: automl-consumer
+      API_BASE: http://api:8000
+      DW_HOST: api
+      DW_PORT: 8000
+      # Note: TABULAR_AUTOML_HOST should point to where the AutoML tabular service is running
+      # If running outside Docker on the host machine, use host.docker.internal (Windows/Mac) or host IP
+      # If running in Docker, use the service name (e.g., 'tabular' if added to docker-compose)
+      # Default to host.docker.internal to access services on the host machine
+      TABULAR_AUTOML_HOST: host.docker.internal
+      TABULAR_AUTOML_PORT: 8001
+    depends_on:
+      api:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - data-warehouse-network
+    command: >
+      sh -c "sleep 20 && python kafka_automl_consumer_example_v3.py"
+    volumes:
+      - ./app:/app/app:ro
+      - ./kafka_automl_consumer_example_v3.py:/app/kafka_automl_consumer_example_v3.py:ro
+
 volumes:
   mongodb_data:
   minio_data:

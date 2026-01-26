@@ -34,6 +34,7 @@ class TransformationReportService:
         )
         doc = await self.collection.find_one({"user_id": data.user_id, "dataset_id": data.dataset_id, "version": data.version})
         return TransformationReportResponse(
+            id=str(doc.get("_id")) if doc and doc.get("_id") else None,
             user_id=doc["user_id"],
             dataset_id=doc["dataset_id"],
             version=doc["version"],
@@ -47,6 +48,7 @@ class TransformationReportService:
         if not doc:
             return None
         return TransformationReportResponse(
+            id=str(doc.get("_id")) if doc and doc.get("_id") else None,
             user_id=doc["user_id"],
             dataset_id=doc["dataset_id"],
             version=doc["version"],
