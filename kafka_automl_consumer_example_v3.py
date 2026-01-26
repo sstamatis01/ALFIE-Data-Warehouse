@@ -237,7 +237,7 @@ async def process_automl_trigger(event: dict) -> None:
         logger.info(f"  Target column: {target_column}")
         logger.info(f"  Task type: {task_type}")
         logger.info(f"  Task category: {task_category}")
-        logger.info(f"  Time budget: {time_budget} minutes (will be converted to seconds)")
+        logger.info(f"  Time budget: {time_budget} seconds")
         
         # Step 1: Fetch dataset metadata and download file (for validation/preprocessing)
         try:
@@ -276,13 +276,13 @@ async def process_automl_trigger(event: dict) -> None:
         
         # Step 2: Call AutoML service with all necessary information
         if task_category == "tabular":
-            # Convert time_budget from string to int, and from minutes to seconds
+            # Convert time_budget from string to int (already in seconds, no conversion needed)
             # The endpoint expects time_budget in seconds as an integer
             try:
-                time_budget_seconds = int(time_budget) * 60  # Convert minutes to seconds
+                time_budget_seconds = int(time_budget)  # Use directly as seconds
             except (ValueError, TypeError):
-                logger.warning(f"Invalid time_budget '{time_budget}', using default 10 minutes (600 seconds)")
-                time_budget_seconds = 600
+                logger.warning(f"Invalid time_budget '{time_budget}', using default 10 seconds")
+                time_budget_seconds = 10
             
             data = {
                 "user_id": user_id,
@@ -312,9 +312,9 @@ async def process_automl_trigger(event: dict) -> None:
             
             try:
                 # Calculate timeout: training time + buffer for download/upload/processing
-                # Add 5 minutes (300 seconds) buffer for dataset download, model upload, and processing overhead
+                # Add 300 seconds buffer for dataset download, model upload, and processing overhead
                 request_timeout = time_budget_seconds + 300
-                logger.info(f"Setting request timeout to {request_timeout} seconds ({request_timeout // 60} minutes) to accommodate {time_budget_seconds // 60} minutes of training")
+                logger.info(f"Setting request timeout to {request_timeout} seconds to accommodate {time_budget_seconds} seconds of training")
                 r = requests.post(AUTOML_TABULAR_URL, data=data, headers=headers, timeout=request_timeout)
                 r.raise_for_status()
             except requests.exceptions.ConnectionError as e:
