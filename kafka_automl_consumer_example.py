@@ -133,6 +133,44 @@ def extract_dataset_folder(zip_bytes: bytes, extract_to: str = "temp_dataset") -
     return extracted_files
 
 
+def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, 
+                       zip_file_path: str, model_type: str, 
+                       framework: str = "sklearn", accuracy: float = None,
+                       dataset_version: str = None, task_id: str | None = None) -> dict:
+    """
+    Upload model ZIP file to Data Warehouse
+    
+    This uses the folder upload endpoint for AI models (ZIP files).
+    Version is auto-incremented by the DW.
+    """
+    url = f"{API_BASE}/ai-models/upload/folder/{user_id}"
+    
+    # Include dataset version in description for data lineage tracking
+    description = f"AutoML trained model for {model_type}"
+    if dataset_version:
+        description += f" (trained on dataset {dataset_id} version {dataset_version})"
+    else:
+        description += f" (trained on dataset {dataset_id})"
+    
+    with open(zip_file_path, 'rb') as f:
+        files = {'zip_file': (os.path.basename(zip_file_path), f, 'application/zip')}
+        data = {
+            'model_id': model_id,
+            'name': f"AutoML Model - {model_id}",
+            'description': description,
+            'framework': framework,
+            'model_type': model_type,
+            'preserve_structure': 'true',
+            'training_dataset': dataset_id,
+            'training_accuracy': accuracy,
+        }
+        
+        headers = {"X-Task-ID": task_id} if task_id else None
+        r = requests.post(url, files=files, data=data, headers=headers, timeout=120)
+        r.raise_for_status()
+        return r.json()
+
+
 async def send_automl_complete_event(
     producer: AIOKafkaProducer,
     task_id: str,
@@ -358,16 +396,89 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer) -> Non
         logger.info("Simulating training process...")
         await asyncio.sleep(2)  # Simulate processing time
         
-        # Generate dummy model ID and version
+        # Generate model ID
         model_id = f"automl_{dataset_id}_{int(datetime.now(timezone.utc).timestamp())}"
-        model_version = "v1"  # Dummy version
         
-        logger.info(f"✅ Dummy AutoML training completed!")
-        logger.info(f"   Model ID: {model_id}")
-        logger.info(f"   Model Version: {model_version}")
-        logger.info(f"   Dataset: {dataset_id} (version {dataset_version})")
+        # Step 4: Upload model ZIP file to Data Warehouse
+        model_file_path = "automl_predictor.zip"
         
-        # Step 4: Send automl-complete event to Kafka
+        if not os.path.exists(model_file_path):
+            logger.error(f"Model file not found: {model_file_path}")
+            logger.error(f"   Please ensure {model_file_path} exists in the current directory")
+            # Send failure event
+            await send_automl_complete_event(
+                producer=producer,
+                task_id=task_id,
+                user_id=user_id,
+                model_id=model_id,
+                model_version="",
+                dataset_id=dataset_id,
+                dataset_version=dataset_version,
+                success=False,
+                error_message=f"Model file not found: {model_file_path}"
+            )
+            return
+        
+        try:
+            logger.info(f"Uploading model to Data Warehouse: {model_file_path}")
+            logger.info(f"   Model ID: {model_id}")
+            logger.info(f"   Dataset: {dataset_id} (version {dataset_version})")
+            
+            upload_result = upload_model_to_dw(
+                user_id=user_id,
+                model_id=model_id,
+                dataset_id=dataset_id,
+                zip_file_path=model_file_path,
+                model_type=task_type,
+                framework="sklearn",
+                accuracy=0.92,  # Dummy accuracy for testing
+                dataset_version=dataset_version,
+                task_id=task_id
+            )
+            
+            # Extract model version from upload result
+            model_version = upload_result.get("version", "v1")
+            
+            logger.info(f"✅ Model uploaded to Data Warehouse successfully!")
+            logger.info(f"   Model ID: {model_id}")
+            logger.info(f"   Model Version: {model_version}")
+            logger.info(f"   Response: {json.dumps(upload_result, indent=2, default=str)}")
+            
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Failed to upload model to Data Warehouse: {e}")
+            if e.response is not None:
+                logger.error(f"   Response status: {e.response.status_code}")
+                logger.error(f"   Response body: {e.response.text[:500]}")
+            # Send failure event
+            await send_automl_complete_event(
+                producer=producer,
+                task_id=task_id,
+                user_id=user_id,
+                model_id=model_id,
+                model_version="",
+                dataset_id=dataset_id,
+                dataset_version=dataset_version,
+                success=False,
+                error_message=f"Failed to upload model: {e}"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Failed to upload model to Data Warehouse: {e}", exc_info=True)
+            # Send failure event
+            await send_automl_complete_event(
+                producer=producer,
+                task_id=task_id,
+                user_id=user_id,
+                model_id=model_id,
+                model_version="",
+                dataset_id=dataset_id,
+                dataset_version=dataset_version,
+                success=False,
+                error_message=f"Failed to upload model: {e}"
+            )
+            return
+        
+        # Step 5: Send automl-complete event to Kafka
         try:
             await send_automl_complete_event(
                 producer=producer,
@@ -413,7 +524,17 @@ async def run_consumer() -> None:
     logger.info(f"Data Warehouse API: {API_BASE} (host: {DW_HOST}, port: {DW_PORT})")
     logger.info(f"Output topic: {KAFKA_AUTOML_COMPLETE_TOPIC}")
     logger.info("Waiting for AutoML trigger events from Agentic Core...")
-    logger.info("Note: This is a DUMMY consumer - no actual AutoML service is called")
+    logger.info("Note: This consumer uploads automl_predictor.zip to the Data Warehouse")
+    
+    # Check if model file exists
+    model_file_path = "automl_predictor.zip"
+    if os.path.exists(model_file_path):
+        file_size = os.path.getsize(model_file_path)
+        logger.info(f"✅ Model file found: {model_file_path} ({file_size} bytes)")
+    else:
+        logger.warning(f"⚠️  Model file not found: {model_file_path}")
+        logger.warning("   The consumer will fail if a trigger event is received")
+        logger.warning("   Please ensure automl_predictor.zip exists in the current directory")
 
     await consumer.start()
     await producer.start()

@@ -57,7 +57,9 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      # PLAINTEXT is for internal Docker communication (kafka:29092)
+      # PLAINTEXT_HOST is for external access - must use external IP, not localhost
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://160.40.52.44:9092
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -175,7 +177,7 @@ services:
       - ./app:/app/app:ro
       - ./kafka_bias_detector_consumer_example.py:/app/kafka_bias_detector_consumer_example.py:ro
 
-  # AutoML Consumer Service (with parallel processing support)
+  # AutoML Consumer Service (dummy - produces automl-complete events without calling AutoML service)
   automl-consumer:
     build: .
     env_file:
@@ -185,16 +187,11 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_AUTOML_TRIGGER_TOPIC: automl-trigger-events
+      KAFKA_AUTOML_COMPLETE_TOPIC: automl-complete-events
       KAFKA_CONSUMER_GROUP: automl-consumer
       API_BASE: http://api:8000
       DW_HOST: api
       DW_PORT: 8000
-      # Note: TABULAR_AUTOML_HOST should point to where the AutoML tabular service is running
-      # If running outside Docker on the host machine, use host.docker.internal (Windows/Mac) or host IP
-      # If running in Docker, use the service name (e.g., 'tabular' if added to docker-compose)
-      # Default to host.docker.internal to access services on the host machine
-      TABULAR_AUTOML_HOST: host.docker.internal
-      TABULAR_AUTOML_PORT: 8001
     depends_on:
       api:
         condition: service_started
@@ -203,10 +200,12 @@ services:
     networks:
       - data-warehouse-network
     command: >
-      sh -c "sleep 20 && python kafka_automl_consumer_example_v3.py"
+      sh -c "sleep 20 && python kafka_automl_consumer_example.py"
     volumes:
       - ./app:/app/app:ro
-      - ./kafka_automl_consumer_example_v3.py:/app/kafka_automl_consumer_example_v3.py:ro
+      - ./kafka_automl_consumer_example.py:/app/kafka_automl_consumer_example.py:ro
+      # Mount automl_predictor.zip if it exists (optional - will warn if missing)
+      - ./automl_predictor.zip:/app/automl_predictor.zip:ro
 
 volumes:
   mongodb_data:
