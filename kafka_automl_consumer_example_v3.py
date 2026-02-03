@@ -208,7 +208,7 @@ async def process_automl_trigger(event: dict) -> None:
         "user_id": "user123",
         "target_column_name": "target",
         "task_type": "classification",
-        "time_budget": "10",
+        "time_budget": "10",  # seconds (e.g. 10 = 10s training time)
         "timestamp": "2025-10-10T12:00:00.000000"
     }
     """
@@ -276,10 +276,10 @@ async def process_automl_trigger(event: dict) -> None:
         
         # Step 2: Call AutoML service with all necessary information
         if task_category == "tabular":
-            # Convert time_budget from string to int (already in seconds, no conversion needed)
+            # time_budget from Kafka is in seconds (e.g. default 10 = 10 seconds training time)
             # The endpoint expects time_budget in seconds as an integer
             try:
-                time_budget_seconds = int(time_budget)  # Use directly as seconds
+                time_budget_seconds = int(time_budget)
             except (ValueError, TypeError):
                 logger.warning(f"Invalid time_budget '{time_budget}', using default 10 seconds")
                 time_budget_seconds = 10
@@ -312,9 +312,9 @@ async def process_automl_trigger(event: dict) -> None:
             
             try:
                 # Calculate timeout: training time + buffer for download/upload/processing
-                # Add 300 seconds buffer for dataset download, model upload, and processing overhead
+                # Add 5 minutes (300 seconds) buffer for dataset download, model upload, and processing overhead
                 request_timeout = time_budget_seconds + 300
-                logger.info(f"Setting request timeout to {request_timeout} seconds to accommodate {time_budget_seconds} seconds of training")
+                logger.info(f"Setting request timeout to {request_timeout} seconds to accommodate {time_budget_seconds}s of training")
                 r = requests.post(AUTOML_TABULAR_URL, data=data, headers=headers, timeout=request_timeout)
                 r.raise_for_status()
             except requests.exceptions.ConnectionError as e:
