@@ -471,6 +471,18 @@ python kafka_agentic_core_consumer_example.py
 
 ---
 
+## 📦 Data persistence and migrating to a new machine
+
+On a **new machine**, Docker creates **new empty volumes** for MongoDB, MinIO, and **GraphDB**. So existing GraphDB repositories and data do not move with the project.
+
+To **transfer or migrate GraphDB data** when building the app on a new machine, see:
+
+- **[GRAPHDB_MIGRATION.md](GRAPHDB_MIGRATION.md)** – Backup/restore the GraphDB volume, use a bind mount so data lives in a folder you can copy, or export/import via GraphDB.
+
+Quick approach: on the source machine run `./scripts/backup-graphdb.sh`, copy the generated `.tar.gz` to the new machine, then run `./scripts/restore-graphdb.sh graphdb_backup_YYYYMMDD.tar.gz` there (after starting the stack once and stopping GraphDB).
+
+---
+
 ## 💡 Summary
 
 **Your Current Setup (Working):**

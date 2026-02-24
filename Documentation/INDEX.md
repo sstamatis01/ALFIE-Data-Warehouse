@@ -8,7 +8,8 @@ Welcome to the Data Warehouse documentation! This index will help you find the r
 
 ### 🚀 Getting Started
 - **[README.md](../README.md)** - Main project README (in root directory)
-- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Complete implementation overview
+- **[AUTODW_OVERVIEW.md](AUTODW_OVERVIEW.md)** - **Technical overview of AutoDW** (stack, API, Kafka, services – concise and up to date)
+- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Kafka orchestration implementation summary
 
 ### 🏗️ Architecture & Orchestration
 - **[KAFKA_ORCHESTRATION_COMPLETE.md](KAFKA_ORCHESTRATION_COMPLETE.md)** - Complete Kafka architecture and flow
@@ -51,7 +52,7 @@ Welcome to the Data Warehouse documentation! This index will help you find the r
 
 ### For New Developers
 1. Start with [README.md](../README.md)
-2. Read [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
+2. Read [AUTODW_OVERVIEW.md](AUTODW_OVERVIEW.md) for a concise technical overview
 3. Review [KAFKA_ORCHESTRATION_COMPLETE.md](KAFKA_ORCHESTRATION_COMPLETE.md)
 4. Follow [TEST_COMPLETE_FLOW.md](TEST_COMPLETE_FLOW.md)
 
@@ -86,7 +87,8 @@ data-warehouse-app/
 ├── README.md                          # Main project README
 ├── Documentation/                     # All documentation (you are here!)
 │   ├── INDEX.md                      # This file
-│   ├── IMPLEMENTATION_SUMMARY.md     # Implementation overview
+│   ├── AUTODW_OVERVIEW.md            # Technical overview (stack, API, Kafka, services)
+│   ├── IMPLEMENTATION_SUMMARY.md     # Kafka orchestration summary
 │   ├── KAFKA_ORCHESTRATION_COMPLETE.md
 │   ├── KAFKA_QUICK_REFERENCE.md
 │   ├── API_CHANGES_USER_ID_AND_VERSIONING.md
@@ -141,7 +143,7 @@ data-warehouse-app/
 
 ## 💡 Tips
 
-- **New to the project?** Start with [README.md](../README.md) and [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
+- **New to the project?** Start with [README.md](../README.md) and [AUTODW_OVERVIEW.md](AUTODW_OVERVIEW.md)
 - **Need quick reference?** Use [KAFKA_QUICK_REFERENCE.md](KAFKA_QUICK_REFERENCE.md)
 - **Integrating as partner?** Go to [SHARING_WITH_PARTNERS_README.md](SHARING_WITH_PARTNERS_README.md)
 - **Testing?** Follow [TEST_COMPLETE_FLOW.md](TEST_COMPLETE_FLOW.md)
@@ -170,5 +172,5 @@ When adding new documentation:
 
 ---
 
-Last updated: October 10, 2025
+Last updated: February 2026
 
