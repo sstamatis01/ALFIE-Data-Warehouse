@@ -19,6 +19,8 @@ from .services.etd_hub_service import etd_hub_service
 from .api import etd_hub, etd_hub_import
 from .services.graphdb_service import graphdb_service
 from .api import graphdb
+from .api import user_files
+from .services.user_file_service import user_file_service
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +46,7 @@ async def lifespan(app: FastAPI):
         await xai_report_service.initialize()
         await etd_hub_service.initialize()
         await graphdb_service.initialize()
+        await user_file_service.initialize()
         
         # Initialize Kafka (non-fatal)
         try:
@@ -125,6 +128,7 @@ app.include_router(xai_reports.router)
 app.include_router(etd_hub.router)
 app.include_router(etd_hub_import.router)
 app.include_router(graphdb.router)
+app.include_router(user_files.router)
 
 
 @app.get("/")

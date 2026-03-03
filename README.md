@@ -1,16 +1,21 @@
-# Data Warehouse API
+# Data Warehouse API (AutoDW)
 
-A comprehensive Python-based Data Warehouse application for storing and managing both structured (CSV, XLS, tabular) and unstructured data (images, videos, audio files, AI models) with automatic metadata extraction and user-based organization.
+A comprehensive Python-based Data Warehouse application for storing and managing both structured (CSV, XLS, tabular) and unstructured data (images, videos, audio files, AI models) with automatic metadata extraction, user-based organization, and event-driven ML pipelines.
+
+**For a full summary of capabilities**, see **[Documentation/CAPABILITIES_OVERVIEW.md](Documentation/CAPABILITIES_OVERVIEW.md)**.
 
 ## Features
 
 - **Multi-format File Support**: CSV, Excel, JSON, images, videos, audio files, and AI model weights
 - **User Separation**: Organized file storage with user-based directories
-- **Versioning**: Simple versioning system (v1, v2, etc.)
+- **Versioning**: Simple versioning system (v1, v2, etc.); automatic **70-15-15 train/test/drift split** for suitable tabular datasets (for concept drift)
 - **Automatic Metadata Extraction**: Extracts relevant metadata from uploaded files
 - **MongoDB Integration**: Stores metadata with efficient indexing
 - **MinIO Integration**: Scalable file storage with S3-compatible API
 - **RESTful API**: FastAPI-based REST endpoints
+- **User-files API**: Upload/list/download/delete files for chatbot attachments (text, PDF, DOC, etc.)
+- **GraphDB**: SPARQL endpoint configs and query API; optional **init from backup** via `graphdb_init/`
+- **Kafka orchestration**: Dataset → Bias → AutoML → XAI → Concept drift (event-driven pipeline)
 - **Docker Support**: Easy deployment with Docker Compose
 
 ## Architecture
@@ -18,10 +23,17 @@ A comprehensive Python-based Data Warehouse application for storing and managing
 ```
 ├── FastAPI Application (Python)
 ├── MongoDB (Metadata Storage)
-└── MinIO (File Storage)
+├── MinIO (File Storage)
+└── Kafka (ML pipeline events; optional GraphDB)
 ```
 
 ### File Organization Structure
+```
+datasets/          → user datasets (v1 = original, v2 = train/test/drift when split)
+models/            → AI model files
+xai_reports/       → XAI HTML reports
+user-files/        → user-uploaded files (chatbot attachments): user-files/{user_id}/{file_id}/
+```
 ```
 datasets/
 ├── user1/
@@ -29,7 +41,9 @@ datasets/
 │   │   ├── v1/
 │   │   │   └── heart_rate.csv
 │   │   └── v2/
-│   │       └── heart_rate_updated.csv
+│   │       ├── train/
+│   │       ├── test/
+│   │       └── drift/
 │   └── another_dataset/
 │       └── v1/
 │           └── data.xlsx
@@ -111,6 +125,8 @@ python -m app.main
 - **Alternative Docs**: http://localhost:8000/redoc
 - **MinIO Console**: http://localhost:9001 (minioadmin/minioadmin)
 
+**More:** Full capability overview and API details: [Documentation/CAPABILITIES_OVERVIEW.md](Documentation/CAPABILITIES_OVERVIEW.md) and [Documentation/INDEX.md](Documentation/INDEX.md). GraphDB init from backup: [graphdb_init/README.md](graphdb_init/README.md).
+
 ## API Endpoints
 
 ### Dataset Management
@@ -160,12 +176,22 @@ DELETE /datasets/{user_id}/{dataset_id}
 #### Download Dataset
 ```http
 GET /datasets/{user_id}/{dataset_id}/download
+# With split (when dataset has train/test/drift): ?split=train|test|drift
 ```
 
 #### Search Datasets
 ```http
 GET /datasets/search/{user_id}?query=heart&tags=medical&file_type=csv
 ```
+
+### User-files (chatbot attachments)
+- `POST /user-files/upload/{user_id}` – Upload file (multipart: file, optional name, description, project_id)
+- `GET /user-files/{user_id}` – List files (query: project_id, skip, limit)
+- `GET /user-files/{user_id}/{file_id}` – Get metadata
+- `GET /user-files/{user_id}/{file_id}/download` – Download file
+- `DELETE /user-files/{user_id}/{file_id}` – Delete file  
+
+See [Documentation/USER_FILES_README.md](Documentation/USER_FILES_README.md).
 
 ### User Management
 

@@ -88,8 +88,8 @@ class MetadataService:
             return None
             
         except Exception as e:
-            logger.error(f"Error retrieving dataset {dataset_id} version {version}: {e}")
-            raise HTTPException(status_code=500, detail="Failed to retrieve dataset")
+            logger.error(f"Error retrieving dataset {dataset_id} version {version}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to retrieve dataset: {str(e)}")
 
     async def get_latest_dataset(self, dataset_id: str, user_id: str) -> Optional[DatasetMetadata]:
         """Get the latest version of a dataset for a user by created_at desc"""

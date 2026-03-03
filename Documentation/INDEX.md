@@ -8,7 +8,8 @@ Welcome to the Data Warehouse documentation! This index will help you find the r
 
 ### 🚀 Getting Started
 - **[README.md](../README.md)** - Main project README (in root directory)
-- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Complete implementation overview
+- **[CAPABILITIES_OVERVIEW.md](CAPABILITIES_OVERVIEW.md)** - **Summary of all AutoDW capabilities** (recommended entry point)
+- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Kafka orchestration implementation overview
 
 ### 🏗️ Architecture & Orchestration
 - **[KAFKA_ORCHESTRATION_COMPLETE.md](KAFKA_ORCHESTRATION_COMPLETE.md)** - Complete Kafka architecture and flow
@@ -21,15 +22,18 @@ Welcome to the Data Warehouse documentation! This index will help you find the r
 - **[API_CHANGES_USER_ID_AND_VERSIONING.md](API_CHANGES_USER_ID_AND_VERSIONING.md)** - API changes and auto-versioning
 - **[AI_MODELS_README.md](AI_MODELS_README.md)** - AI Models API documentation
 - **[XAI_REPORTS_README.md](XAI_REPORTS_README.md)** - XAI Reports API documentation
+- **[USER_FILES_README.md](USER_FILES_README.md)** - **User-files API** (chatbot attachments: upload, list, download, delete)
 - **[DATASET_FOLDER_UPLOAD.md](DATASET_FOLDER_UPLOAD.md)** - Dataset folder upload guide
 - **[DATASET_DOWNLOAD_DELETE.md](DATASET_DOWNLOAD_DELETE.md)** - Download and delete operations
 - **[DATASET_FOLDER_COMPLETE.md](DATASET_FOLDER_COMPLETE.md)** - Complete folder implementation
+- **[GRAPHDB_README.md](GRAPHDB_README.md)** - GraphDB SPARQL configs & query API; **init from backup** (see also [graphdb_init/README.md](../graphdb_init/README.md))
 
 ### 🧪 Testing Guides
 - **[TEST_COMPLETE_FLOW.md](TEST_COMPLETE_FLOW.md)** - Complete end-to-end testing guide
 - **[TEST_NEW_API_ENDPOINTS.md](TEST_NEW_API_ENDPOINTS.md)** - Testing new API endpoints
 - **[END_TO_END_TESTING_UPDATE.md](END_TO_END_TESTING_UPDATE.md)** - End-to-end testing updates
 - **[AUTOML_CONSUMER_V2.md](AUTOML_CONSUMER_V2.md)** - AutoML consumer V2 with real model folder
+- **[CONCEPT_DRIFT_KAFKA.md](CONCEPT_DRIFT_KAFKA.md)** - Concept drift events & **automatic 70-15-15 train/test/drift split**
 
 ### 🤝 Partner Integration
 - **[SHARING_WITH_PARTNERS_README.md](SHARING_WITH_PARTNERS_README.md)** - Guide for sharing with partners
@@ -51,15 +55,17 @@ Welcome to the Data Warehouse documentation! This index will help you find the r
 
 ### For New Developers
 1. Start with [README.md](../README.md)
-2. Read [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
-3. Review [KAFKA_ORCHESTRATION_COMPLETE.md](KAFKA_ORCHESTRATION_COMPLETE.md)
-4. Follow [TEST_COMPLETE_FLOW.md](TEST_COMPLETE_FLOW.md)
+2. Read **[CAPABILITIES_OVERVIEW.md](CAPABILITIES_OVERVIEW.md)** for a full capability summary
+3. Read [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
+4. Review [KAFKA_ORCHESTRATION_COMPLETE.md](KAFKA_ORCHESTRATION_COMPLETE.md)
+5. Follow [TEST_COMPLETE_FLOW.md](TEST_COMPLETE_FLOW.md)
 
 ### For API Users
 1. [API_CHANGES_USER_ID_AND_VERSIONING.md](API_CHANGES_USER_ID_AND_VERSIONING.md)
 2. [AI_MODELS_README.md](AI_MODELS_README.md)
 3. [XAI_REPORTS_README.md](XAI_REPORTS_README.md)
-4. [TEST_NEW_API_ENDPOINTS.md](TEST_NEW_API_ENDPOINTS.md)
+4. [USER_FILES_README.md](USER_FILES_README.md) - User-files (chatbot attachments)
+5. [TEST_NEW_API_ENDPOINTS.md](TEST_NEW_API_ENDPOINTS.md)
 
 ### For Partners Integrating
 1. [SHARING_WITH_PARTNERS_README.md](SHARING_WITH_PARTNERS_README.md) - Start here!
@@ -86,7 +92,11 @@ data-warehouse-app/
 ├── README.md                          # Main project README
 ├── Documentation/                     # All documentation (you are here!)
 │   ├── INDEX.md                      # This file
-│   ├── IMPLEMENTATION_SUMMARY.md     # Implementation overview
+│   ├── IMPLEMENTATION_SUMMARY.md     # Kafka implementation overview
+│   ├── CAPABILITIES_OVERVIEW.md      # Summary of all AutoDW capabilities
+│   ├── USER_FILES_README.md          # User-files API (chatbot attachments)
+│   ├── GRAPHDB_README.md            # GraphDB + init from backup
+│   ├── CONCEPT_DRIFT_KAFKA.md       # Concept drift & 70-15-15 split
 │   ├── KAFKA_ORCHESTRATION_COMPLETE.md
 │   ├── KAFKA_QUICK_REFERENCE.md
 │   ├── API_CHANGES_USER_ID_AND_VERSIONING.md
@@ -113,12 +123,15 @@ data-warehouse-app/
 ### Kafka & Event-Driven Architecture
 - [KAFKA_ORCHESTRATION_COMPLETE.md](KAFKA_ORCHESTRATION_COMPLETE.md) - Complete guide
 - [KAFKA_QUICK_REFERENCE.md](KAFKA_QUICK_REFERENCE.md) - Quick reference
+- [CONCEPT_DRIFT_KAFKA.md](CONCEPT_DRIFT_KAFKA.md) - Concept drift & 70-15-15 split
 - [KAFKA_AUTOML_IMPLEMENTATION.md](KAFKA_AUTOML_IMPLEMENTATION.md) - Historical
 
 ### API Endpoints
 - [API_CHANGES_USER_ID_AND_VERSIONING.md](API_CHANGES_USER_ID_AND_VERSIONING.md) - API changes
 - [AI_MODELS_README.md](AI_MODELS_README.md) - AI models
 - [XAI_REPORTS_README.md](XAI_REPORTS_README.md) - XAI reports
+- [USER_FILES_README.md](USER_FILES_README.md) - User-files (chatbot attachments)
+- [GRAPHDB_README.md](GRAPHDB_README.md) - GraphDB configs & SPARQL
 
 ### Docker & Deployment
 - [DOCKER_DEPLOYMENT_GUIDE.md](DOCKER_DEPLOYMENT_GUIDE.md) - Complete deployment guide
@@ -141,10 +154,12 @@ data-warehouse-app/
 
 ## 💡 Tips
 
-- **New to the project?** Start with [README.md](../README.md) and [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
+- **New to the project?** Start with [README.md](../README.md) and **[CAPABILITIES_OVERVIEW.md](CAPABILITIES_OVERVIEW.md)**
 - **Need quick reference?** Use [KAFKA_QUICK_REFERENCE.md](KAFKA_QUICK_REFERENCE.md)
 - **Integrating as partner?** Go to [SHARING_WITH_PARTNERS_README.md](SHARING_WITH_PARTNERS_README.md)
 - **Testing?** Follow [TEST_COMPLETE_FLOW.md](TEST_COMPLETE_FLOW.md)
+- **User-files (chatbot)?** See [USER_FILES_README.md](USER_FILES_README.md)
+- **GraphDB init from backup?** See [GRAPHDB_README.md](GRAPHDB_README.md) and [graphdb_init/README.md](../graphdb_init/README.md)
 
 ---
 
@@ -170,5 +185,5 @@ When adding new documentation:
 
 ---
 
-Last updated: October 10, 2025
+Last updated: February 2025
 

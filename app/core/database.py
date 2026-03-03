@@ -87,6 +87,12 @@ async def create_indexes():
         await transform_collection.create_index([("user_id", 1), ("dataset_id", 1), ("version", 1)], unique=True)
         await transform_collection.create_index("created_at")
 
+        # User files collection indexes (chatbot attachments)
+        user_files_collection = mongodb.database.user_files
+        await user_files_collection.create_index([("user_id", 1), ("file_id", 1)], unique=True)
+        await user_files_collection.create_index([("user_id", 1), ("project_id", 1)])
+        await user_files_collection.create_index("created_at")
+
         logger.info("Database indexes created successfully")
         
     except Exception as e:

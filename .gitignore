@@ -1,3 +1,14 @@
+# Concept drift consumer debug dumps (upload folder / full temp)
+concept_drift_upload_debug/
+
+# AutoGluon / saved models (local artifacts; do not commit)
+autogluon_models/
+
+# Concept drift / AutoML generated data (local; do not commit)
+drift_log.csv
+metrics_summary.csv
+train.csv
+
 # Python
 __pycache__/
 *.py[cod]
@@ -35,6 +46,7 @@ venv.bak/
 # IDE
 .vscode/
 .idea/
+.vs/
 *.swp
 *.swo
 *~
@@ -63,9 +75,9 @@ logs/
 *.tmp
 *.temp
 
-# Local artifacts / large binaries
-*.pkl
-*.zip
+# GraphDB init backup (large export; keep out of git)
+graphdb_init/*.tar.gz
+graphdb_backup*.tar.gz
 
 # Backup files
 *.bak

@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-Kafka Consumer Example for AutoML Trigger Events
+Kafka Consumer Example for AutoML Trigger Events (Tabular + Vision)
 
 This consumer listens to the automl-trigger-events topic (from Agentic Core).
-When an AutoML trigger event is received, this consumer should:
-- Load the dataset
-- Identify the ML problem (classification, regression, etc.)
-- Train an AI model using AutoML
-- Save the model to the Data Warehouse (which triggers automl-events)
+Event field task_category selects the pipeline:
+- task_category "tabular" -> calls AutoML Tabular (best_model)
+- task_category "vision"  -> calls AutoML Vision (best_model)
+
+When an AutoML trigger event is received, the consumer:
+- Fetches dataset metadata and validates download
+- Calls the appropriate AutoML service (tabular or vision)
+- The AutoML service trains and uploads the model to the Data Warehouse (triggers automl-events)
 
 Usage:
-  # Default configuration (runs outside Docker, connects to Docker services via localhost)
+  # Default (localhost; Tabular 8001, Vision 8002)
   KAFKA_BOOTSTRAP_SERVERS=localhost:9092 python kafka_automl_consumer_example_v3.py
 
-  # Optional: Override defaults
-  API_BASE=http://localhost:8000 TABULAR_AUTOML_HOST=localhost TABULAR_AUTOML_PORT=8001 python kafka_automl_consumer_example_v3.py
+  # Override endpoints
+  API_BASE=http://localhost:8000 TABULAR_AUTOML_HOST=localhost TABULAR_AUTOML_PORT=8001 \\
+  VISION_AUTOML_HOST=localhost VISION_AUTOML_PORT=8002 python kafka_automl_consumer_example_v3.py
 
-  Note: This consumer runs OUTSIDE Docker and connects to Docker services via localhost.
-        The Docker services (tabular, data-warehouse-api) expose ports to the host.
+  Note: Runs OUTSIDE Docker; connect to Docker services via localhost.
 """
 
 import os
@@ -57,14 +60,22 @@ else:
 # Can be overridden with TABULAR_AUTOML_HOST environment variable
 TABULAR_AUTOML_HOST = os.getenv("TABULAR_AUTOML_HOST", "localhost")
 TABULAR_AUTOML_PORT = os.getenv("TABULAR_AUTOML_PORT", "8001")
-MAIN_AUTOML_URL = f"http://{TABULAR_AUTOML_HOST}:{TABULAR_AUTOML_PORT}"
-AUTOML_TABULAR_URL = f"{MAIN_AUTOML_URL}/automl_tabular/best_model"
+TABULAR_AUTOML_URL = f"http://{TABULAR_AUTOML_HOST}:{TABULAR_AUTOML_PORT}"
+AUTOML_TABULAR_BEST_MODEL_URL = f"{TABULAR_AUTOML_URL}/automl_tabular/best_model"
 
-# Log configuration at module load
+# AutoML Vision configuration (runs on 8002; tabular on 8001)
+VISION_AUTOML_HOST = os.getenv("VISION_AUTOML_HOST", "localhost")
+VISION_AUTOML_PORT = os.getenv("VISION_AUTOML_PORT", "8002")
+VISION_AUTOML_URL = f"http://{VISION_AUTOML_HOST}:{VISION_AUTOML_PORT}"
+AUTOML_VISION_BEST_MODEL_URL = f"{VISION_AUTOML_URL}/automl_vision/best_model/"
+
+# Log configuration at module load (so we see which host/port are used, e.g. host.docker.internal when in Docker)
 logger.info(f"Configuration:")
 logger.info(f"  Data Warehouse API: {API_BASE} (host: {DW_HOST}, port: {DW_PORT})")
-logger.info(f"  AutoML Tabular: {AUTOML_TABULAR_URL} (host: {TABULAR_AUTOML_HOST}, port: {TABULAR_AUTOML_PORT})")
-logger.info(f"  Note: Running outside Docker - using localhost to connect to Docker services")
+logger.info(f"  AutoML Tabular: {AUTOML_TABULAR_BEST_MODEL_URL}")
+logger.info(f"  AutoML Vision: {AUTOML_VISION_BEST_MODEL_URL}")
+if VISION_AUTOML_HOST == "localhost" and os.getenv("KAFKA_BOOTSTRAP_SERVERS", "").find("kafka") >= 0:
+    logger.warning("  When running in Docker, set VISION_AUTOML_HOST=host.docker.internal so the container can reach Vision on the host")
 
 
 def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -> dict:
@@ -109,12 +120,14 @@ def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
         raise
 
 
-def download_dataset_file(user_id: str, dataset_id: str, version: str = None) -> bytes:
-    """Download dataset file (single file or folder as ZIP) - specific version or latest"""
+def download_dataset_file(user_id: str, dataset_id: str, version: str = None, split: str = None) -> bytes:
+    """Download dataset file (single file or folder as ZIP). If split is 'train', 'test', or 'drift', download only that subset (for split datasets)."""
     if version:
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}/download"
     else:
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
+    if split and split in ("train", "test", "drift"):
+        url += f"?split={split}"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
@@ -195,9 +208,13 @@ async def process_automl_trigger(event: dict) -> None:
             "dataset_id": "...",
             "dataset_version": "v1",
             "user_id": "...",
-            "target_column_name": "target",
-            "task_type": "classification",
-            "task_category": "tabular"
+            "task_category": "tabular" | "vision",
+            "task_type": "classification" | "regression" | ...,
+            "target_column_name": "target",        // tabular
+            "filename_column": "filename",         // vision (optional)
+            "label_column": "label",               // vision (optional)
+            "model_size": "small",                 // vision (optional: small/medium/large)
+            "time_budget": "10"                    // minutes (both)
         }
     }
     
@@ -225,12 +242,20 @@ async def process_automl_trigger(event: dict) -> None:
         target_column = input_obj.get("target_column_name")
         task_type = input_obj.get("task_type")
         time_budget = input_obj.get("time_budget", event.get("time_budget", "10"))  # Check both places
-        task_category = input_obj.get("task_category", "tabular")
+        task_category = (input_obj.get("task_category") or "tabular").strip().lower()
+        filename_column = input_obj.get("filename_column", "filename")
+        label_column = input_obj.get("label_column", "label")
+        model_size = input_obj.get("model_size", "small")
         
         if not user_id or not dataset_id:
             logger.warning("Missing user_id or dataset_id in event; skipping")
             return
-        
+
+        if task_category == "tabular" and (not target_column or not task_type):
+            logger.warning("Tabular task requires target_column_name and task_type in event; skipping")
+            return
+        # Vision defaults filename_column, label_column, task_type, model_size so no strict check needed
+
         logger.info(f"Processing AutoML trigger for dataset {dataset_id} version {dataset_version}")
         logger.info(f"  Task ID: {task_id}")
         logger.info(f"  User: {user_id}")
@@ -245,17 +270,21 @@ async def process_automl_trigger(event: dict) -> None:
             metadata = fetch_dataset_metadata(user_id, dataset_id, dataset_version)
             logger.info(f"Dataset metadata fetched successfully")
             
-            # Check if dataset is a folder or single file
+            # Check if dataset is a folder or single file, and if it has train/test/drift split
             is_folder = metadata.get("is_folder", False)
             file_count = metadata.get("file_count", 1)
+            has_split = bool(metadata.get("custom_metadata", {}).get("split"))
+            # For split tabular datasets, download only the train split so we get a single CSV for validation
+            download_split = "train" if (has_split and task_category == "tabular") else None
+            if download_split:
+                logger.info(f"Dataset has train/test/drift split; downloading '{download_split}' split for tabular AutoML")
             
             logger.info(f"Dataset type: {'FOLDER' if is_folder else 'SINGLE FILE'}")
             if is_folder:
                 logger.info(f"File count: {file_count}")
             
-            # Download dataset file (AutoML service may do this too, but we validate it exists)
             logger.info(f"Downloading dataset file from: {API_BASE}")
-            file_bytes = download_dataset_file(user_id, dataset_id, dataset_version)
+            file_bytes = download_dataset_file(user_id, dataset_id, dataset_version, split=download_split)
             logger.info(f"Dataset downloaded: {len(file_bytes)} bytes")
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout while fetching dataset from {API_BASE}")
@@ -293,16 +322,20 @@ async def process_automl_trigger(event: dict) -> None:
                 "task_type": task_type,
                 "time_budget": time_budget_seconds  # Send as integer in seconds
             }
+            # Tell the AutoML tabular service to request the train split when downloading from DW (split datasets)
+            if has_split:
+                data["dataset_split"] = "train"
+                logger.info("  Passing dataset_split=train so AutoML service uses train split from DW")
             
             # Include task_id in headers if available (for tracking)
             headers = {"X-Task-ID": task_id} if task_id else None
             
-            logger.info(f"Calling AutoML service: {AUTOML_TABULAR_URL}")
+            logger.info(f"Calling AutoML Tabular: {AUTOML_TABULAR_BEST_MODEL_URL}")
             logger.info(f"   Using host: {TABULAR_AUTOML_HOST}, port: {TABULAR_AUTOML_PORT}")
             
             # Try to verify the service is reachable first
             try:
-                health_check_url = f"http://{TABULAR_AUTOML_HOST}:{TABULAR_AUTOML_PORT}/docs"  # FastAPI docs endpoint
+                health_check_url = f"{TABULAR_AUTOML_URL}/docs"  # FastAPI docs endpoint
                 logger.debug(f"Checking if service is reachable at {health_check_url}")
                 health_check = requests.get(health_check_url, timeout=5)
                 logger.debug(f"Service health check: {health_check.status_code}")
@@ -311,10 +344,14 @@ async def process_automl_trigger(event: dict) -> None:
                 logger.warning(f"   This might indicate the service is not running or not accessible")
             
             try:
-                r = requests.post(AUTOML_TABULAR_URL, data=data, headers=headers, timeout=120)
+                # Calculate timeout: training time + buffer for download/upload/processing
+                # Add 5 minutes (300 seconds) buffer for dataset download, model upload, and processing overhead
+                request_timeout = time_budget_seconds + 300
+                logger.info(f"Setting request timeout to {request_timeout} seconds ({request_timeout // 60} minutes) to accommodate {time_budget_seconds // 60} minutes of training")
+                r = requests.post(AUTOML_TABULAR_BEST_MODEL_URL, data=data, headers=headers, timeout=request_timeout)
                 r.raise_for_status()
             except requests.exceptions.ConnectionError as e:
-                logger.error(f"Failed to connect to AutoML service at {AUTOML_TABULAR_URL}")
+                logger.error(f"Failed to connect to AutoML Tabular at {AUTOML_TABULAR_BEST_MODEL_URL}")
                 logger.error(f"   Error: {e}")
                 logger.error(f"   Ensure the tabular Docker service is running and accessible on {TABULAR_AUTOML_HOST}:{TABULAR_AUTOML_PORT}")
                 logger.error(f"   Check: docker ps | grep tabular")
@@ -333,6 +370,11 @@ async def process_automl_trigger(event: dict) -> None:
                             logger.error(f"   Response body: {e.response.text[:500]}")
                 logger.error(f"   If running in Docker, ensure TABULAR_AUTOML_HOST=tabular is set")
                 raise
+            except requests.exceptions.Timeout as e:
+                logger.error(f"Request to AutoML service timed out after {request_timeout} seconds")
+                logger.error(f"   Training may have taken longer than expected")
+                logger.error(f"   Consider increasing time_budget or checking service logs")
+                raise
             
             response_data = r.json() if r.content else {}
             logger.info("✅ AutoML processing completed and models uploaded to Data Warehouse")
@@ -340,6 +382,65 @@ async def process_automl_trigger(event: dict) -> None:
             
             # Note: The AutoML service should handle model upload to DW with task_id
             # which will automatically trigger automl-events
+        elif task_category == "vision":
+            # Vision AutoML: time_budget in seconds (vision API expects seconds)
+            try:
+                time_budget_seconds = int(time_budget) * 60  # event in minutes -> seconds
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid time_budget '{time_budget}', using default 10 minutes (600 seconds)")
+                time_budget_seconds = 600
+
+            data = {
+                "user_id": user_id,
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version or "v1",
+                "filename_column": filename_column,
+                "label_column": label_column,
+                "task_type": task_type or "classification",
+                "time_budget": time_budget_seconds,
+                "model_size": (model_size or "small").strip().lower(),
+            }
+            if has_split:
+                data["dataset_split"] = "train"
+                logger.info("  Passing dataset_split=train so Vision service uses train split from DW")
+            headers = {"X-Task-ID": task_id} if task_id else None
+
+            request_timeout = time_budget_seconds + 300
+            logger.info(f"Calling AutoML Vision: {AUTOML_VISION_BEST_MODEL_URL}")
+            logger.info(f"   filename_column={filename_column}, label_column={label_column}, model_size={model_size}")
+            logger.info(f"   time_budget={time_budget_seconds}s, request_timeout={request_timeout}s")
+
+            try:
+                r = requests.post(
+                    AUTOML_VISION_BEST_MODEL_URL,
+                    data=data,
+                    headers=headers,
+                    timeout=request_timeout,
+                )
+                r.raise_for_status()
+            except requests.exceptions.ConnectionError as e:
+                logger.error(f"Failed to connect to AutoML Vision at {AUTOML_VISION_BEST_MODEL_URL}: {e}")
+                logger.error(
+                    "  Ensure the AutoML Vision service is running on port 8002. "
+                    "Override with VISION_AUTOML_PORT if different. "
+                    "From Docker use VISION_AUTOML_HOST=host.docker.internal"
+                )
+                raise
+            except requests.exceptions.HTTPError as e:
+                logger.error(f"AutoML Vision HTTP error: {e}")
+                if e.response and e.response.content:
+                    try:
+                        logger.error(f"   Response: {e.response.json()}")
+                    except Exception:
+                        logger.error(f"   Response: {e.response.text[:500]}")
+                raise
+            except requests.exceptions.Timeout as e:
+                logger.error(f"AutoML Vision request timed out after {request_timeout}s")
+                raise
+
+            response_data = r.json() if r.content else {}
+            logger.info("✅ Vision AutoML completed; model uploaded to Data Warehouse")
+            logger.info(f"   Response: {json.dumps(response_data, indent=2, default=str)}")
         else:
             logger.error(f"Unsupported task category: {task_category}")
             return
@@ -365,7 +466,8 @@ async def run_consumer() -> None:
     logger.info(f"Topic: {KAFKA_AUTOML_TRIGGER_TOPIC}")
     logger.info(f"Consumer group: {KAFKA_CONSUMER_GROUP}")
     logger.info(f"Data Warehouse API: {API_BASE} (host: {DW_HOST}, port: {DW_PORT})")
-    logger.info(f"AutoML Tabular service: {AUTOML_TABULAR_URL} (host: {TABULAR_AUTOML_HOST}, port: {TABULAR_AUTOML_PORT})")
+    logger.info(f"AutoML Tabular: {AUTOML_TABULAR_BEST_MODEL_URL}")
+    logger.info(f"AutoML Vision: {AUTOML_VISION_BEST_MODEL_URL}")
     logger.info("Waiting for AutoML trigger events from Agentic Core...")
 
     await consumer.start()

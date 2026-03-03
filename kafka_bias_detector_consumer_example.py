@@ -50,15 +50,82 @@ def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -
     return r.json()
 
 
-def download_dataset_file(user_id: str, dataset_id: str, version: str = None) -> bytes:
-    """Download dataset file (specific version or latest)"""
+def download_dataset_file(user_id: str, dataset_id: str, version: str = None, split: str = None) -> bytes:
+    """Download dataset file (specific version or latest). If split is 'train', 'test', or 'drift', download only that subset (for split datasets)."""
     if version:
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}/download"
     else:
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
+    if split and split in ("train", "test", "drift"):
+        url += f"?split={split}"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
+
+
+def _bytes_to_dataframe(file_bytes: bytes) -> pd.DataFrame:
+    """Load a DataFrame from bytes: either raw CSV or a zip containing one or more CSVs (uses first CSV)."""
+    from io import BytesIO
+    import zipfile
+    try:
+        return pd.read_csv(BytesIO(file_bytes))
+    except Exception:
+        pass
+    try:
+        with zipfile.ZipFile(BytesIO(file_bytes), "r") as z:
+            names = [n for n in z.namelist() if n.endswith(".csv") and not n.startswith("__")]
+            if not names:
+                raise ValueError("No CSV found in zip")
+            with z.open(names[0]) as f:
+                return pd.read_csv(BytesIO(f.read()))
+    except Exception as e:
+        raise ValueError(f"Cannot load DataFrame from bytes (CSV or zip): {e}")
+
+
+def upload_mitigated_dataset_folder(
+    user_id: str,
+    original_dataset_id: str,
+    original_version: str,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    df_drift: pd.DataFrame,
+    meta: dict,
+    csv_filename: str = "data.csv",
+) -> dict:
+    """
+    Upload a mitigated dataset that has train/test/drift splits as a single new version (folder zip).
+    Returns the API response including the new version.
+    """
+    from io import BytesIO
+    import zipfile
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, df in [("train/" + csv_filename, df_train), ("test/" + csv_filename, df_test), ("drift/" + csv_filename, df_drift)]:
+            bio = BytesIO()
+            df.to_csv(bio, index=False)
+            z.writestr(name, bio.getvalue())
+    buf.seek(0)
+    zip_bytes = buf.getvalue()
+
+    url = f"{API_BASE}/datasets/upload/folder/{user_id}"
+    files = {"zip_file": (f"{original_dataset_id}_mitigated.zip", zip_bytes, "application/zip")}
+    existing_tags = meta.get("tags", [])
+    if isinstance(existing_tags, str):
+        existing_tags = [t.strip() for t in existing_tags.split(",") if t.strip()]
+    tags = existing_tags + ["mitigated", "bias-corrected"]
+    data = {
+        "dataset_id": original_dataset_id,
+        "name": f"{meta.get('name', original_dataset_id)} (Mitigated)",
+        "description": f"Bias-mitigated version (train/test/drift) of {original_dataset_id} {original_version}.",
+        "tags": ",".join(tags),
+        "preserve_structure": "true",
+    }
+    r = requests.post(url, files=files, data=data, timeout=120)
+    r.raise_for_status()
+    result = r.json()
+    logger.info(f"Mitigated folder dataset uploaded: {original_dataset_id} version {result.get('version')}")
+    return result
 
 
 def clean_for_json(obj):
@@ -81,8 +148,8 @@ def clean_for_json(obj):
 
 def post_bias_report(user_id: str, dataset_id: str, report: dict, 
                      target_column_name: str = None, task_type: str = None,
-                     dataset_version: str = "v1", task_id: str | None = None) -> dict:
-<<<<<<< HEAD
+                     dataset_version: str = "v1", task_id: str | None = None,
+                     transformation_report_id: str | None = None) -> dict:
     """
     Post bias report to API
     
@@ -98,6 +165,8 @@ def post_bias_report(user_id: str, dataset_id: str, report: dict,
         "target_column_name": target_column_name,
         "task_type": task_type,
     }
+    if transformation_report_id:
+        payload["transformation_report_id"] = transformation_report_id
     headers = {}
     if task_id:
         headers["X-Task-ID"] = task_id
@@ -106,7 +175,6 @@ def post_bias_report(user_id: str, dataset_id: str, report: dict,
     return r.json()
 
 
-<<<<<<< HEAD
 async def send_bias_complete_event(
     producer: AIOKafkaProducer,
     task_id: str,
@@ -528,22 +596,34 @@ async def run_consumer() -> None:
                 # Extract dataset version from input (if provided)
                 dataset_version = input_data.get("dataset_version", "v1")  # Default to v1 for backward compatibility
                 
-                # Fetch metadata (optional) and download file
+                # Fetch metadata first to detect split (train/test/drift) datasets
                 meta = fetch_dataset_metadata(user_id, dataset_id, dataset_version)
+                has_split = bool(meta.get("custom_metadata", {}).get("split"))
 
-                file_bytes = download_dataset_file(user_id, dataset_id, dataset_version)
-
-                # Try to read as CSV with pandas (fallback to bytes length)
                 df = None
-                try:
-                    from io import BytesIO
-                    df = pd.read_csv(BytesIO(file_bytes))
-                    logger.info(f"Loaded dataset into pandas DataFrame with shape {df.shape}")
-                except Exception as e:
-                    logger.warning(f"Could not parse file as CSV: {e}; proceeding with raw bytes")
+                df_train = df_test = df_drift = None
+                if has_split:
+                    # Dataset has train/test/drift splits: download each split and run bias on all three
+                    logger.info("Dataset has train/test/drift split; downloading each split separately")
+                    dfs = {}
+                    for split_name in ("train", "test", "drift"):
+                        file_bytes = download_dataset_file(user_id, dataset_id, dataset_version, split=split_name)
+                        dfs[split_name] = _bytes_to_dataframe(file_bytes)
+                        logger.info(f"  Loaded {split_name} split: shape {dfs[split_name].shape}")
+                    df_train, df_test, df_drift = dfs["train"], dfs["test"], dfs["drift"]
+                    df = pd.concat([df_train, df_test, df_drift], ignore_index=True)
+                    logger.info(f"Combined DataFrame shape: {df.shape}")
+                else:
+                    # Single file or non-split folder: download once and load (CSV or zip)
+                    file_bytes = download_dataset_file(user_id, dataset_id, dataset_version)
+                    try:
+                        df = _bytes_to_dataframe(file_bytes)
+                        logger.info(f"Loaded dataset into pandas DataFrame with shape {df.shape}")
+                    except Exception as e:
+                        logger.warning(f"Could not load dataset as CSV or zip: {e}; proceeding with raw bytes")
 
                 # Build bias report (profile) per the corrected example
-                bias_report = build_bias_report(df, meta)
+                bias_report = build_bias_report(df, meta) if df is not None else {}
 
                 # POST bias report to API WITHOUT task_id initially (so no event is sent)
                 # We'll send the event manually after mitigation completes
@@ -588,67 +668,80 @@ async def run_consumer() -> None:
                     logger.info("=" * 80)
                     
                     try:
-                        df_transformed, transformation_log = preprocess_data(df, bias_report)
-                        
-                        if transformation_log:
-                            logger.info(f"Applied {len(transformation_log)} transformations")
-                            
-                            # Upload mitigated dataset FIRST to get the actual version from the API
-                            logger.info("Uploading mitigated dataset...")
-                            mitigated_result = upload_mitigated_dataset(
-                                user_id=user_id,
-                                original_dataset_id=dataset_id,
-                                original_version=dataset_version,
-                                df_transformed=df_transformed,
-                                meta=meta
-                            )
-                            
-                            # Extract the ACTUAL version from the upload response
+                        if has_split and df_train is not None and df_test is not None and df_drift is not None:
+                            # Mitigate each split separately, then upload as one folder (train/test/drift)
+                            log_train, log_test, log_drift = [], [], []
+                            df_t, log_train = preprocess_data(df_train, bias_report)
+                            df_train_transformed = df_t
+                            df_t, log_test = preprocess_data(df_test, bias_report)
+                            df_test_transformed = df_t
+                            df_t, log_drift = preprocess_data(df_drift, bias_report)
+                            df_drift_transformed = df_t
+                            transformation_log = log_train + log_test + log_drift
+                            if transformation_log:
+                                logger.info(f"Applied {len(transformation_log)} transformations across train/test/drift")
+                                logger.info("Uploading mitigated dataset (train/test/drift folder)...")
+                                mitigated_result = upload_mitigated_dataset_folder(
+                                    user_id=user_id,
+                                    original_dataset_id=dataset_id,
+                                    original_version=dataset_version,
+                                    df_train=df_train_transformed,
+                                    df_test=df_test_transformed,
+                                    df_drift=df_drift_transformed,
+                                    meta=meta,
+                                )
+                            else:
+                                mitigated_result = None
+                        else:
+                            df_transformed, transformation_log = preprocess_data(df, bias_report)
+                            if transformation_log:
+                                logger.info(f"Applied {len(transformation_log)} transformations")
+                                logger.info("Uploading mitigated dataset...")
+                                mitigated_result = upload_mitigated_dataset(
+                                    user_id=user_id,
+                                    original_dataset_id=dataset_id,
+                                    original_version=dataset_version,
+                                    df_transformed=df_transformed,
+                                    meta=meta
+                                )
+                            else:
+                                mitigated_result = None
+                        # Common follow-up when we uploaded a mitigated dataset (single or folder)
+                        if mitigated_result:
                             actual_mitigated_version = mitigated_result.get("version")
                             if not actual_mitigated_version:
                                 logger.error("Upload response missing version field!")
                                 logger.error(f"Response: {json.dumps(mitigated_result, indent=2, default=str)}")
                                 raise ValueError("Failed to get version from dataset upload response")
-                            
                             mitigated_dataset_version = actual_mitigated_version
-                            
                             logger.info(f"✅ Mitigated dataset uploaded successfully!")
                             logger.info(f"   Dataset ID: {dataset_id}")
                             logger.info(f"   Actual mitigated version: {actual_mitigated_version}")
                             logger.info(f"   Original version: {dataset_version}")
                             logger.info(f"   Transformations applied: {len(transformation_log)}")
-                            
-                            # Post transformation report with the ACTUAL version from upload response
                             transform_url = f"{API_BASE}/transformation-reports/"
                             transform_payload = {
                                 "user_id": user_id,
                                 "dataset_id": dataset_id,
-                                "version": actual_mitigated_version,  # Use actual version from upload
+                                "version": actual_mitigated_version,
                                 "report": transformation_log
                             }
                             transform_resp = requests.post(transform_url, json=transform_payload, timeout=30)
                             transform_resp.raise_for_status()
                             transform_report_result = transform_resp.json()
                             transformation_report_id = transform_report_result.get("id", "")
-                            
                             logger.info(f"✅ Transformation report saved successfully!")
                             logger.info(f"   Dataset ID: {dataset_id}")
                             logger.info(f"   Version: {actual_mitigated_version}")
                             logger.info(f"   Transformation report ID: {transformation_report_id}")
-                            
-                            # Update bias report with mitigation metadata
                             mitigation_metadata = {
                                 "mitigation_performed": True,
                                 "mitigated_dataset_version": actual_mitigated_version,
                                 "transformation_report_id": transformation_report_id,
                                 "transformation_count": len(transformation_log)
                             }
-                            
-                            # Add mitigation metadata to the bias report
                             updated_bias_report = bias_report.copy()
                             updated_bias_report["mitigation"] = mitigation_metadata
-                            
-                            # Update the bias report by posting again (upsert)
                             updated_saved = post_bias_report(
                                 user_id=user_id,
                                 dataset_id=dataset_id,
@@ -656,7 +749,8 @@ async def run_consumer() -> None:
                                 target_column_name=target_column_name,
                                 task_type=task_type,
                                 dataset_version=dataset_version,
-                                task_id=None  # Still no task_id - we'll send event manually
+                                task_id=None,
+                                transformation_report_id=transformation_report_id
                             )
                             logger.info(f"✅ Bias report updated with mitigation metadata")
                         else:

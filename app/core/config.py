@@ -33,7 +33,9 @@ class Settings(BaseSettings):
     kafka_bias_trigger_topic: str = "bias-detection-trigger-events"
     kafka_automl_trigger_topic: str = "automl-trigger-events"
     kafka_xai_trigger_topic: str = "xai-trigger-events"
-    
+    kafka_concept_drift_trigger_topic: str = "concept-drift-trigger-events"
+    kafka_concept_drift_topic: str = "concept-drift-complete-events"
+
     class Config:
         env_file = ".env"
         case_sensitive = False

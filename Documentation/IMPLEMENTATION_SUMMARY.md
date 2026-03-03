@@ -1,5 +1,17 @@
 # Complete Kafka Orchestration - Implementation Summary
 
+This document summarizes the Kafka orchestration implementation. For a **high-level overview of all AutoDW capabilities** (datasets, models, GraphDB, user-files, concept drift, etc.), see **[CAPABILITIES_OVERVIEW.md](CAPABILITIES_OVERVIEW.md)**.
+
+---
+
+## Recent additions (Documentation & features)
+
+- **GraphDB initialization from backup:** GraphDB can start with data from a backup placed in `graphdb_init/`. Configs are stored in MongoDB—create them via the API after first run. See [GRAPHDB_README.md](GRAPHDB_README.md) and [graphdb_init/README.md](../graphdb_init/README.md).
+- **User-files API:** Upload/list/download/delete user attachments (e.g. for chatbot). Stored in MinIO at `user-files/{user_id}/{file_id}/`. See [USER_FILES_README.md](USER_FILES_README.md).
+- **Automatic 70-15-15 split:** For suitable tabular datasets, the DW automatically creates train (70%) / test (15%) / drift (15%) under v2; concept-drift consumer uses `?split=drift`. See [CONCEPT_DRIFT_KAFKA.md](CONCEPT_DRIFT_KAFKA.md).
+
+---
+
 ## ✅ What Was Implemented
 
 ### 1. Fixed Bias Report Kafka Events

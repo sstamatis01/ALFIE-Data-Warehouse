@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
@@ -20,6 +20,7 @@ class TransformationReportCreate(BaseModel):
 
 
 class TransformationReportResponse(BaseModel):
+    id: Optional[str] = Field(None, description="Transformation report document ID as string")
     user_id: str
     dataset_id: str
     version: str

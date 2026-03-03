@@ -66,22 +66,26 @@ async def _get_next_dataset_version(user_id: str, dataset_id: str) -> str:
     Auto-detect the next version number for a dataset.
     Queries existing versions and increments (v1, v2, v3, etc.)
     """
+    versions = await _get_next_dataset_versions(user_id, dataset_id, count=1)
+    return versions[0]
+
+
+async def _get_next_dataset_versions(user_id: str, dataset_id: str, count: int = 2) -> tuple:
+    """
+    Return the next `count` version strings for a dataset (e.g. v1, v2).
+    Used so we can reserve v1 for original and v2 for split in one upload flow.
+    """
     try:
         from ..core.database import get_database
         db = get_database()
-        
-        # Find all versions of this dataset for this user
+
         cursor = db.datasets.find({
             "user_id": user_id,
             "dataset_id": dataset_id
         }, {"version": 1})
-        
+
         versions = await cursor.to_list(length=1000)
-        
-        if not versions:
-            return "v1"
-        
-        # Extract version numbers (v1 -> 1, v2 -> 2, etc.)
+
         version_numbers = []
         for doc in versions:
             version_str = doc.get("version", "v1")
@@ -90,18 +94,13 @@ async def _get_next_dataset_version(user_id: str, dataset_id: str) -> str:
                     version_numbers.append(int(version_str[1:]))
                 except ValueError:
                     pass
-        
-        # Get the max version and increment
-        if version_numbers:
-            next_version = max(version_numbers) + 1
-        else:
-            next_version = 1
-        
-        return f"v{next_version}"
-        
+
+        start = max(version_numbers) + 1 if version_numbers else 1
+        return tuple(f"v{i}" for i in range(start, start + count))
+
     except Exception as e:
-        logger.warning(f"Error detecting next version, defaulting to v1: {e}")
-        return "v1"
+        logger.warning(f"Error detecting next versions, defaulting to v1..v{count}: {e}")
+        return tuple(f"v{i}" for i in range(1, 1 + count))
 
 
 @router.post("/upload/{user_id}", response_model=DatasetResponse)
@@ -148,63 +147,82 @@ async def upload_dataset(
         if tags:
             tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
         
-        # Auto-detect next version
-        version = await _get_next_dataset_version(user_id, dataset_id)
-        logger.info(f"Auto-detected version: {version} for dataset {dataset_id}")
+        # Reserve v1 (original) and v2 (split if applicable)
+        v1, v2 = await _get_next_dataset_versions(user_id, dataset_id, count=2)
+        logger.info(f"Reserved versions: v1={v1}, v2={v2} for dataset {dataset_id}")
         
-        # Create dataset metadata object
-        dataset_create = DatasetCreate(
+        # Upload: original always to v1; split to v2 when large enough
+        file_path, v1_metadata, v2_metadata = await file_service.upload_file(
+            file=file,
+            user_id=user_id,
+            dataset_id=dataset_id,
+            version=v1,
+            version_split=v2,
+        )
+        
+        # Add file path to v1 metadata
+        v1_metadata['file_path'] = file_path
+        
+        # Create v1 dataset record (original)
+        dataset_create_v1 = DatasetCreate(
             dataset_id=dataset_id,
             user_id=user_id,
             name=name,
             description=description,
-            version=version,
+            version=v1,
             tags=tag_list
         )
-        
-        # Upload file to MinIO and get metadata
-        file_path, file_metadata = await file_service.upload_file(
-            file=file,
-            user_id=user_id,
-            dataset_id=dataset_id,
-            version=version
+        dataset_metadata_v1 = await metadata_service.create_dataset_metadata(
+            dataset_data=dataset_create_v1,
+            file_metadata=v1_metadata
         )
         
-        # Add file path to metadata
-        file_metadata['file_path'] = file_path
+        # Optionally create v2 dataset record (split) and use as response
+        if v2_metadata is not None:
+            dataset_create_v2 = DatasetCreate(
+                dataset_id=dataset_id,
+                user_id=user_id,
+                name=name,
+                description=description,
+                version=v2,
+                tags=tag_list
+            )
+            dataset_metadata_v2 = await metadata_service.create_dataset_metadata(
+                dataset_data=dataset_create_v2,
+                file_metadata=v2_metadata
+            )
+            # Send Kafka only for v2 so the pipeline runs once on the split version (orchestrator expects one event per upload)
+            try:
+                await kafka_producer_service.send_dataset_uploaded_event(dataset_metadata_v2)
+            except Exception as kafka_error:
+                logger.warning(f"Failed to send Kafka event for v2: {kafka_error}")
+            result_metadata = dataset_metadata_v2
+        else:
+            try:
+                await kafka_producer_service.send_dataset_uploaded_event(dataset_metadata_v1)
+            except Exception as kafka_error:
+                logger.warning(f"Failed to send Kafka event for upload: {kafka_error}")
+            result_metadata = dataset_metadata_v1
         
-        # Store metadata in MongoDB
-        dataset_metadata = await metadata_service.create_dataset_metadata(
-            dataset_data=dataset_create,
-            file_metadata=file_metadata
-        )
-        
-        # Send Kafka event (non-blocking failure)
-        try:
-            await kafka_producer_service.send_dataset_uploaded_event(dataset_metadata)
-        except Exception as kafka_error:
-            logger.warning(f"Failed to send Kafka event for upload: {kafka_error}")
-
-        # Convert to response model
         return DatasetResponse(
-            dataset_id=dataset_metadata.dataset_id,
-            user_id=dataset_metadata.user_id,
-            name=dataset_metadata.name,
-            description=dataset_metadata.description,
-            version=dataset_metadata.version,
-            file_type=dataset_metadata.file_type,
-            file_size=dataset_metadata.file_size,
-            original_filename=dataset_metadata.original_filename,
-            files=dataset_metadata.files,
-            is_folder=dataset_metadata.is_folder,
-            columns=dataset_metadata.columns,
-            row_count=dataset_metadata.row_count,
-            data_types=dataset_metadata.data_types,
-            tags=dataset_metadata.tags,
-            custom_metadata=dataset_metadata.custom_metadata,
-            created_at=dataset_metadata.created_at,
-            updated_at=dataset_metadata.updated_at,
-            file_hash=dataset_metadata.file_hash
+            dataset_id=result_metadata.dataset_id,
+            user_id=result_metadata.user_id,
+            name=result_metadata.name,
+            description=result_metadata.description,
+            version=result_metadata.version,
+            file_type=result_metadata.file_type,
+            file_size=result_metadata.file_size,
+            original_filename=result_metadata.original_filename,
+            files=result_metadata.files,
+            is_folder=result_metadata.is_folder,
+            columns=result_metadata.columns,
+            row_count=result_metadata.row_count,
+            data_types=result_metadata.data_types,
+            tags=result_metadata.tags,
+            custom_metadata=result_metadata.custom_metadata,
+            created_at=result_metadata.created_at,
+            updated_at=result_metadata.updated_at,
+            file_hash=result_metadata.file_hash
         )
         
     except HTTPException:
@@ -256,59 +274,105 @@ async def upload_dataset_folder(
         if tags:
             tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
         
-        # Auto-detect next version
-        version = await _get_next_dataset_version(user_id, dataset_id)
-        logger.info(f"Auto-detected version: {version} for dataset folder {dataset_id}")
+        v1, v2 = await _get_next_dataset_versions(user_id, dataset_id, count=2)
+        logger.info(f"Reserved versions: v1={v1}, v2={v2} for dataset folder {dataset_id}")
         
-        # Upload folder to MinIO
-        dataset_files, total_size = await file_service.upload_dataset_folder(
-            zip_file=zip_file,
-            user_id=user_id,
-            dataset_id=dataset_id,
-            version=version,
-            preserve_structure=preserve_structure
-        )
-        
-        if not dataset_files:
+        # Upload: original always to v1; split to v2 when large enough
+        try:
+            (dataset_files_v1, total_size_v1, _), v2_result = await file_service.upload_dataset_folder(
+                zip_file=zip_file,
+                user_id=user_id,
+                dataset_id=dataset_id,
+                version=v1,
+                version_split=v2,
+                preserve_structure=preserve_structure
+            )
+        except HTTPException as e:
+            if e.status_code == 400 and e.detail and "annotation" in str(e.detail).lower():
+                try:
+                    await kafka_producer_service.send_dataset_upload_failed_event(
+                        user_id=user_id,
+                        dataset_id=dataset_id,
+                        filename=zip_file.filename or "archive.zip",
+                        error_message=e.detail,
+                    )
+                except Exception as kafka_err:
+                    logger.warning(f"Failed to send dataset upload failed event: {kafka_err}")
+            raise
+
+        if not dataset_files_v1:
             raise HTTPException(status_code=400, detail="No valid files found in ZIP")
         
-        # Simplified metadata for folder
-        file_types = list(set([f.file_type for f in dataset_files]))
-        folder_path = f"datasets/{user_id}/{dataset_id}/{version}/"
+        file_types_v1 = list(set([f.file_type for f in dataset_files_v1]))
+        folder_path_v1 = f"datasets/{user_id}/{dataset_id}/{v1}/"
+        custom_meta_v1 = {"file_count": len(dataset_files_v1), "preserve_structure": preserve_structure}
         
-        dataset_metadata = DatasetMetadata(
+        dataset_metadata_v1 = DatasetMetadata(
             dataset_id=dataset_id,
             user_id=user_id,
             name=name,
             description=description,
-            version=version,
-            file_type=", ".join(file_types),
-            file_size=total_size,
-            file_path=folder_path,
+            version=v1,
+            file_type=", ".join(file_types_v1),
+            file_size=total_size_v1,
+            file_path=folder_path_v1,
             original_filename=zip_file.filename,
-            files=dataset_files,
+            files=dataset_files_v1,
             is_folder=True,
             columns=None,
             row_count=None,
             data_types=None,
             tags=tag_list,
-            custom_metadata={"file_count": len(dataset_files), "preserve_structure": preserve_structure},
+            custom_metadata=custom_meta_v1,
             created_at=datetime.now(tz=timezone.utc),
             updated_at=datetime.now(tz=timezone.utc),
             file_hash=None
         )
-        
         from ..core.database import get_database
         db = get_database()
-        result = await db.datasets.insert_one(dataset_metadata.dict(by_alias=True, exclude={'id'}))
-        created_dataset = await db.datasets.find_one({"_id": result.inserted_id})
+        await db.datasets.insert_one(dataset_metadata_v1.dict(by_alias=True, exclude={'id'}))
         
-        logger.info(f"Dataset folder uploaded: {dataset_id} ({len(dataset_files)} files)")
+        if v2_result is not None:
+            dataset_files_v2, total_size_v2, split_counts = v2_result
+            file_types_v2 = list(set([f.file_type for f in dataset_files_v2]))
+            folder_path_v2 = f"datasets/{user_id}/{dataset_id}/{v2}/"
+            custom_meta_v2 = {"file_count": len(dataset_files_v2), "preserve_structure": preserve_structure, "split": split_counts}
+            dataset_metadata_v2 = DatasetMetadata(
+                dataset_id=dataset_id,
+                user_id=user_id,
+                name=name,
+                description=description,
+                version=v2,
+                file_type=", ".join(file_types_v2),
+                file_size=total_size_v2,
+                file_path=folder_path_v2,
+                original_filename=zip_file.filename,
+                files=dataset_files_v2,
+                is_folder=True,
+                columns=None,
+                row_count=None,
+                data_types=None,
+                tags=tag_list,
+                custom_metadata=custom_meta_v2,
+                created_at=datetime.now(tz=timezone.utc),
+                updated_at=datetime.now(tz=timezone.utc),
+                file_hash=None
+            )
+            await db.datasets.insert_one(dataset_metadata_v2.dict(by_alias=True, exclude={'id'}))
+            # Send Kafka only for v2 so the pipeline runs once on the split version (orchestrator expects one event per upload)
+            try:
+                await kafka_producer_service.send_dataset_uploaded_event(dataset_metadata_v2)
+            except Exception as kafka_error:
+                logger.warning(f"Failed to send Kafka event for v2: {kafka_error}")
+            created_dataset = await db.datasets.find_one({"dataset_id": dataset_id, "user_id": user_id, "version": v2})
+        else:
+            try:
+                await kafka_producer_service.send_dataset_uploaded_event(dataset_metadata_v1)
+            except Exception as kafka_error:
+                logger.warning(f"Failed to send Kafka event for upload: {kafka_error}")
+            created_dataset = await db.datasets.find_one({"dataset_id": dataset_id, "user_id": user_id, "version": v1})
         
-        try:
-            await kafka_producer_service.send_dataset_uploaded_event(DatasetMetadata(**created_dataset))
-        except Exception as kafka_error:
-            logger.warning(f"Failed to send Kafka event: {kafka_error}")
+        logger.info(f"Dataset folder uploaded: {dataset_id} (v1 + v2 split)" if v2_result else f"Dataset folder uploaded: {dataset_id} (v1 only)")
         
         return DatasetResponse(**created_dataset)
         
@@ -512,123 +576,97 @@ async def delete_dataset(user_id: str, dataset_id: str):
 
 @router.get("/{user_id}/{dataset_id}/download")
 async def download_dataset(
-    user_id: str, 
+    user_id: str,
     dataset_id: str,
-    filename: Optional[str] = Query(None, description="Specific filename to download (for folders)")
+    filename: Optional[str] = Query(None, description="Specific filename to download (for folders)"),
+    split: Optional[str] = Query(None, description="For split datasets: 'train', 'test', or 'drift' to download only that subset"),
 ):
     """
-    Download latest dataset file or folder
-    
+    Download latest dataset file or folder.
+
     - For single files: downloads the file
-    - For folders without filename: downloads all files as ZIP
+    - For folders without filename: downloads all files as ZIP (optionally only train/test/drift if split= is set)
     - For folders with filename: downloads specific file from folder
+    - split=train|test|drift: when dataset has train/test/drift split, download only that subset (does not affect non-split datasets)
     """
-    # Get latest dataset metadata
     dataset = await metadata_service.get_latest_dataset(dataset_id, user_id)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    
-    # Handle folder downloads
+
     if dataset.is_folder:
         if filename:
-            # Download specific file from folder
             dataset_files = dataset.files or []
-            target_file = None
-            
-            for file_info in dataset_files:
-                if file_info.filename == filename:
-                    target_file = file_info
-                    break
-            
+            target_file = next((f for f in dataset_files if f.filename == filename), None)
             if not target_file:
                 raise HTTPException(status_code=404, detail=f"File '{filename}' not found in dataset")
-            
             file_data = await file_service.download_file(target_file.file_path)
-            
             return StreamingResponse(
                 BytesIO(file_data),
                 media_type='application/octet-stream',
                 headers={"Content-Disposition": f"attachment; filename={filename}"}
             )
-        else:
-            # Download all files as ZIP
-            zip_data = await file_service.download_folder_as_zip(dataset.file_path)
-            
-            return StreamingResponse(
-                BytesIO(zip_data),
-                media_type='application/zip',
-                headers={"Content-Disposition": f"attachment; filename={dataset_id}_{dataset.version}.zip"}
-            )
-    else:
-        # Single file download
-        file_data = await file_service.download_file(dataset.file_path)
-        
+        subfolder = None
+        if split and split in ("train", "test", "drift") and (dataset.custom_metadata or {}).get("split"):
+            subfolder = split
+        zip_data = await file_service.download_folder_as_zip(dataset.file_path, subfolder_prefix=subfolder)
+        zip_name = f"{dataset_id}_{dataset.version}" + (f"_{split}" if subfolder else "") + ".zip"
         return StreamingResponse(
-            BytesIO(file_data),
-            media_type='application/octet-stream',
-            headers={"Content-Disposition": f"attachment; filename={dataset.original_filename}"}
+            BytesIO(zip_data),
+            media_type='application/zip',
+            headers={"Content-Disposition": f"attachment; filename={zip_name}"}
         )
+    file_data = await file_service.download_file(dataset.file_path)
+    return StreamingResponse(
+        BytesIO(file_data),
+        media_type='application/octet-stream',
+        headers={"Content-Disposition": f"attachment; filename={dataset.original_filename}"}
+    )
 
 
 @router.get("/{user_id}/{dataset_id}/version/{version}/download")
 async def download_dataset_by_version(
-    user_id: str, 
-    dataset_id: str, 
+    user_id: str,
+    dataset_id: str,
     version: str,
-    filename: Optional[str] = Query(None, description="Specific filename to download (for folders)")
+    filename: Optional[str] = Query(None, description="Specific filename to download (for folders)"),
+    split: Optional[str] = Query(None, description="For split datasets: 'train', 'test', or 'drift'"),
 ):
     """
-    Download a specific version of a dataset file or folder
-    
-    - For single files: downloads the file
-    - For folders without filename: downloads all files as ZIP
-    - For folders with filename: downloads specific file from folder
+    Download a specific version of a dataset file or folder.
+    Use split=train|test|drift to download only that subset when the dataset has a split.
     """
-    # Get dataset metadata for the specific version
     dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset version not found")
-    
-    # Handle folder downloads
+
     if dataset.is_folder:
         if filename:
-            # Download specific file from folder
             dataset_files = dataset.files or []
-            target_file = None
-            
-            for file_info in dataset_files:
-                if file_info.filename == filename:
-                    target_file = file_info
-                    break
-            
+            target_file = next((f for f in dataset_files if f.filename == filename), None)
             if not target_file:
                 raise HTTPException(status_code=404, detail=f"File '{filename}' not found in dataset")
-            
             file_data = await file_service.download_file(target_file.file_path)
-            
             return StreamingResponse(
                 BytesIO(file_data),
                 media_type='application/octet-stream',
                 headers={"Content-Disposition": f"attachment; filename={filename}"}
             )
-        else:
-            # Download all files as ZIP
-            zip_data = await file_service.download_folder_as_zip(dataset.file_path)
-            
-            return StreamingResponse(
-                BytesIO(zip_data),
-                media_type='application/zip',
-                headers={"Content-Disposition": f"attachment; filename={dataset_id}_{version}.zip"}
-            )
-    else:
-        # Single file download
-        file_data = await file_service.download_file(dataset.file_path)
-        
+        subfolder = None
+        if split and split in ("train", "test", "drift") and (dataset.custom_metadata or {}).get("split"):
+            subfolder = split
+        zip_data = await file_service.download_folder_as_zip(dataset.file_path, subfolder_prefix=subfolder)
+        zip_name = f"{dataset_id}_{version}" + (f"_{split}" if subfolder else "") + ".zip"
         return StreamingResponse(
-            BytesIO(file_data),
-            media_type='application/octet-stream',
-            headers={"Content-Disposition": f"attachment; filename={dataset.original_filename}"}
+            BytesIO(zip_data),
+            media_type='application/zip',
+            headers={"Content-Disposition": f"attachment; filename={zip_name}"}
         )
+    file_data = await file_service.download_file(dataset.file_path)
+    return StreamingResponse(
+        BytesIO(file_data),
+        media_type='application/octet-stream',
+        headers={"Content-Disposition": f"attachment; filename={dataset.original_filename}"}
+    )
 
 
 @router.get("/{user_id}/{dataset_id}/files", response_model=List[DatasetFile])

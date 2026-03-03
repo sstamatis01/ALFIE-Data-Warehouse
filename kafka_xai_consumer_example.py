@@ -79,15 +79,22 @@ def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
         raise
 
 
-def download_dataset_file(user_id: str, dataset_id: str, version: str = None) -> bytes:
-    """Download dataset file (single file or folder as ZIP) - specific version or latest"""
+def download_dataset_file(user_id: str, dataset_id: str, version: str = None, split: str = None) -> bytes:
+    """Download dataset file (single file or folder as ZIP) - specific version or latest. If split is 'train', 'test', or 'drift', download only that subset (for split datasets)."""
     if version:
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}/download"
     else:
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
+    if split and split in ("train", "test", "drift"):
+        url += f"?split={split}"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
+
+
+def _is_zip(data: bytes) -> bool:
+    """Return True if data looks like a ZIP file (PK magic bytes)."""
+    return len(data) >= 2 and data[:2] == b"PK"
 
 
 def extract_dataset_folder(zip_bytes: bytes, extract_to: str = "temp_dataset") -> list:
@@ -243,11 +250,20 @@ async def process_xai_trigger(event: dict) -> None:
         try:
             dataset_meta = fetch_dataset_metadata(user_id, dataset_id, dataset_version)
             logger.info(f"Dataset metadata fetched: {dataset_meta.get('name')} (version {dataset_version})")
-            
+            # Use metadata for is_folder/file_count so v2 (split) and v3 (mitigated) folder datasets are handled correctly
+            is_folder = dataset_meta.get("is_folder", is_folder)
+            files_meta = dataset_meta.get("files") or []
+            file_count = len(files_meta) if files_meta else dataset_meta.get("file_count", file_count)
+            if not files_meta and dataset_meta.get("custom_metadata", {}).get("file_count") is not None:
+                file_count = dataset_meta["custom_metadata"]["file_count"]
+
             # Download dataset (single file or ZIP)
             dataset_bytes = download_dataset_file(user_id, dataset_id, dataset_version)
             logger.info(f"Dataset downloaded: {len(dataset_bytes)} bytes")
-            
+            # If download is a ZIP but we thought single file (e.g. event had no is_folder), treat as folder (v2/v3)
+            if not is_folder and _is_zip(dataset_bytes):
+                logger.info("Download is a ZIP; treating as folder dataset for extraction")
+                is_folder = True
             # Handle dataset based on type
             dataset_extracted_files = []
             if is_folder:
@@ -268,7 +284,11 @@ async def process_xai_trigger(event: dict) -> None:
             model_meta = fetch_model_metadata(user_id, model_id, model_version)
             logger.info(f"Model metadata fetched: {model_meta.get('name')} (version {model_version})")
             logger.info(f"  Framework: {model_meta.get('framework')}")
-            logger.info(f"  Files: {len(model_meta.get('files', []))}")
+            model_files_list = model_meta.get("files") or []
+            logger.info(f"  Files: {len(model_files_list)}")
+            # Use metadata for is_model_folder so folder models (e.g. AutoGluon) are handled correctly
+            is_model_folder = len(model_files_list) > 1 if model_files_list else model_meta.get("is_folder", is_model_folder)
+            model_file_count = len(model_files_list) if model_files_list else model_meta.get("file_count", model_file_count)
             
             # Download model (single file or folder as ZIP)
             model_bytes = download_model_file(user_id, model_id, model_version)

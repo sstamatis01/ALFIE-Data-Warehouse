@@ -9,6 +9,19 @@ The GraphDB integration provides:
 - **Query Execution**: Execute SELECT and UPDATE SPARQL queries
 - **Connection Testing**: Validate GraphDB connections and repository access
 - **Authentication**: Secure credential management for GraphDB access
+- **Initialization from backup**: Option to start GraphDB with data from a backup (e.g. from another AutoDW instance)—see [Initializing GraphDB from backup](#initializing-graphdb-from-backup) below.
+
+## Initializing GraphDB from backup
+
+You can start GraphDB with existing data by placing a GraphDB backup archive in the `graphdb_init/` directory. On first run (when the GraphDB data volume is empty), the Docker entrypoint restores this backup so every build can start with the same triple store.
+
+- **Configs are not in the backup:** GraphDB **configurations** are stored in **MongoDB** by the Data Warehouse API. After restoring from backup you must create configs via the API so the DW knows how to connect to GraphDB and which repository to use.
+- **Setup and scripts:** See **[graphdb_init/README.md](../graphdb_init/README.md)** in the repo root for:
+  - Where to put the backup file (e.g. `graphdb_backup_*.tar.gz`)
+  - Supported backup layouts
+  - How to discover repository names and create a config (helper script `create_graphdb_config.sh` or curl)
+  - How to run SPARQL via the API
+- **Python script:** Use **`graphdb_etd_hub_kg_create_and_query.py`** to create a config for a repository (e.g. `etd-hub-kg-test`) and run example SPARQL queries. Run from repo root with `API_BASE=http://localhost:8000 python graphdb_etd_hub_kg_create_and_query.py`.
 
 ## Features
 

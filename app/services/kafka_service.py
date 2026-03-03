@@ -157,27 +157,27 @@ class KafkaProducerService:
     async def send_dataset_upload_failed_event(
         self,
         *,
-        session_id: str,
-        conversation_id: str,
         user_id: str,
         dataset_id: str,
         filename: str,
-        error_message: str
+        error_message: str,
+        session_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
     ) -> None:
-        """Send dataset upload failed event for tracking"""
+        """Send dataset upload failed event for tracking (e.g. validation failed: annotations missing)."""
         if not self.producer:
             logger.warning("Kafka producer not initialized; skipping dataset upload failed event")
             return
-        
+
         payload = {
             "event_type": "dataset.upload.failed",
-            "session_id": session_id,
-            "conversation_id": conversation_id,
+            "session_id": session_id or "",
+            "conversation_id": conversation_id or "",
             "user_id": user_id,
             "dataset_id": dataset_id,
             "filename": filename,
             "error_message": error_message,
-            "timestamp": datetime.now(tz=timezone.utc).isoformat()
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         }
         
         try:
@@ -334,6 +334,53 @@ class KafkaProducerService:
             logger.info(f"XAI completion event sent for task_id={task_id}")
         except Exception as e:
             logger.warning(f"Failed to send XAI completion event: {e}")
+
+    async def send_concept_drift_complete_event(
+        self,
+        *,
+        task_id: str,
+        user_id: str,
+        model_id: str,
+        model_version: str,
+        dataset_id: Optional[str] = None,
+        dataset_version: Optional[str] = None,
+        success: bool = True,
+        error_message: Optional[str] = None,
+        drift_metrics: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Send concept drift completion event (retrained model uploaded to DW)."""
+        if not self.producer:
+            logger.warning("Kafka producer not initialized; skipping concept drift completion event")
+            return
+
+        payload = {
+            "task_id": task_id,
+            "event_type": "concept-drift-complete",
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        if success:
+            payload["output"] = {
+                "model_id": model_id,
+                "model_version": model_version,
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "user_id": user_id,
+            }
+            if drift_metrics:
+                payload["output"]["drift_metrics"] = drift_metrics
+            payload["failure"] = None
+        else:
+            payload["output"] = None
+            payload["failure"] = {
+                "error_type": "ConceptDriftError",
+                "error_message": error_message or "Concept drift retraining failed",
+            }
+
+        try:
+            await self.producer.send_and_wait(settings.kafka_concept_drift_topic, value=payload, key=task_id)
+            logger.info(f"Concept drift completion event sent for task_id={task_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send concept drift completion event: {e}")
 
 
 kafka_producer_service = KafkaProducerService()

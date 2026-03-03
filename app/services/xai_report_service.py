@@ -268,3 +268,4 @@ class XAIReportService:
 
 # Global XAI report service instance
 xai_report_service = XAIReportService()
+

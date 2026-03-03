@@ -17,7 +17,7 @@ async def create_or_update_bias_report(
     task_id: Optional[str] = Header(None, alias="X-Task-ID")
 ):
     try:
-        report = await bias_report_service.upsert_report(payload)
+        report = await bias_report_service.upsert_report(payload, transformation_report_id=payload.transformation_report_id)
         
         # Send completion event if task_id is provided
         if task_id:
@@ -35,6 +35,8 @@ async def create_or_update_bias_report(
                 logger.error(f"Failed to send bias completion event: {e}", exc_info=True)
         
         return report
+    except HTTPException:
+        raise
     except ValueError as e:
         # Send failure event if task_id is provided
         if task_id:
@@ -42,6 +44,7 @@ async def create_or_update_bias_report(
                 await kafka_producer_service.send_bias_complete_event(
                     task_id=task_id,
                     dataset_id=payload.dataset_id,
+                    dataset_version=payload.dataset_version,
                     user_id=payload.user_id,
                     bias_report_id="",
                     success=False,
@@ -52,12 +55,14 @@ async def create_or_update_bias_report(
                 logger.error(f"Failed to send bias failure event: {kafka_error}", exc_info=True)
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        logger.error(f"Failed to save bias report: {e}", exc_info=True)
         # Send failure event if task_id is provided
         if task_id:
             try:
                 await kafka_producer_service.send_bias_complete_event(
                     task_id=task_id,
                     dataset_id=payload.dataset_id,
+                    dataset_version=payload.dataset_version,
                     user_id=payload.user_id,
                     bias_report_id="",
                     success=False,
@@ -66,7 +71,7 @@ async def create_or_update_bias_report(
                 logger.info(f"Bias failure event sent for task_id={task_id}")
             except Exception as kafka_error:
                 logger.error(f"Failed to send bias failure event: {kafka_error}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to save bias report")
+        raise HTTPException(status_code=500, detail=f"Failed to save bias report: {str(e)}")
 
 
 @router.get("/{user_id}/{dataset_id}", response_model=BiasReportResponse)

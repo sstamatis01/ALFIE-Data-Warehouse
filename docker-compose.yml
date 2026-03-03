@@ -104,9 +104,14 @@ services:
       GDB_MIN_MEM: 1g
       GDB_MAX_MEM: 1g
       GDB_MASTER_PASSWORD: admin
+      INIT_BACKUP_DIR: /init-backup
     volumes:
       - graphdb_data:/opt/graphdb/home/data
       - graphdb_logs:/opt/graphdb/home/logs
+      - ./graphdb_init:/init-backup:ro
+      - ./graphdb_init/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    command: ["/opt/graphdb/dist/bin/graphdb", "-Dgraphdb.home=/opt/graphdb/home", "-Dgraphdb.distribution=docker"]
     networks:
       - data-warehouse-network
     healthcheck:
@@ -174,6 +179,70 @@ services:
     volumes:
       - ./app:/app/app:ro
       - ./kafka_bias_detector_consumer_example.py:/app/kafka_bias_detector_consumer_example.py:ro
+
+  # AutoML Consumer Service (with parallel processing support)
+  automl-consumer:
+    build: .
+    env_file:
+      - .env
+    container_name: data-warehouse-automl-consumer
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_AUTOML_TRIGGER_TOPIC: automl-trigger-events
+      KAFKA_CONSUMER_GROUP: automl-consumer
+      API_BASE: http://api:8000
+      DW_HOST: api
+      DW_PORT: 8000
+      # AutoML services may run on the host or in another stack - use host.docker.internal
+      # so the container can reach them (required when consumer runs in Docker).
+      TABULAR_AUTOML_HOST: host.docker.internal
+      TABULAR_AUTOML_PORT: 8001
+      VISION_AUTOML_HOST: host.docker.internal
+      VISION_AUTOML_PORT: 8002
+    extra_hosts:
+      # Ensure host.docker.internal resolves (needed on Linux; Windows/Mac have it by default)
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      api:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - data-warehouse-network
+    command: >
+      sh -c "sleep 20 && python kafka_automl_consumer_example_v3.py"
+    volumes:
+      - ./app:/app/app:ro
+      - ./kafka_automl_consumer_example_v3.py:/app/kafka_automl_consumer_example_v3.py:ro
+
+  # Concept Drift Consumer: listens to concept-drift-trigger-events, runs ADWIN + AutoGluon retrain, uploads model to DW, sends concept-drift-complete
+  concept-drift-consumer:
+    build: .
+    env_file:
+      - .env
+    container_name: data-warehouse-concept-drift-consumer
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_CONCEPT_DRIFT_TRIGGER_TOPIC: concept-drift-trigger-events
+      KAFKA_CONCEPT_DRIFT_COMPLETE_TOPIC: concept-drift-complete-events
+      KAFKA_CONCEPT_DRIFT_CONSUMER_GROUP: concept-drift-consumer
+      API_BASE: http://api:8000
+      DW_HOST: api
+      DW_PORT: 8000
+    depends_on:
+      api:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - data-warehouse-network
+    command: >
+      sh -c "sleep 25 && python kafka_concept_drift_consumer_example.py"
+    volumes:
+      - ./app:/app/app:ro
+      - ./kafka_concept_drift_consumer_example.py:/app/kafka_concept_drift_consumer_example.py:ro
 
 volumes:
   mongodb_data:
