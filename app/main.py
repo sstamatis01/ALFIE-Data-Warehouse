@@ -112,10 +112,13 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
-# Custom docs: use X-Forwarded-Prefix when set (by nginx) so /autodw/docs works; otherwise use /openapi.json for direct access (e.g. http://host:8000/docs)
+# Custom docs: use X-Forwarded-Prefix only when request came through a proxy (other X-Forwarded-* set), else /openapi.json for direct :8000 access
 def _openapi_url_for_request(request: Request) -> str:
     prefix = request.headers.get("X-Forwarded-Prefix", "").strip().rstrip("/")
-    return f"{prefix}/openapi.json" if prefix else "/openapi.json"
+    from_proxy = any(request.headers.get(h) for h in ("X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host"))
+    if prefix and from_proxy:
+        return f"{prefix}/openapi.json"
+    return "/openapi.json"
 
 
 @app.get("/docs", include_in_schema=False)
