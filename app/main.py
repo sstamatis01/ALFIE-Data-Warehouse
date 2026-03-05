@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
 from contextlib import asynccontextmanager
 import logging
 
@@ -107,8 +108,29 @@ app = FastAPI(
     - Repository management for semantic knowledge graphs
     """,
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
 )
+# Custom docs so Swagger UI fetches OpenAPI from the prefixed path (e.g. /autodw/openapi.json) when behind nginx
+_openapi_url = f"{settings.root_path}/openapi.json" if settings.root_path else "/openapi.json"
+
+
+@app.get("/docs", include_in_schema=False)
+async def swagger_ui_html():
+    return get_swagger_ui_html(
+        openapi_url=_openapi_url,
+        title=app.title + " - Swagger UI",
+    )
+
+
+@app.get("/redoc", include_in_schema=False)
+async def redoc_html():
+    from fastapi.openapi.docs import get_redoc_html
+    return get_redoc_html(
+        openapi_url=_openapi_url,
+        title=app.title + " - ReDoc",
+    )
 
 # Add CORS middleware
 app.add_middleware(
