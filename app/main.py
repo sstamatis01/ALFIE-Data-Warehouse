@@ -76,7 +76,6 @@ async def lifespan(app: FastAPI):
 # Create FastAPI application
 app = FastAPI(
     title="Data Warehouse API",
-    root_path=settings.root_path,
     description="""
     A comprehensive Data Warehouse API for storing and managing both structured and unstructured data.
     
