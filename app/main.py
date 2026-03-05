@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from contextlib import asynccontextmanager
@@ -112,24 +112,29 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
-# Custom docs so the browser fetches OpenAPI relative to the docs URL.
-# Example: when served at https://alfie.iti.gr/autodw/docs, `openapi.json` resolves to /autodw/openapi.json.
-_openapi_url = "openapi.json"
+# Custom docs: use X-Forwarded-Prefix (set by nginx) or ROOT_PATH so the browser requests the spec at /autodw/openapi.json
+def _openapi_url_for_request(request: Request) -> str:
+    prefix = request.headers.get("X-Forwarded-Prefix", "").strip().rstrip("/")
+    if not prefix:
+        prefix = (settings.root_path or "").strip().rstrip("/")
+    return f"{prefix}/openapi.json" if prefix else "/openapi.json"
 
 
 @app.get("/docs", include_in_schema=False)
-async def swagger_ui_html():
+async def swagger_ui_html(request: Request):
+    openapi_url = _openapi_url_for_request(request)
     return get_swagger_ui_html(
-        openapi_url=_openapi_url,
+        openapi_url=openapi_url,
         title=app.title + " - Swagger UI",
     )
 
 
 @app.get("/redoc", include_in_schema=False)
-async def redoc_html():
+async def redoc_html(request: Request):
     from fastapi.openapi.docs import get_redoc_html
+    openapi_url = _openapi_url_for_request(request)
     return get_redoc_html(
-        openapi_url=_openapi_url,
+        openapi_url=openapi_url,
         title=app.title + " - ReDoc",
     )
 
