@@ -112,8 +112,9 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
-# Custom docs so Swagger UI fetches OpenAPI from the prefixed path (e.g. /autodw/openapi.json) when behind nginx
-_openapi_url = f"{settings.root_path}/openapi.json" if settings.root_path else "/openapi.json"
+# Custom docs so the browser fetches OpenAPI relative to the docs URL.
+# Example: when served at https://alfie.iti.gr/autodw/docs, `openapi.json` resolves to /autodw/openapi.json.
+_openapi_url = "openapi.json"
 
 
 @app.get("/docs", include_in_schema=False)
