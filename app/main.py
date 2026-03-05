@@ -112,11 +112,9 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
-# Custom docs: use X-Forwarded-Prefix (set by nginx) or ROOT_PATH so the browser requests the spec at /autodw/openapi.json
+# Custom docs: use X-Forwarded-Prefix when set (by nginx) so /autodw/docs works; otherwise use /openapi.json for direct access (e.g. http://host:8000/docs)
 def _openapi_url_for_request(request: Request) -> str:
     prefix = request.headers.get("X-Forwarded-Prefix", "").strip().rstrip("/")
-    if not prefix:
-        prefix = (settings.root_path or "").strip().rstrip("/")
     return f"{prefix}/openapi.json" if prefix else "/openapi.json"
 
 
