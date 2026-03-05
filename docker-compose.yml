@@ -139,8 +139,6 @@ services:
       KAFKA_DATASET_TOPIC: dataset-events
       KAFKA_GROUP_ID: data-warehouse-group
       KAFKA_AUTO_OFFSET_RESET: earliest
-      # When behind nginx at https://alfie.iti.gr/dw/ set ROOT_PATH=/dw so /docs loads OpenAPI spec correctly
-      ROOT_PATH: ""
     depends_on:
       mongodb:
         condition: service_started

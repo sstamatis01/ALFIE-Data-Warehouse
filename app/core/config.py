@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # API Configuration
     api_host: str = "0.0.0.0"
     api_port: int = 8000
-    root_path: str = ""  # Set to "/dw" when behind nginx at https://alfie.iti.gr/dw/
+    root_path: str = ""  # When behind nginx at e.g. https://alfie.iti.gr/autodw/ set ROOT_PATH=/autodw in .env
     secret_key: str = "your-secret-key-change-this-in-production"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
