@@ -23,18 +23,21 @@ import pandas as pd
 from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
 from scipy.stats import skew, ks_2samp
 from imblearn.over_sampling import SMOTE
+from sklearn.utils.multiclass import type_of_target
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger("kafka_consumer_example")
 
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "alfie.iti.gr:9092")
 KAFKA_BIAS_TRIGGER_TOPIC = os.getenv("KAFKA_BIAS_TRIGGER_TOPIC", "bias-detection-trigger-events")
 KAFKA_BIAS_TRIGGER_CONSUMER_GROUP = os.getenv("KAFKA_BIAS_TRIGGER_CONSUMER_GROUP", "bias-trigger-consumer")
 KAFKA_BIAS_TOPIC = os.getenv("KAFKA_BIAS_TOPIC", "bias-detection-complete-events")
 
-# Use Docker service name if KAFKA_BOOTSTRAP_SERVERS points to kafka:29092, otherwise use localhost
+# Use Docker service name if KAFKA_BOOTSTRAP_SERVERS points to kafka:29092; use deployment API when alfie.iti.gr
 if "kafka:" in KAFKA_BOOTSTRAP_SERVERS:
     API_BASE = os.getenv("API_BASE", "http://api:8000")
+elif "alfie.iti.gr" in KAFKA_BOOTSTRAP_SERVERS:
+    API_BASE = os.getenv("API_BASE", "https://alfie.iti.gr/autodw")
 else:
     API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
@@ -94,14 +97,36 @@ def upload_mitigated_dataset_folder(
 ) -> dict:
     """
     Upload a mitigated dataset that has train/test/drift splits as a single new version (folder zip).
+    Aligns columns across all three splits so they have identical structure (required for ML and for
+    consumers that expect consistent train/test/drift CSVs). Missing columns in a split are filled with 0.
     Returns the API response including the new version.
     """
     from io import BytesIO
     import zipfile
 
+    # Align columns: use union of all columns, same order as train; fill missing in test/drift with 0
+    all_cols = list(df_train.columns)
+    for df in (df_test, df_drift):
+        for c in df.columns:
+            if c not in all_cols:
+                all_cols.append(c)
+    # Ensure train has all cols (already does), then test and drift
+    def align_to_columns(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+        out = df.copy()
+        for c in columns:
+            if c not in out.columns:
+                out[c] = 0
+        return out[columns]
+
+    df_train_a = align_to_columns(df_train, all_cols)
+    df_test_a = align_to_columns(df_test, all_cols)
+    df_drift_a = align_to_columns(df_drift, all_cols)
+    if len(all_cols) != len(df_train.columns) or len(all_cols) != len(df_test.columns) or len(all_cols) != len(df_drift.columns):
+        logger.info(f"Aligned train/test/drift to common columns: {len(all_cols)} columns (train had {len(df_train.columns)}, test {len(df_test.columns)}, drift {len(df_drift.columns)})")
+
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for name, df in [("train/" + csv_filename, df_train), ("test/" + csv_filename, df_test), ("drift/" + csv_filename, df_drift)]:
+        for name, df in [("train/" + csv_filename, df_train_a), ("test/" + csv_filename, df_test_a), ("drift/" + csv_filename, df_drift_a)]:
             bio = BytesIO()
             df.to_csv(bio, index=False)
             z.writestr(name, bio.getvalue())
@@ -230,49 +255,38 @@ async def send_bias_complete_event(
 
 
 def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
-    # Build a report like the provided example structure
+    """Build bias/EDA report (target_column, shape, summary stats, missing, duplicates, correlation, distribution, outliers, drift)."""
     report: dict = {}
     try:
         if df is not None:
-            # 1. Basic info
-            report["shape"] = [int(df.shape[0]), int(df.shape[1])]  # JSON-friendly
+            report["target_column"] = meta.get("target_column_name")
+            report["shape"] = [int(df.shape[0]), int(df.shape[1])]
             report["columns"] = list(df.columns.astype(str))
             report["dtypes"] = {col: str(dtype) for col, dtype in df.dtypes.items()}
-            # Memory in MB
             mem_bytes = df.memory_usage(deep=True).sum()
             report["memory_usage_MB"] = float(mem_bytes / (1024 * 1024))
-            # 2. Summary statistics for numeric columns
             try:
                 desc = df.describe(percentiles=[0.25, 0.5, 0.75], include=["number"]).to_dict()
-                # Ensure JSON-friendly floats
-                clean_desc: dict = {}
+                clean_desc = {}
                 for col, stats in desc.items():
                     clean_desc[col] = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in stats.items()}
                 report["summary_statistics"] = clean_desc
             except Exception:
                 report["summary_statistics"] = {}
-            # 3. Missing Values
             missing = df.isnull().sum()
-            missing_percent = (missing / len(df)) * 100
             report["missing_values"] = {
-                col: {"count": int(missing[col]), "percent": float(missing_percent[col])}
+                col: {"count": int(missing[col]), "percent": float(missing[col]) / len(df)}
                 for col in df.columns if missing[col] > 0
             }
-            # 4. Unique values
-            report['unique_values'] = {col: df[col].nunique() for col in df.columns}
-            # 5. Duplicate Rows
+            report["unique_values"] = {col: int(df[col].nunique()) for col in df.columns}
             duplicates = df[df.duplicated()]
-            report['duplicate_rows_count'] = duplicates.shape[0]
-            report['sample_duplicate_rows'] = duplicates.head().to_dict(orient='records')
-            # 6. Correlation Matrix (Only numerical)
+            report["duplicate_rows_count"] = int(duplicates.shape[0])
+            report["sample_duplicate_rows"] = duplicates.head().to_dict(orient="records")
             numeric_cols = df.select_dtypes(include=[np.number]).columns
             if len(numeric_cols) > 0:
-                # Select numeric columns from DataFrame and compute correlation
-                numeric_df = df[numeric_cols]
-                report['correlation_matrix'] = numeric_df.corr(method="pearson").round(3).to_dict()
+                report["correlation_matrix"] = df[numeric_cols].corr(method="pearson").round(3).to_dict()
             else:
-                report['correlation_matrix'] = {}
-            # 7. Distribution Stats
+                report["correlation_matrix"] = {}
             distribution_stats = {}
             for col in numeric_cols:
                 series = df[col].dropna()
@@ -284,15 +298,13 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
                         "min": float(series.min()) if not np.isnan(series.min()) else None,
                         "max": float(series.max()) if not np.isnan(series.max()) else None,
                         "skew": float(series.skew()) if not np.isnan(series.skew()) else None,
-                        "kurtosis": float(series.kurt()) if not np.isnan(series.kurt()) else None
+                        "kurtosis": float(series.kurt()) if not np.isnan(series.kurt()) else None,
                     }
-            report['distribution_statistics'] = distribution_stats
-            # 8. Categorical value count (top5)
-            cat_cols = df.select_dtypes(include='object')
-            report['categorical_value_counts'] = {
+            report["distribution_statistics"] = distribution_stats
+            cat_cols = df.select_dtypes(include="object")
+            report["categorical_value_counts"] = {
                 col: df[col].value_counts(dropna=False).head(5).to_dict() for col in cat_cols.columns
             }
-            # 9. Outlier Detection (IQR)
             outlier_summary = {}
             for col in numeric_cols:
                 try:
@@ -304,190 +316,227 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
                     outliers = df[(df[col] < lower) | (df[col] > upper)]
                     outlier_summary[col] = {
                         "count": int(outliers.shape[0]),
-                        "percent": float((outliers.shape[0] / df.shape[0]) * 100)
+                        "percent": float((outliers.shape[0] / df.shape[0]) * 100),
                     }
                 except Exception:
                     outlier_summary[col] = {"count": 0, "percent": 0.0}
-            report['outlier_detection'] = outlier_summary
-            # 10. Data Drift
+            report["outlier_detection"] = outlier_summary
             try:
                 from river import drift
-                # Simple drift detection on first numeric column if available
                 if len(numeric_cols) > 0:
                     first_col = numeric_cols[0]
                     series = df[first_col].dropna()
-                    ddm = drift.dummy.DummyDriftDetector(t_0=min(1000, len(series)//2), seed=42)
-                    drifts = {
-                        "index": [],
-                        "value": [],
-                        "column_analyzed": first_col
-                    }
-                    
-                    # Iterate over the numeric values
-                    for i, val in enumerate(series.iloc[:min(1000, len(series))]):  # Limit to first 1000 values
+                    ddm = drift.dummy.DummyDriftDetector(t_0=min(1000, len(series) // 2), seed=42)
+                    drifts = {"index": [], "value": [], "column_analyzed": first_col}
+                    for i, val in enumerate(series.iloc[: min(1000, len(series))]):
                         if not np.isnan(val):
                             ddm.update(float(val))
                             if ddm.drift_detected:
                                 drifts["index"].append(int(i))
                                 drifts["value"].append(float(val))
-                    
-                    report['data_drift'] = drifts
+                    report["data_drift"] = drifts
                 else:
-                    report['data_drift'] = {"message": "No numeric columns available for drift detection"}
-                    
+                    report["data_drift"] = {"message": "No numeric columns available for drift detection"}
             except ImportError:
                 logger.warning("River library not available, skipping drift detection")
-                report['data_drift'] = {"message": "River library not installed, drift detection skipped"}
+                report["data_drift"] = {"message": "River library not installed, drift detection skipped"}
             except Exception as e:
                 logger.warning(f"Error in drift detection: {e}")
-                report['data_drift'] = {"message": f"Drift detection failed: {str(e)}"}
-
+                report["data_drift"] = {"message": f"Drift detection failed: {str(e)}"}
             logger.info("Bias report generation complete")
         else:
-            # Fallback if we couldn't parse with pandas
             report["shape"] = [int(meta.get("row_count", 0)), len(meta.get("columns", []) or [])]
             report["columns"] = meta.get("columns", []) or []
             report["dtypes"] = meta.get("data_types", {}) or {}
             report["memory_usage_MB"] = None
             report["summary_statistics"] = {}
+            report["target_column"] = meta.get("target_column_name")
+            report["duplicate_rows_count"] = 0
     except Exception as e:
         logger.warning(f"Failed to build bias report: {e}")
-    
-    # Clean the report to ensure JSON serialization compatibility
+
     return clean_for_json(report)
 
 
 def preprocess_data(df: pd.DataFrame, eda_results: dict):
     """
-    Apply bias mitigation transformations to the dataset
-    
-    Returns:
-        tuple: (transformed_dataframe, transformation_log)
+    Mitigation pipeline: fill missing, drop duplicates, encode categoricals (skip target),
+    task inference + target encoding, skew correction, SMOTE (classification, imbalance gate), drift mitigation.
+    Returns (transformed_dataframe, transformation_log).
     """
     df_cleaned = df.copy()
+    target_column = eda_results.get("target_column")
     transformation_log = []
     try:
-        # 1. Fill missing values
-        for col in eda_results.get("columns", df_cleaned.columns):
-            if col in df_cleaned.columns and df_cleaned[col].isnull().sum() > 0:
-                method = 'median' if df_cleaned[col].dtype in [np.float64, np.int64] else 'mode'
+        for col in eda_results.get("columns", list(df_cleaned.columns)):
+            if col not in df_cleaned.columns:
+                continue
+            if df_cleaned[col].isnull().sum() > 0:
+                method = "median" if df_cleaned[col].dtype in [np.float64, np.int64] else "mode"
                 original_null_count = int(df_cleaned[col].isnull().sum())
-                fill_value = df_cleaned[col].median() if method == 'median' else df_cleaned[col].mode().iloc[0] if len(df_cleaned[col].mode()) > 0 else None
+                fill_value = df_cleaned[col].median() if method == "median" else df_cleaned[col].mode().iloc[0] if len(df_cleaned[col].mode()) > 0 else None
                 if fill_value is not None:
                     df_cleaned[col] = df_cleaned[col].fillna(fill_value)
                     transformation_log.append({
-                        'column': col,
-                        'transformation': 'missing_value_fill',
-                        'method': method,
-                        'original_missing_values': f"{original_null_count} missing",
-                        'modified_value': str(fill_value)
+                        "column": col,
+                        "transformation": "missing_value_fill",
+                        "method": method,
+                        "original_missing_values": f"{original_null_count} missing",
+                        "modified_value": str(fill_value),
                     })
-
-        # 2. Remove duplicates
-        if eda_results.get('duplicate_rows_count', 0) > 0:
+        duplicate_count = eda_results.get("duplicate_rows_count", 0)
+        if duplicate_count > 0:
             original_count = len(df_cleaned)
             df_cleaned = df_cleaned.drop_duplicates()
             removed_count = original_count - len(df_cleaned)
             if removed_count > 0:
                 transformation_log.append({
-                    'column': 'all',
-                    'transformation': 'duplicate_removal',
-                    'method': 'drop_duplicates',
-                    'original_value': f"{eda_results['duplicate_rows_count']} duplicates",
-                    'modified_value': f"{removed_count} duplicates removed"
+                    "column": "all",
+                    "transformation": "duplicate_removal",
+                    "method": "drop_duplicates",
+                    "original_value": f"{duplicate_count} duplicates",
+                    "modified_value": f"{removed_count} duplicates removed",
                 })
-
-        # 3. Encode categorical features
-        cat_cols = df_cleaned.select_dtypes(include='object').columns
+        cat_cols = df_cleaned.select_dtypes(include="object").columns
         for col in cat_cols:
-            unique_vals = df_cleaned[col].nunique()
+            if col == target_column:
+                continue
+            unique_vals = df_cleaned[col].nunique(dropna=True)
             if unique_vals <= 10:
                 dummies = pd.get_dummies(df_cleaned[col], prefix=col)
                 df_cleaned = pd.concat([df_cleaned.drop(columns=col), dummies], axis=1)
                 transformation_log.append({
-                    'column': col,
-                    'transformation': 'encoding',
-                    'method': 'one-hot',
-                    'original_value': unique_vals,
-                    'modified_value': f"{dummies.shape[1]} binary columns"
+                    "column": col,
+                    "transformation": "encoding",
+                    "method": "one-hot",
+                    "original_value": int(unique_vals),
+                    "modified_value": f"{dummies.shape[1]} binary columns",
                 })
             else:
                 le = LabelEncoder()
                 df_cleaned[col] = le.fit_transform(df_cleaned[col].astype(str))
                 transformation_log.append({
-                    'column': col,
-                    'transformation': 'encoding',
-                    'method': 'label_encoding',
-                    'original_value': unique_vals,
-                    'modified_value': f"integers from 0 to {unique_vals - 1}"
+                    "column": col,
+                    "transformation": "encoding",
+                    "method": "label_encoding",
+                    "original_value": int(unique_vals),
+                    "modified_value": f"integers from 0 to {unique_vals - 1}",
                 })
-
-        # 4. Handle skewed features
-        numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns
+        task_type = "unknown"
+        y = None
+        y_type = None
+        if target_column is not None and target_column in df_cleaned.columns:
+            y = df_cleaned[target_column]
+            if pd.api.types.is_object_dtype(y) or pd.api.types.is_categorical_dtype(y):
+                le_y = LabelEncoder()
+                df_cleaned[target_column] = le_y.fit_transform(y.astype(str))
+                y = df_cleaned[target_column]
+                transformation_log.append({
+                    "column": target_column,
+                    "transformation": "target_encoding",
+                    "method": "label_encoding",
+                    "original_value": "object/categorical labels",
+                    "modified_value": f"integers from 0 to {int(pd.Series(y).nunique()) - 1}",
+                })
+            y_type = type_of_target(y)
+            if y_type in {"binary", "multiclass"}:
+                task_type = "classification"
+            elif y_type == "continuous":
+                task_type = "regression"
+            else:
+                task_type = "other"
+        transformation_log.append({
+            "column": target_column if target_column else "unknown",
+            "transformation": "task_inference",
+            "method": "type_of_target",
+            "original_value": str(y_type),
+            "modified_value": task_type,
+        })
+        numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns.tolist()
         for col in numeric_cols:
+            series = df_cleaned[col].dropna()
+            if series.empty:
+                continue
             col_skew = skew(df_cleaned[col].dropna())
             if abs(col_skew) > 0.75:
-                original_skew = col_skew
+                original_skew = float(col_skew)
                 if (df_cleaned[col] > 0).all():
-                    transformer = PowerTransformer(method='yeo-johnson')
+                    transformer = PowerTransformer(method="yeo-johnson")
                     df_cleaned[col] = transformer.fit_transform(df_cleaned[[col]])
-                    method = 'yeo-johnson'
+                    method = "yeo-johnson"
                 else:
                     scaler = StandardScaler()
                     df_cleaned[col] = scaler.fit_transform(df_cleaned[[col]])
-                    method = 'standard_scaler'
-                new_skew = skew(df_cleaned[col])
+                    method = "standard_scaler"
+                new_skew = float(skew(df_cleaned[col].dropna()))
                 transformation_log.append({
-                    'column': col,
-                    'transformation': 'skew_correction',
-                    'method': method,
-                    'original_value': round(original_skew, 3),
-                    'modified_value': round(new_skew, 3)
+                    "column": col,
+                    "transformation": "skew_correction",
+                    "method": method,
+                    "original_value": round(original_skew, 3),
+                    "modified_value": round(new_skew, 3),
                 })
-
-        # 5. Oversampling for target if detected
-        target_col = None
-        for col, stats in eda_results.get("distribution_statistics", {}).items():
-            if abs(stats.get("skew", 0)) > 0.75 and col in df_cleaned.columns:
-                target_col = col
-                break
-
-        if target_col and df_cleaned[target_col].nunique() == 2:
-            X = df_cleaned.drop(columns=[target_col])
-            y = df_cleaned[target_col]
-            smote = SMOTE(random_state=42)
-            X_resampled, y_resampled = smote.fit_resample(X, y)
-            transformation_log.append({
-                'column': target_col,
-                'transformation': 'oversampling',
-                'method': 'SMOTE',
-                'original_value': df_cleaned[target_col].value_counts().to_dict(),
-                'modified_value': pd.Series(y_resampled).value_counts().to_dict()
-            })
-            df_cleaned = pd.concat([pd.DataFrame(X_resampled, columns=X.columns), pd.Series(y_resampled, name=target_col)], axis=1)
-
-        # 6. Data drift detection and mitigation
-        numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
-            series = df_cleaned[col].dropna()
-            if len(series) > 0:
-                reference = np.random.normal(loc=series.mean(), scale=series.std(), size=min(series.shape[0], 1000))
-                ks_stat, p_value = ks_2samp(series.iloc[:min(1000, len(series))], reference)
-                if p_value < 0.01:
-                    original_mean = series.mean()
-                    scaler = StandardScaler()
-                    df_cleaned[col] = scaler.fit_transform(df_cleaned[[col]])
-                    modified_mean = df_cleaned[col].mean()
+        if task_type == "classification" and target_column is not None:
+            X = df_cleaned.drop(columns=[target_column])
+            y = df_cleaned[target_column]
+            if type_of_target(y) in {"binary", "multiclass"}:
+                vc = y.value_counts()
+                imbalance_ratio = vc.min() / vc.max() if vc.max() > 0 else 1.0
+                if imbalance_ratio < 0.5 and vc.min() >= 2:
+                    smote = SMOTE(random_state=42)
+                    X_resampled, y_resampled = smote.fit_resample(X, y)
                     transformation_log.append({
-                        'column': col,
-                        'transformation': 'drift_mitigation',
-                        'method': 'standard_scaler',
-                        'original_value': round(original_mean, 3),
-                        'modified_value': round(modified_mean, 3)
+                        "column": target_column,
+                        "transformation": "oversampling",
+                        "method": "SMOTE",
+                        "original_value": vc.to_dict(),
+                        "modified_value": pd.Series(y_resampled).value_counts().to_dict(),
                     })
+                    df_cleaned = pd.concat(
+                        [pd.DataFrame(X_resampled, columns=X.columns), pd.Series(y_resampled, name=target_column)],
+                        axis=1,
+                    )
+                else:
+                    transformation_log.append({
+                        "column": target_column,
+                        "transformation": "oversampling_skipped",
+                        "method": "SMOTE",
+                        "original_value": vc.to_dict(),
+                        "modified_value": f"Skipped (imbalance_ratio={imbalance_ratio:.3f}, min_class={int(vc.min())})",
+                    })
+            else:
+                transformation_log.append({
+                    "column": target_column,
+                    "transformation": "oversampling_skipped",
+                    "method": "SMOTE",
+                    "original_value": str(type_of_target(y)),
+                    "modified_value": "Skipped (target not discrete classification labels)",
+                })
+        for col in numeric_cols:
+            if col not in df_cleaned.columns:
+                continue
+            series = df_cleaned[col].dropna()
+            if series.empty:
+                continue
+            std = float(series.std())
+            if std == 0 or np.isnan(std):
+                continue
+            reference = np.random.normal(loc=float(series.mean()), scale=std, size=series.shape[0])
+            ks_stat, p_value = ks_2samp(series, reference)
+            if p_value < 0.01:
+                original_mean = float(series.mean())
+                scaler = StandardScaler()
+                df_cleaned[col] = scaler.fit_transform(df_cleaned[[col]])
+                modified_mean = float(df_cleaned[col].mean())
+                transformation_log.append({
+                    "column": col,
+                    "transformation": "drift_mitigation",
+                    "method": "standard_scaler",
+                    "original_value": round(original_mean, 3),
+                    "modified_value": round(modified_mean, 3),
+                })
     except Exception as e:
-        logger.warning(f"Error in preprocessing: {e}")
-    
+        logger.warning(f"Preprocess/mitigation failed: {e}")
     return df_cleaned, transformation_log
 
 
@@ -622,8 +671,9 @@ async def run_consumer() -> None:
                     except Exception as e:
                         logger.warning(f"Could not load dataset as CSV or zip: {e}; proceeding with raw bytes")
 
-                # Build bias report (profile) per the corrected example
-                bias_report = build_bias_report(df, meta) if df is not None else {}
+                # Build bias report (profile); include target_column_name in meta so report has target_column for mitigation
+                meta_for_report = {**meta, "target_column_name": target_column_name}
+                bias_report = build_bias_report(df, meta_for_report) if df is not None else {}
 
                 # POST bias report to API WITHOUT task_id initially (so no event is sent)
                 # We'll send the event manually after mitigation completes

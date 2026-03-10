@@ -10,7 +10,7 @@ When an XAI trigger event is received, this consumer should:
 - Upload the reports to the Data Warehouse (which triggers xai-events)
 
 Usage:
-  KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
+  KAFKA_BOOTSTRAP_SERVERS=alfie.iti.gr:9092 \
   KAFKA_XAI_TRIGGER_TOPIC=xai-trigger-events \
   KAFKA_CONSUMER_GROUP=xai-consumer \
   python kafka_xai_consumer_example.py
@@ -45,7 +45,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("kafka_xai_consumer")
 
 # Configuration
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "alfie.iti.gr:9092")
 KAFKA_XAI_TRIGGER_TOPIC = os.getenv("KAFKA_XAI_TRIGGER_TOPIC", "xai-trigger-events")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "xai-consumer")
 
@@ -67,31 +67,71 @@ def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -
     return r.json()
 
 
+def is_zip_bytes(data: bytes) -> bool:
+    """Return True if data looks like a ZIP file (e.g. v3 folder dataset)."""
+    return len(data) >= 4 and data[:4] == b'PK\x03\x04'
+
+
+def _pick_best_csv_for_xai(extracted_files: list) -> Optional[str]:
+    """
+    From a list of extracted file paths, pick the best single CSV for XAI (model/data interpretability).
+    Prefers train/data.csv (v3 mitigated split), then any data.csv, then largest CSV by size.
+    """
+    csv_files = [p for p in extracted_files if p.lower().endswith('.csv')]
+    if not csv_files:
+        return None
+    # Prefer path containing 'train' and basename 'data.csv' (v3 folder structure)
+    for p in csv_files:
+        if os.path.basename(p).lower() == 'data.csv' and 'train' in p.replace('\\', '/').lower():
+            return p
+    for p in csv_files:
+        if os.path.basename(p).lower() == 'data.csv':
+            return p
+    # Else largest by file size
+    return max(csv_files, key=lambda p: os.path.getsize(p))
+
+
 def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
     """
-    Try to read CSV with multiple encodings
+    Try to read CSV with multiple encodings and robust parsing.
 
-    Handles files with different encodings:
-    - utf-8: Standard
-    - latin-1 (ISO-8859-1): Western European
-    - cp1252 (Windows-1252): Windows default
-    - utf-16: Some Excel exports
+    Handles:
+    - Different encodings (utf-8, latin-1, cp1252, etc.)
+    - Malformed or inconsistent CSV (uses Python engine when C engine fails)
+    - Buffer overflow / tokenizing errors (skips bad lines if needed)
     """
     from io import BytesIO
     encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1', 'utf-16']
 
+    # Python engine avoids C parser buffer overflow; on_bad_lines for pandas >= 1.3
+    try:
+        pd.read_csv(BytesIO(b'a,b\n1,2'), engine='python', on_bad_lines='warn')
+        kwargs_robust = {'engine': 'python', 'on_bad_lines': 'warn'}
+    except TypeError:
+        kwargs_robust = {'engine': 'python', 'error_bad_lines': False, 'warn_bad_lines': True}
+
     for encoding in encodings:
         try:
-            df = pd.read_csv(BytesIO(file_data), encoding=encoding)
+            df = pd.read_csv(BytesIO(file_data), encoding=encoding, engine='python')
             logger.info(f"Successfully read CSV with encoding: {encoding}")
             return df
-        except (UnicodeDecodeError, Exception):
+        except (UnicodeDecodeError, pd.errors.ParserError, Exception):
             continue
 
-    # If all encodings fail, try with error handling
+    # Try with lenient parsing (skip bad lines) to handle buffer overflow / malformed input
+    for encoding in encodings:
+        try:
+            df = pd.read_csv(BytesIO(file_data), encoding=encoding, **kwargs_robust)
+            logger.warning(f"Read CSV with encoding={encoding} and lenient parsing (some rows may be skipped)")
+            return df
+        except Exception:
+            continue
+
+    # Last resort: decode with errors=ignore and use Python engine
     try:
-        df = pd.read_csv(BytesIO(file_data), encoding='utf-8', encoding_errors='ignore')
-        logger.warning("Read CSV with 'ignore' errors - some characters may be missing")
+        text = file_data.decode('utf-8', errors='ignore')
+        df = pd.read_csv(BytesIO(text.encode('utf-8')), encoding='utf-8', **kwargs_robust)
+        logger.warning("Read CSV with utf-8 (ignore errors) and lenient parsing")
         return df
     except Exception as e:
         logger.error(f"Failed to read CSV with all encodings: {e}")
@@ -571,10 +611,16 @@ async def process_xai_trigger(event: dict) -> None:
             dataset_bytes = download_dataset_file(user_id, dataset_id, dataset_version)
             logger.info(f"Dataset downloaded: {len(dataset_bytes)} bytes")
 
-            # Handle dataset based on type
+            # Handle dataset based on type (v3 mitigated is a ZIP with train/test/drift; event may say single file)
             dataset_extracted_files = []
             if is_folder:
                 logger.info("Extracting folder dataset...")
+                dataset_extracted_files = extract_dataset_folder(dataset_bytes, f"temp_xai_dataset_{dataset_id}")
+                logger.info(f"Extracted {len(dataset_extracted_files)} dataset files:")
+                for file_path in dataset_extracted_files:
+                    logger.info(f"  - {file_path}")
+            elif is_zip_bytes(dataset_bytes):
+                logger.info("Dataset is ZIP but event had is_folder=False; extracting as folder (e.g. v3 train/test/drift)")
                 dataset_extracted_files = extract_dataset_folder(dataset_bytes, f"temp_xai_dataset_{dataset_id}")
                 logger.info(f"Extracted {len(dataset_extracted_files)} dataset files:")
                 for file_path in dataset_extracted_files:
@@ -630,12 +676,20 @@ async def process_xai_trigger(event: dict) -> None:
             os.makedirs(model_analysis_dir, exist_ok=True)
 
             # Copy extracted files to analysis directories
-            if is_folder:
-                logger.info(f"Copying {len(dataset_extracted_files)} dataset files to analysis directory")
-                for file_path in dataset_extracted_files:
-                    filename = os.path.basename(file_path)
+            if is_folder or dataset_extracted_files:
+                logger.info(f"Using extracted dataset files ({len(dataset_extracted_files)} total)")
+                best_csv = _pick_best_csv_for_xai(dataset_extracted_files)
+                if best_csv:
                     import shutil
-                    shutil.copy2(file_path, os.path.join(data_analysis_dir, filename))
+                    dest = os.path.join(data_analysis_dir, 'dataset.csv')
+                    shutil.copy2(best_csv, dest)
+                    logger.info(f"Copied chosen CSV to {dest} (source: {best_csv})")
+                else:
+                    # Fallback: copy all by basename (may overwrite; last wins)
+                    import shutil
+                    for file_path in dataset_extracted_files:
+                        filename = os.path.basename(file_path)
+                        shutil.copy2(file_path, os.path.join(data_analysis_dir, filename))
             else:
                 # Handle single dataset file
                 logger.info("Processing single dataset file")

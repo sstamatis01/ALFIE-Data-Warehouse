@@ -22,6 +22,7 @@ import pandas as pd
 from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
 from scipy.stats import skew, ks_2samp
 from imblearn.over_sampling import SMOTE
+from sklearn.utils.multiclass import type_of_target
 
 from app.services.transformation_report_service import transformation_report_service
 
@@ -70,6 +71,7 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
     try:
         if df is not None:
             # 1. Basic info
+            report["target_column"] = meta.get("target_column_name")
             report["shape"] = [int(df.shape[0]), int(df.shape[1])]  # JSON-friendly
             report["columns"] = list(df.columns.astype(str))
             report["dtypes"] = {col: str(dtype) for col, dtype in df.dtypes.items()}
@@ -171,11 +173,14 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
 
 def preprocess_data(df: pd.DataFrame, eda_results: dict):
     df_cleaned = df.copy()
+    target_column = eda_results.get("target_column")
     transformation_log = []
     try:
         # 1. Fill missing values
         # for col in df_cleaned.columns:
-        for col in eda_results["columns"]:
+        for col in eda_results.get("columns", df_cleaned.columns):
+            if col not in df_cleaned.columns:
+                continue
             if df_cleaned[col].isnull().sum() > 0:
                 method = 'median' if df_cleaned[col].dtype in [np.float64, np.int64] else 'mode'
                 original_null_count = int(df_cleaned[col].isnull().sum())
@@ -203,7 +208,10 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
         # 3. Encode categorical features
         cat_cols = df_cleaned.select_dtypes(include='object').columns
         for col in cat_cols:
-            unique_vals = df_cleaned[col].nunique()
+            if col == target_column:
+                # Keep classification labels as-is for now; optionally label-encode below after task inference
+                continue
+            unique_vals = df_cleaned[col].nunique(dropna=True)
             if unique_vals <= 10:
                 dummies = pd.get_dummies(df_cleaned[col], prefix=col)
                 df_cleaned = pd.concat([df_cleaned.drop(columns=col), dummies], axis=1)
@@ -216,21 +224,65 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
                 })
             else:
                 le = LabelEncoder()
-                df_cleaned[col] = le.fit_transform(df_cleaned[col])
+                df_cleaned[col] = le.fit_transform(df_cleaned[col].astype(str))
                 transformation_log.append({
                     'column': col,
                     'transformation': 'encoding',
                     'method': 'label_encoding',
-                    'original_value': unique_vals,
+                    'original_value': int(unique_vals),
                     'modified_value': f"integers from 0 to {unique_vals - 1}"
                 })
 
-        # 4. Handle skewed features
-        numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns
+        # Infer task type (classification vs regression) if target exists
+        task_type = "unknown"
+        y = None
+        y_type = None
+
+        if target_column is not None and target_column in df_cleaned.columns:
+            y = df_cleaned[target_column]
+
+            # If target is object/categorical, label-encode so type_of_target works cleanly
+            if pd.api.types.is_object_dtype(y) or pd.api.types.is_categorical_dtype(y):
+                le_y = LabelEncoder()
+                df_cleaned[target_column] = le_y.fit_transform(y.astype(str))
+                y = df_cleaned[target_column]
+                transformation_log.append({
+                    "column": target_column,
+                    "transformation": "target_encoding",
+                    "method": "label_encoding",
+                    "original_value": "object/categorical labels",
+                    "modified_value": f"integers from 0 to {int(pd.Series(y).nunique()) - 1}"
+                })
+
+            y_type = type_of_target(y)
+
+            if y_type in {"binary", "multiclass"}:
+                task_type = "classification"
+            elif y_type == "continuous":
+                task_type = "regression"
+            else:
+                # multilabel, continuous-multioutput, etc.
+                task_type = "other"
+
+        transformation_log.append({
+            "column": target_column if target_column else "unknown",
+            "transformation": "task_inference",
+            "method": "type_of_target",
+            "original_value": str(y_type),
+            "modified_value": task_type
+        })
+
+
+        # 4. Handle skewed features (EXCLUDE target)
+        numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns.tolist()
+        feature_numeric_cols = [c for c in numeric_cols if c != target_column]
         for col in numeric_cols:
+            series = df_cleaned[col].dropna()
+            if series.empty:
+                continue
             col_skew = skew(df_cleaned[col].dropna())
             if abs(col_skew) > 0.75:
-                original_skew = col_skew
+                original_skew = float(col_skew)
                 if (df_cleaned[col] > 0).all():
                     transformer = PowerTransformer(method='yeo-johnson')
                     df_cleaned[col] = transformer.fit_transform(df_cleaned[[col]])
@@ -239,7 +291,7 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
                     scaler = StandardScaler()
                     df_cleaned[col] = scaler.fit_transform(df_cleaned[[col]])
                     method = 'standard_scaler'
-                new_skew = skew(df_cleaned[col])
+                new_skew = float(skew(df_cleaned[col].dropna()))
                 transformation_log.append({
                     'column': col,
                     'transformation': 'skew_correction',
@@ -248,43 +300,77 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
                     'modified_value': round(new_skew, 3)
                 })
 
-        # 5. Oversampling for target if detected
-        target_col = None
-        for col, stats in eda_results.get("distribution_statistics", {}).items():
-            if abs(stats.get("skew", 0)) > 0.75 and col in df_cleaned.columns:
-                target_col = col
-                break
+        # 5. Oversampling for target if detected (Classification-only)
+        if task_type == "classification" and target_column is not None:
+            X = df_cleaned.drop(columns=[target_column])
+            y = df_cleaned[target_column]
 
-        if target_col and df_cleaned[target_col].nunique() == 2:
-            X = df_cleaned.drop(columns=[target_col])
-            y = df_cleaned[target_col]
-            smote = SMOTE()
-            X_resampled, y_resampled = smote.fit_resample(X, y)
-            transformation_log.append({
-                'column': target_col,
-                'transformation': 'oversampling',
-                'method': 'SMOTE',
-                'original_value': df_cleaned[target_col].value_counts().to_dict(),
-                'modified_value': pd.Series(y_resampled).value_counts().to_dict()
-            })
-            df_cleaned = pd.concat([pd.DataFrame(X_resampled, columns=X.columns), pd.Series(y_resampled, name=target_col)], axis=1)
+            # Only apply SMOTE for discrete class targets
+            if type_of_target(y) in {"binary", "multiclass"}:
+                vc = y.value_counts()
+                # Optional imbalance gate: only if minority class is meaningfully smaller
+                imbalance_ratio = vc.min() / vc.max() if vc.max() > 0 else 1.0
+
+                if imbalance_ratio < 0.5 and vc.min() >= 2:
+                    smote = SMOTE()
+                    X_resampled, y_resampled = smote.fit_resample(X, y)
+
+                    transformation_log.append({
+                        "column": target_column,
+                        "transformation": "oversampling",
+                        "method": "SMOTE",
+                        "original_value": vc.to_dict(),
+                        "modified_value": pd.Series(y_resampled).value_counts().to_dict()
+                    })
+
+                    df_cleaned = pd.concat(
+                        [pd.DataFrame(X_resampled, columns=X.columns),
+                         pd.Series(y_resampled, name=target_column)],
+                        axis=1
+                    )
+                else:
+                    transformation_log.append({
+                        "column": target_column,
+                        "transformation": "oversampling_skipped",
+                        "method": "SMOTE",
+                        "original_value": vc.to_dict(),
+                        "modified_value": f"Skipped (imbalance_ratio={imbalance_ratio:.3f}, min_class={int(vc.min())})"
+                    })
+            else:
+                transformation_log.append({
+                    "column": target_column,
+                    "transformation": "oversampling_skipped",
+                    "method": "SMOTE",
+                    "original_value": str(type_of_target(y)),
+                    "modified_value": "Skipped (target not discrete classification labels)"
+                })
 
         # 6. Data drift detection and mitigation
         for col in numeric_cols:
             series = df_cleaned[col].dropna()
-            reference = np.random.normal(loc=series.mean(), scale=series.std(), size=series.shape[0])
+            if series.empty:
+                continue
+
+            # Guard against std=0
+            std = float(series.std())
+            if std == 0 or np.isnan(std):
+                continue
+
+            reference = np.random.normal(loc=float(series.mean()), scale=std, size=series.shape[0])
             ks_stat, p_value = ks_2samp(series, reference)
+
             if p_value < 0.01:
-                original_mean = series.mean()
+                original_mean = float(series.mean())
                 scaler = StandardScaler()
                 df_cleaned[col] = scaler.fit_transform(df_cleaned[[col]])
-                modified_mean = df_cleaned[col].mean()
+                modified_mean = float(df_cleaned[col].mean())
+
                 transformation_log.append({
-                    'column': col,
-                    'transformation': 'drift_mitigation',
-                    'method': 'standard_scaler',
-                    'original_value': round(original_mean, 3),
-                    'modified_value': round(modified_mean, 3)
+                    "column": col,
+                    "transformation": "drift_mitigation",
+                    "method": "standard_scaler",
+                    "original_value": round(original_mean, 3),
+                    "modified_value": round(modified_mean, 3)
                 })
     except Exception as e:
         logger.warning(f"Failed to build bias report: {e}")

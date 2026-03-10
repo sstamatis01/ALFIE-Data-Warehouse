@@ -28,7 +28,7 @@ from io import BytesIO
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger("agentic_core")
 
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "alfie.iti.gr:9092")
 KAFKA_DATASET_TOPIC = os.getenv("KAFKA_DATASET_TOPIC", "dataset-events")
 KAFKA_BIAS_TOPIC = os.getenv("KAFKA_BIAS_TOPIC", "bias-detection-complete-events")
 KAFKA_AUTOML_TOPIC = os.getenv("KAFKA_AUTOML_TOPIC", "automl-complete-events")

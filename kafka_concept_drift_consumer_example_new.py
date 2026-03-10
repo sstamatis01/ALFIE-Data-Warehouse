@@ -5,38 +5,25 @@ Kafka Consumer for Concept Drift Trigger Events
 Listens to concept-drift-trigger-events. On trigger:
 - Downloads the drift split of the dataset (15%) from the Data Warehouse
 - Downloads the trained model (from AutoML) from the Data Warehouse
-- Optionally induces synthetic drift on the drift split (for testing)
 - Runs concept drift detection (ADWIN) and adaptive retraining (AutoGluon)
-  - Supports both classification and regression (problem type from predictor or heuristic)
-  - Drift signal: 0/1 error for classification, absolute error for regression
 - If drift is detected: retrains, uploads the new model to the Data Warehouse, sends concept-drift-complete with new model version
 - If no drift is detected: skips upload and sends concept-drift-complete with success and message "No concept drift detected"
 
 Requires: river, autogluon.tabular, pandas, requests, aiokafka.
-Optional (needed when AutoGluon loads a FastAI model): ipython (fastai/fastprogress imports IPython.display).
 Dataset must have train/test/drift split (use split=drift when downloading).
 """
 
 import os
 import io
 import shutil
-import sys
 import time
 import asyncio
 import json
 import logging
-import pathlib
 import tempfile
 import zipfile
 from datetime import datetime, timezone
 from collections import deque
-
-# Allow loading models trained on Linux (PosixPath) when running on Windows, and vice versa.
-# AutoGluon/torch pickle can contain pathlib paths from the training OS.
-if sys.platform == "win32":
-    pathlib.PosixPath = pathlib.WindowsPath
-else:
-    pathlib.WindowsPath = pathlib.PosixPath
 
 # Required by AutoGluon during TabularPredictor.load; provided by setuptools (in requirements.txt / Dockerfile).
 try:
@@ -139,10 +126,10 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
     """
     Monitor for concept drift using ADWIN and retrain an AutoGluon model on a sliding window.
 
-    Supports BOTH classification and regression by:
+    It supports BOTH classification and regression by:
       - Detecting problem type from the loaded AutoGluon predictor when possible (predictor.problem_type)
       - Falling back to a simple heuristic on the target column
-      - Using appropriate drift signal + metrics (0/1 error for classification, absolute error for regression)
+      - Using appropriate drift signal + metrics
       - Using correct prediction method (labels vs continuous)
     """
     import time
@@ -161,11 +148,15 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
     # 1) Detect problem type
     # --------------------------
     def infer_problem_type(df_: pd.DataFrame, target: str, pred) -> str:
+        # Prefer AutoGluon's own declared type
         pt = getattr(pred, "problem_type", None)
         if isinstance(pt, str) and pt:
-            return pt
+            return pt  # "binary", "multiclass", "regression", "quantile", "softclass", etc.
+
+        # Fallback heuristic
         y = df_[target]
         if pd.api.types.is_numeric_dtype(y):
+            # If few unique values relative to size, treat as classification
             nunique = y.nunique(dropna=True)
             n = len(y)
             if nunique <= 20 or (n > 0 and (nunique / n) < 0.05):
@@ -185,6 +176,13 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
         retrain_path,
     )
 
+    # --------------------------
+    # 2) Drift detector
+    # --------------------------
+    # ADWIN needs a 1D stream; use:
+    #  - classification: 0/1 error
+    #  - regression: absolute error (non-negative continuous)
+
     adwin = ADWIN(delta=0.01, clock=1)
     window_rows = deque(maxlen=window_size)
     events = []
@@ -193,25 +191,37 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
     window_y_pred = deque(maxlen=window_size)
     total_retrain_time = 0.0
     start_time = __import__("time").time()
-    log_interval = max(1, n_rows // 10)
+    log_interval = max(1, n_rows // 10)  # log progress ~10 times over the run
 
+    # --------------------------
+    # 3) Prediction helper
+    # --------------------------
     def predict_one(predictor_: TabularPredictor, row_: pd.Series):
-        X = pd.DataFrame([row_[feature_cols].to_dict()])
+        X = pd.DataFrame([row_[feature_cols].to_dict()])  # 1-row frame
         if is_regression:
+            # continuous predictions
             return predictor_.predict(X).iloc[0]
         else:
+            # class label predictions (NOT probabilities)
             return predictor_.predict(X).iloc[0]
 
+    # --------------------------
+    # 4) Main monitoring loop
+    # --------------------------
     for i, row in df.iterrows():
         y_true = row[target_col]
         y_pred = predict_one(predictor, row)
 
+        # Drift signal
         if is_regression:
+            # absolute error (continuous)
             try:
                 error = float(abs(y_pred - y_true))
             except Exception:
+                # if types mismatch, coerce numeric best-effort
                 error = float(abs(float(y_pred) - float(y_true)))
         else:
+            # 0/1 error
             error = 0.0 if y_pred == y_true else 1.0
 
         y_true_all.append(y_true)
@@ -243,10 +253,12 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
             )
             window_df = pd.DataFrame(list(window_rows))
             retrain_start = __import__("time").time()
+            # Keep the same problem type if we know it
             fit_kwargs = {}
             if is_regression:
                 fit_kwargs["problem_type"] = "regression"
             else:
+                # If predictor.problem_type is "binary" keep it, else multiclass
                 if str(problem_type).lower() == "binary":
                     fit_kwargs["problem_type"] = "binary"
                 else:
@@ -256,6 +268,7 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
             retrain_time = __import__("time").time() - retrain_start
             total_retrain_time += retrain_time
             events.append({"index": i, "window_size": len(window_rows), "elapsed_seconds": elapsed, "retrain_time_seconds": retrain_time})
+            # Confirm that fit() wrote to retrain_path (and list contents)
             try:
                 contents = []
                 for _root, _dirs, files in os.walk(retrain_path):
@@ -265,13 +278,14 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
                 logger.warning("[Drift] Could not list retrain_path after fit: %s", e)
 
     drift_log = pd.DataFrame(events)
+    # Summary: whether any retrain happened (if not, retrain_path stays empty and upload will fail)
     n_drifts = len(events)
     total_count = len(y_true_all)
     correct_count = sum(1 for a, b in zip(y_true_all, y_pred_all) if a == b)
     try:
         retrain_files = []
         for root, _d, files in os.walk(retrain_path):
-            retrain_files.extend((os.path.join(root, f) for f in files))
+            retrain_files.extend(os.path.join(root, f) for f in files)
         logger.info(
             "[Drift] Monitoring complete. Drifts detected=%d, total retrain_time=%.2fs, retrain_path has %d files",
             n_drifts,
@@ -286,7 +300,11 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
     except Exception as e:
         logger.warning("[Drift] Could not list retrain_path at end: %s", e)
 
+    # --------------------------
+    # 5) Compute correct metrics
+    # --------------------------
     if not y_true_all:
+        # no samples
         if is_regression:
             metrics = {
                 "problem_type": "regression",
@@ -314,6 +332,7 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
         return predictor, drift_log, metrics
 
     if is_regression:
+        # Coerce numeric arrays
         y_true_arr = np.asarray(pd.to_numeric(pd.Series(y_true_all), errors="coerce"))
         y_pred_arr = np.asarray(pd.to_numeric(pd.Series(y_pred_all), errors="coerce"))
 
@@ -342,34 +361,76 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
         }
 
     else:
+        # Classification problem
         y_true_ser = pd.Series(y_true_all)
         y_pred_ser = pd.Series(y_pred_all)
 
+        # If AutoGluon says regression, don't run classification metrics
         pred_problem_type = str(getattr(predictor, "problem_type", "")).lower()
         if "regress" in pred_problem_type:
             raise ValueError(
-                f"Predictor is '{pred_problem_type}' (regression) but computing classification metrics. "
-                "Fix problem-type detection or force problem_type when fitting."
+                f"Your predictor is '{pred_problem_type}' (regression), but you are computing classification metrics. "
+                "Fix your problem-type detection or force problem_type when fitting."
             )
 
+        # ---- Coerce y_true to discrete labels (string-safe) ----
+        # (This also helps if y_true is a mix of ints/strings.)
+        y_true_labels = y_true_ser.astype("string")
+
+        # ---- If predictions look continuous, map them to nearest known class ----
+        # Detect "continuous-like" predictions:
+        pred_is_numeric = pd.api.types.is_numeric_dtype(y_pred_ser)
+        pred_is_floaty = pred_is_numeric and (not pd.api.types.is_integer_dtype(y_pred_ser))
+
+        if pred_is_floaty:
+            # Try to map to nearest numeric class if classes are numeric-like
+            # Get unique true classes (drop NA)
+            true_classes = pd.Series(y_true_ser.dropna().unique())
+
+            # Try numeric mapping first
+            true_classes_num = pd.to_numeric(true_classes, errors="coerce")
+            if true_classes_num.notna().all():
+                # Numeric classes (e.g., 0/1/2/3). Map each prediction to nearest class value.
+                class_vals = np.sort(true_classes_num.to_numpy(dtype=float))
+
+                pred_vals = pd.to_numeric(y_pred_ser, errors="coerce").to_numpy(dtype=float)
+                # For each pred, choose nearest class
+                nearest = class_vals[np.abs(pred_vals[:, None] - class_vals[None, :]).argmin(axis=1)]
+                y_pred_labels = pd.Series(nearest).astype("Int64").astype("string")
+                y_true_labels = pd.to_numeric(y_true_ser, errors="coerce").astype("Int64").astype("string")
+            else:
+                # Non-numeric classes but float predictions -> last-resort discretization
+                # (Often means you trained regression by accident.)
+                y_pred_labels = y_pred_ser.round().astype("Int64").astype("string")
+        else:
+            # Already discrete-ish: cast to string labels
+            y_pred_labels = y_pred_ser.astype("string")
+
+        # Now compute metrics safely on label strings
         def coerce_classification_labels(y_true_ser: pd.Series, y_pred_ser: pd.Series):
+            # cast true labels to strings for safety
             y_true_labels = y_true_ser.astype("string")
+
             pred_is_numeric = pd.api.types.is_numeric_dtype(y_pred_ser)
             pred_is_floaty = pred_is_numeric and (not pd.api.types.is_integer_dtype(y_pred_ser))
 
             if pred_is_floaty:
                 true_classes = pd.Series(y_true_ser.dropna().unique())
                 true_classes_num = pd.to_numeric(true_classes, errors="coerce")
+
                 if true_classes_num.notna().all():
                     class_vals = np.sort(true_classes_num.to_numpy(dtype=float))
                     pred_vals = pd.to_numeric(y_pred_ser, errors="coerce").to_numpy(dtype=float)
+
                     nearest = class_vals[np.abs(pred_vals[:, None] - class_vals[None, :]).argmin(axis=1)]
                     y_pred_labels = pd.Series(nearest).astype("Int64").astype("string")
                     y_true_labels = pd.to_numeric(y_true_ser, errors="coerce").astype("Int64").astype("string")
                 else:
+                    # last resort
                     y_pred_labels = y_pred_ser.round().astype("Int64").astype("string")
             else:
                 y_pred_labels = y_pred_ser.astype("string")
+
             return y_true_labels, y_pred_labels
 
         y_true_labels, y_pred_labels = coerce_classification_labels(y_true_ser, y_pred_ser)
@@ -377,7 +438,9 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
         f1 = f1_score(y_true_labels, y_pred_labels, average="weighted")
         precision = precision_score(y_true_labels, y_pred_labels, average="weighted", zero_division=0)
         recall = recall_score(y_true_labels, y_pred_labels, average="weighted", zero_division=0)
+        #cumulative_accuracy = float((y_true_labels == y_pred_labels).mean())
 
+        # window accuracy
         if window_y_true:
             wy_true = pd.Series(list(window_y_true))
             wy_pred = pd.Series(list(window_y_pred))
@@ -388,7 +451,7 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
 
         metrics = {
             "problem_type": "classification",
-            "cumulative_accuracy": correct_count / total_count if total_count else float("nan"),
+            "cumulative_accuracy": correct_count / total_count if total_count else float("nan"), #cumulative_accuracy
             "final_accuracy": final_accuracy,
             "final_window_accuracy": final_window_accuracy,
             "f1_score": f1,
@@ -403,10 +466,7 @@ def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_p
 
 
 def drift_induction(data, drift_strength=0.1, random_state=None, target_col=None):
-    """
-    Induce synthetic drift in numeric columns (for testing). Optionally exclude target column.
-    Supports DataFrame or numpy array.
-    """
+    print("Drift induction in process...")
     if random_state is not None:
         np.random.seed(random_state)
 
@@ -428,25 +488,34 @@ def drift_induction(data, drift_strength=0.1, random_state=None, target_col=None
             if start >= n_samples:
                 break
             end = (i + 1) * segment_size if i < 9 else n_samples
+
             drift_factor = (i + 1) * drift_strength
+
+            # ✅ use iloc for row slicing by position
             seg = drifted_df.iloc[start:end][num_cols].to_numpy(dtype=float)
+
             noise = np.random.normal(0, drift_factor, seg.shape)
+
+            # ✅ write back with iloc as well
             drifted_df.iloc[start:end, drifted_df.columns.get_indexer(num_cols)] = seg + noise
 
         return drifted_df
 
+    # numpy array case
     data_array = np.array(data, copy=True)
     if not np.issubdtype(data_array.dtype, np.number):
         raise TypeError("NumPy input must be numeric to apply drift.")
 
     n_samples = data_array.shape[0]
     segment_size = n_samples // 10 if n_samples >= 10 else n_samples
+
     drifted_data = data_array.copy()
     for i in range(10):
         start = i * segment_size
         if start >= n_samples:
             break
         end = (i + 1) * segment_size if i < 9 else n_samples
+
         drift_factor = (i + 1) * drift_strength
         segment = drifted_data[start:end]
         noise = np.random.normal(0, drift_factor, segment.shape)
@@ -668,14 +737,7 @@ async def _send_complete(
             payload["output"]["drift_metrics"] = drift_metrics
         payload["failure"] = None
     else:
-        # Include context so orchestrators can still proceed to XAI / next step
-        payload["output"] = {
-            "user_id": user_id,
-            "dataset_id": dataset_id,
-            "model_id": model_id,
-            "model_version": model_version,
-            "dataset_version": dataset_version,
-        }
+        payload["output"] = None
         payload["failure"] = {"error_type": "ConceptDriftError", "error_message": error_message or "Concept drift failed"}
     await producer.send_and_wait(KAFKA_DRIFT_COMPLETE_TOPIC, value=payload, key=task_id)
     logger.info(f"Sent concept-drift-complete task_id={task_id} success={success}")

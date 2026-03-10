@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("kafka_automl_consumer")
 
 # Configuration
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "alfie.iti.gr:9092")
 KAFKA_AUTOML_TRIGGER_TOPIC = os.getenv("KAFKA_AUTOML_TRIGGER_TOPIC", "automl-trigger-events")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "automl-consumer")
 
@@ -51,7 +51,7 @@ def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -
 def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
     """
     Try to read CSV with multiple encodings
-    
+
     Handles files with different encodings:
     - utf-8: Standard
     - latin-1 (ISO-8859-1): Western European
@@ -60,7 +60,7 @@ def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
     """
     from io import BytesIO
     encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1', 'utf-16']
-    
+
     for encoding in encodings:
         try:
             df = pd.read_csv(BytesIO(file_data), encoding=encoding)
@@ -68,7 +68,7 @@ def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
             return df
         except (UnicodeDecodeError, Exception):
             continue
-    
+
     # If all encodings fail, try with error handling
     try:
         df = pd.read_csv(BytesIO(file_data), encoding='utf-8', encoding_errors='ignore')
@@ -93,31 +93,31 @@ def download_dataset_file(user_id: str, dataset_id: str, version: str = None) ->
 def extract_dataset_folder(zip_bytes: bytes, extract_to: str = "temp_dataset") -> list:
     """
     Extract ZIP file containing dataset folder
-    
+
     Returns:
         List of extracted file paths
     """
     import zipfile
     from io import BytesIO
-    
+
     # Create extraction directory
     os.makedirs(extract_to, exist_ok=True)
-    
+
     # Extract ZIP
     with zipfile.ZipFile(BytesIO(zip_bytes), 'r') as zip_ref:
         zip_ref.extractall(extract_to)
-    
+
     # List extracted files
     extracted_files = []
     for root, dirs, files in os.walk(extract_to):
         for file in files:
             file_path = os.path.join(root, file)
             extracted_files.append(file_path)
-    
+
     return extracted_files
 
 
-def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_path: str, 
+def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_path: str,
                        model_type: str, framework: str = "sklearn", accuracy: float = None,
                        dataset_version: str = None, task_id: str | None = None) -> dict:
     """
@@ -126,14 +126,14 @@ def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_
     Version is auto-incremented by the DW
     """
     url = f"{API_BASE}/ai-models/upload/single/{user_id}"
-    
+
     # Include dataset version in description for data lineage tracking
     description = f"AutoML trained model for {model_type}"
     if dataset_version:
         description += f" (trained on dataset {dataset_id} version {dataset_version})"
     else:
         description += f" (trained on dataset {dataset_id})"
-    
+
     with open(model_file_path, 'rb') as f:
         files = {'file': (os.path.basename(model_file_path), f)}
         data = {
@@ -145,7 +145,7 @@ def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_
             'training_dataset': dataset_id,  # Link to dataset
             'training_accuracy': accuracy,
         }
-        
+
         headers = {"X-Task-ID": task_id} if task_id else None
         r = requests.post(url, files=files, data=data, headers=headers, timeout=120)
         r.raise_for_status()
@@ -155,7 +155,7 @@ def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_
 async def process_automl_trigger(event: dict) -> None:
     """
     Process an AutoML trigger event from Agentic Core
-    
+
     Simplified event structure:
     {
         "task_id": "automl_task_<...>",
@@ -179,39 +179,39 @@ async def process_automl_trigger(event: dict) -> None:
         target_column = input_obj.get("target_column_name")
         task_type = input_obj.get("task_type")
         time_budget = event.get("time_budget", "10")
-        
+
         if not user_id or not dataset_id:
             logger.warning("Missing user_id or dataset_id in event; skipping")
             return
-        
+
         logger.info(f"Processing AutoML trigger for dataset {dataset_id} version {dataset_version}")
         logger.info(f"  User: {user_id}")
         logger.info(f"  Target column: {target_column}")
         logger.info(f"  Task type: {task_type}")
         logger.info(f"  Time budget: {time_budget} minutes")
-        
+
         # Step 1: Fetch dataset metadata and download file
         try:
             metadata = fetch_dataset_metadata(user_id, dataset_id, dataset_version)
-            
+
             # Simplified schema doesn't include these; default values
             is_folder = False
             file_count = 1
-            
+
             logger.info(f"Dataset type: {'FOLDER' if is_folder else 'SINGLE FILE'}")
             if is_folder:
                 logger.info(f"File count: {file_count}")
-            
+
             file_bytes = download_dataset_file(user_id, dataset_id, dataset_version)
             logger.info(f"Dataset downloaded: {len(file_bytes)} bytes")
         except Exception as e:
             logger.error(f"Failed to fetch dataset: {e}")
             return
-        
+
         # Step 2: Load dataset into pandas
         df = None
         extracted_files = []
-        
+
         try:
             if is_folder:
                 # Handle folder dataset - extract ZIP
@@ -220,7 +220,7 @@ async def process_automl_trigger(event: dict) -> None:
                 logger.info(f"Extracted {len(extracted_files)} files:")
                 for file_path in extracted_files:
                     logger.info(f"  - {file_path}")
-                
+
                 # TODO: Process multiple files for AutoML training
                 # For now, find and load a CSV file
                 csv_files = [f for f in extracted_files if f.endswith('.csv')]
@@ -237,33 +237,33 @@ async def process_automl_trigger(event: dict) -> None:
                 # Handle single file dataset
                 df = read_csv_with_encoding(file_bytes)
                 logger.info(f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns")
-                
+
         except Exception as e:
             logger.error(f"Failed to parse dataset: {e}")
             return
-        
+
         # Step 3: Identify the problem and train model
         # TODO: Replace this with actual AutoML training logic
         # For now, we'll use a dummy model.pkl file for testing
-        
+
         logger.info("=" * 80)
         logger.info("Training model (using dummy model.pkl for testing)")
         logger.info(f"  - Target column: {target_column}")
         logger.info(f"  - Task type: {task_type}")
         logger.info(f"  - Dataset shape: {df.shape}")
         logger.info("=" * 80)
-        
+
         # Generate model ID
         model_id = f"automl_{dataset_id}_{int(datetime.now(timezone.utc).timestamp())}"
-        
+
         # Use dummy model.pkl file for testing
         dummy_model_path = "model.pkl"
-        
+
         if not os.path.exists(dummy_model_path):
             logger.warning(f"Dummy model file not found: {dummy_model_path}")
             logger.info("Skipping model upload - create a dummy model.pkl file in the root directory to test")
             return
-        
+
         # Upload the trained model to DW
         try:
             logger.info(f"Uploading model to DW: {model_id}")
@@ -285,9 +285,9 @@ async def process_automl_trigger(event: dict) -> None:
         except Exception as e:
             logger.error(f"Failed to upload model to DW: {e}", exc_info=True)
             return
-        
+
         logger.info(f"AutoML processing completed for dataset {dataset_id}")
-        
+
     except Exception as e:
         logger.error(f"Error processing AutoML trigger event: {e}", exc_info=True)
 
@@ -311,23 +311,23 @@ async def run_consumer() -> None:
     logger.info("Waiting for AutoML trigger events from Agentic Core...")
 
     await consumer.start()
-    
+
     try:
         async for msg in consumer:
             key = msg.key
             value = msg.value
-            
+
             logger.info("=" * 80)
             logger.info("AutoML Trigger Message received")
             logger.info(f"  Partition={msg.partition} Offset={msg.offset}")
             logger.info(f"  Key={key}")
             logger.info(f"  Event={json.dumps(value, indent=2)}")
             logger.info("=" * 80)
-            
+
             # Process the AutoML trigger event
             # The process_automl_trigger function extracts input data from the event
             await process_automl_trigger(value)
-    
+
     finally:
         await consumer.stop()
         logger.info("AutoML Trigger consumer stopped")
