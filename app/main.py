@@ -109,6 +109,7 @@ inner_app = FastAPI(
     version="1.0.0",
     docs_url=None,
     redoc_url=None,
+    openapi_url=None,  # we serve openapi.json via custom route so we can inject "servers" for proxy
 )
 # Root app: serve the same API at / (direct :8000) and at /autodw (behind proxy at https://alfie.iti.gr/autodw).
 # When the proxy forwards e.g. https://alfie.iti.gr/autodw/health to backend:8000/autodw/health,
@@ -129,6 +130,26 @@ def _openapi_url_for_request(request: Request) -> str:
     if prefix and from_proxy:
         return f"{prefix}/openapi.json"
     return "/openapi.json"
+
+
+def _openapi_schema_with_servers(request: Request) -> dict:
+    """Return OpenAPI schema; when behind proxy, add servers so Swagger UI calls /autodw/... not /..."""
+    schema = inner_app.openapi()
+    prefix = request.headers.get("X-Forwarded-Prefix", "").strip().rstrip("/")
+    from_proxy = any(request.headers.get(h) for h in ("X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host"))
+    if prefix and from_proxy:
+        proto = request.headers.get("X-Forwarded-Proto", "https")
+        host = request.headers.get("X-Forwarded-Host", request.headers.get("Host", ""))
+        base = f"{proto}://{host}{prefix}"
+        schema["servers"] = [{"url": base}]
+    return schema
+
+
+@inner_app.get("/openapi.json", include_in_schema=False)
+async def custom_openapi_json(request: Request):
+    """Serve OpenAPI schema with correct servers when behind proxy (so Try it out uses /autodw/...)."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse(content=_openapi_schema_with_servers(request))
 
 
 @inner_app.get("/docs", include_in_schema=False)
