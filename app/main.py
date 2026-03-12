@@ -73,8 +73,8 @@ async def lifespan(app: FastAPI):
     await close_mongo_connection()
 
 
-# Create FastAPI application
-app = FastAPI(
+# Create FastAPI application (inner app: all routes; mounted at / and /autodw by root_app below)
+inner_app = FastAPI(
     title="Data Warehouse API",
     description="""
     A comprehensive Data Warehouse API for storing and managing both structured and unstructured data.
@@ -107,10 +107,15 @@ app = FastAPI(
     - Repository management for semantic knowledge graphs
     """,
     version="1.0.0",
-    lifespan=lifespan,
     docs_url=None,
     redoc_url=None,
 )
+# Root app: serve the same API at / (direct :8000) and at /autodw (behind proxy at https://alfie.iti.gr/autodw).
+# When the proxy forwards e.g. https://alfie.iti.gr/autodw/health to backend:8000/autodw/health,
+# the mount strips the prefix and the sub-app receives /health. Lifespan runs on root so startup/shutdown run once.
+root_app = FastAPI(title="Data Warehouse API (root)", lifespan=lifespan, docs_url=None, redoc_url=None)
+root_app.mount("/autodw", inner_app)
+root_app.mount("/", inner_app)
 # Custom docs: use X-Forwarded-Prefix only when request came through a proxy (other X-Forwarded-* set), else /openapi.json for direct :8000 access
 def _openapi_url_for_request(request: Request) -> str:
     prefix = request.headers.get("X-Forwarded-Prefix", "").strip().rstrip("/")
@@ -120,26 +125,26 @@ def _openapi_url_for_request(request: Request) -> str:
     return "/openapi.json"
 
 
-@app.get("/docs", include_in_schema=False)
+@inner_app.get("/docs", include_in_schema=False)
 async def swagger_ui_html(request: Request):
     openapi_url = _openapi_url_for_request(request)
     return get_swagger_ui_html(
         openapi_url=openapi_url,
-        title=app.title + " - Swagger UI",
+        title=inner_app.title + " - Swagger UI",
     )
 
 
-@app.get("/redoc", include_in_schema=False)
+@inner_app.get("/redoc", include_in_schema=False)
 async def redoc_html(request: Request):
     from fastapi.openapi.docs import get_redoc_html
     openapi_url = _openapi_url_for_request(request)
     return get_redoc_html(
         openapi_url=openapi_url,
-        title=app.title + " - ReDoc",
+        title=inner_app.title + " - ReDoc",
     )
 
-# Add CORS middleware
-app.add_middleware(
+# Add CORS middleware to inner app
+inner_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # In production, specify allowed origins
     allow_credentials=True,
@@ -147,20 +152,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
-app.include_router(datasets.router)
-app.include_router(users.router)
-app.include_router(bias_reports.router)
-app.include_router(transformation_reports.router)
-app.include_router(ai_models.router)
-app.include_router(xai_reports.router)
-app.include_router(etd_hub.router)
-app.include_router(etd_hub_import.router)
-app.include_router(graphdb.router)
-app.include_router(user_files.router)
+# Include routers on inner app
+inner_app.include_router(datasets.router)
+inner_app.include_router(users.router)
+inner_app.include_router(bias_reports.router)
+inner_app.include_router(transformation_reports.router)
+inner_app.include_router(ai_models.router)
+inner_app.include_router(xai_reports.router)
+inner_app.include_router(etd_hub.router)
+inner_app.include_router(etd_hub_import.router)
+inner_app.include_router(graphdb.router)
+inner_app.include_router(user_files.router)
 
 
-@app.get("/")
+@inner_app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
@@ -171,7 +176,7 @@ async def root():
     }
 
 
-@app.get("/health")
+@inner_app.get("/health")
 async def health_check():
     """Health check endpoint"""
     try:
@@ -187,6 +192,10 @@ async def health_check():
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Service unhealthy: {str(e)}")
+
+
+# Export for uvicorn: root app so both / and /autodw work
+app = root_app
 
 
 if __name__ == "__main__":
