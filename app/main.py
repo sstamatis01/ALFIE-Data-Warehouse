@@ -113,7 +113,13 @@ inner_app = FastAPI(
 # Root app: serve the same API at / (direct :8000) and at /autodw (behind proxy at https://alfie.iti.gr/autodw).
 # When the proxy forwards e.g. https://alfie.iti.gr/autodw/health to backend:8000/autodw/health,
 # the mount strips the prefix and the sub-app receives /health. Lifespan runs on root so startup/shutdown run once.
-root_app = FastAPI(title="Data Warehouse API (root)", lifespan=lifespan, docs_url=None, redoc_url=None)
+root_app = FastAPI(
+    title="Data Warehouse API (root)",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,  # no openapi on root so /openapi.json is served by mounted inner_app (avoids empty spec when proxy strips prefix)
+)
 root_app.mount("/autodw", inner_app)
 root_app.mount("/", inner_app)
 # Custom docs: use X-Forwarded-Prefix only when request came through a proxy (other X-Forwarded-* set), else /openapi.json for direct :8000 access
