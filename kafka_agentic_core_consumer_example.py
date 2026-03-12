@@ -37,7 +37,13 @@ KAFKA_BIAS_TRIGGER_TOPIC = os.getenv("KAFKA_BIAS_TRIGGER_TOPIC", "bias-detection
 KAFKA_AUTOML_TRIGGER_TOPIC = os.getenv("KAFKA_AUTOML_TRIGGER_TOPIC", "automl-trigger-events")
 KAFKA_XAI_TRIGGER_TOPIC = os.getenv("KAFKA_XAI_TRIGGER_TOPIC", "xai-trigger-events")
 
-API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+# Default API_BASE based on where Kafka is (deployment vs local).
+if os.getenv("API_BASE"):
+    API_BASE = os.getenv("API_BASE")
+elif "alfie.iti.gr" in KAFKA_BOOTSTRAP_SERVERS:
+    API_BASE = "https://alfie.iti.gr/autodw"
+else:
+    API_BASE = "http://localhost:8000"
 
 
 def fetch_dataset_metadata(user_id: str, dataset_id: str) -> dict:

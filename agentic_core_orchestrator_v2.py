@@ -60,7 +60,13 @@ KAFKA_AUTOML_TOPIC = os.getenv("KAFKA_AUTOML_TOPIC", "automl-complete-events")
 KAFKA_CONCEPT_DRIFT_TOPIC = os.getenv("KAFKA_CONCEPT_DRIFT_TOPIC", "concept-drift-complete-events")
 KAFKA_XAI_TOPIC = os.getenv("KAFKA_XAI_TOPIC", "xai-complete-events")
 
-API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+# Default API_BASE based on where Kafka is (deployment vs local).
+if os.getenv("API_BASE"):
+    API_BASE = os.getenv("API_BASE")
+elif "alfie.iti.gr" in KAFKA_BOOTSTRAP_SERVERS:
+    API_BASE = "https://alfie.iti.gr/autodw"
+else:
+    API_BASE = "http://localhost:8000"
 
 # In-memory task correlation: (user_id, dataset_id) -> task_ids and task config
 # Use _corr_key(user_id, dataset_id) so different users don't overwrite each other.

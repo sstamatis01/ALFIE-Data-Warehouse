@@ -34,7 +34,13 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "alfie.iti.gr:909
 KAFKA_XAI_TRIGGER_TOPIC = os.getenv("KAFKA_XAI_TRIGGER_TOPIC", "xai-trigger-events")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "xai-consumer")
 
-API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+# Default API_BASE based on where Kafka is (deployment vs local).
+if os.getenv("API_BASE"):
+    API_BASE = os.getenv("API_BASE")
+elif "alfie.iti.gr" in KAFKA_BOOTSTRAP_SERVERS:
+    API_BASE = "https://alfie.iti.gr/autodw"
+else:
+    API_BASE = "http://localhost:8000"
 
 
 def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -> dict:

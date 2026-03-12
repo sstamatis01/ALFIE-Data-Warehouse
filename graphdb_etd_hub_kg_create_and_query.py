@@ -19,7 +19,7 @@ except ImportError:
     print("This script requires the 'requests' library. Install with: pip install requests")
     sys.exit(1)
 
-API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+API_BASE = os.getenv("API_BASE", "https://alfie.iti.gr/autodw")
 REPO_NAME = "etd-hub-kg-test"
 CREATED_BY = os.getenv("CREATED_BY", "default")
 # Use graphdb:7200 so the API container (in Docker) can reach GraphDB; override if API runs elsewhere

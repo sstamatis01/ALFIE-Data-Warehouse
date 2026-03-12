@@ -55,7 +55,8 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      # PLAINTEXT_HOST must advertise the host external clients use (IP or hostname). Default alfie.iti.gr for production; set KAFKA_ADVERTISED_HOST=160.40.52.12 if you prefer IP.
+      # PLAINTEXT_HOST must advertise the host external clients use (IP or hostname).
+      # Deployment default is alfie.iti.gr; override with KAFKA_ADVERTISED_HOST=localhost for local testing.
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://${KAFKA_ADVERTISED_HOST:-alfie.iti.gr}:9092
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
