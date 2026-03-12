@@ -36,6 +36,9 @@ fi
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip setuptools wheel
 
+# Ensure setuptools is installed (needed for pkg_resources used by AutoGluon / concept drift consumer)
+pip install 'setuptools>=65.0.0'
+
 # Install requirements (heavy: torch, autogluon, etc.)
 if [[ -f "$REQUIREMENTS" ]]; then
     echo "Installing from requirements.txt (this may take several minutes) ..."

@@ -43,9 +43,9 @@ try:
     import pkg_resources  # noqa: F401
 except ModuleNotFoundError:
     raise RuntimeError(
-        "pkg_resources not found. Rebuild the Docker image so setuptools is installed: "
-        "requirements.txt includes setuptools>=65.0.0 and the Dockerfile reinstalls it after other deps. "
-        "Run: docker compose build --no-cache concept-drift-consumer"
+        "pkg_resources not found (setuptools). Install it and rerun:\n"
+        "  pip install 'setuptools>=65.0.0'\n"
+        "When running in Docker, rebuild the image: docker compose build --no-cache concept-drift-consumer"
     ) from None
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
