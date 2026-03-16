@@ -4,13 +4,20 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from contextlib import asynccontextmanager
 import logging
 
+try:
+    import logfire
+    LOGFIRE_AVAILABLE = True
+except ImportError:
+    LOGFIRE_AVAILABLE = False
+
 from .core.config import settings
 from .core.database import connect_to_mongo, close_mongo_connection
 from .services.file_service import file_service
 from .services.metadata_service import metadata_service
 from .services.kafka_service import kafka_producer_service
 from .services.bias_report_service import bias_report_service
-from .api import datasets, users, bias_reports, ai_models
+from .services.concept_drift_report_service import concept_drift_report_service
+from .api import datasets, users, bias_reports, concept_drift_reports, ai_models
 from .services.transformation_report_service import transformation_report_service
 from .api import transformation_reports
 from .services.ai_model_service import ai_model_service
@@ -42,6 +49,7 @@ async def lifespan(app: FastAPI):
         await file_service.initialize()
         await metadata_service.initialize()
         await bias_report_service.initialize()
+        await concept_drift_report_service.initialize()
         await transformation_report_service.initialize()
         await ai_model_service.initialize()
         await xai_report_service.initialize()
@@ -183,6 +191,7 @@ inner_app.add_middleware(
 inner_app.include_router(datasets.router)
 inner_app.include_router(users.router)
 inner_app.include_router(bias_reports.router)
+inner_app.include_router(concept_drift_reports.router)
 inner_app.include_router(transformation_reports.router)
 inner_app.include_router(ai_models.router)
 inner_app.include_router(xai_reports.router)
@@ -219,6 +228,19 @@ async def health_check():
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Service unhealthy: {str(e)}")
+
+
+# Optional Logfire telemetry: connect DW logs with Task Manager, orchestrator, UI (same project/trace context).
+# Set LOGFIRE_TOKEN in env to enable; without token nothing is sent (send_to_logfire='if-token-present').
+if LOGFIRE_AVAILABLE:
+    try:
+        logfire.configure(send_to_logfire="if-token-present")
+        logfire.instrument_fastapi(inner_app)
+        logger.info("Logfire FastAPI instrumentation enabled (telemetry sent when LOGFIRE_TOKEN is set)")
+    except Exception as e:
+        logger.warning("Logfire instrumentation skipped: %s", e)
+else:
+    logger.debug("Logfire not installed; run pip install 'logfire[fastapi]' to enable telemetry")
 
 
 # Export for uvicorn: root app so both / and /autodw work

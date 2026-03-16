@@ -9,8 +9,8 @@ Listens to concept-drift-trigger-events. On trigger:
 - Runs concept drift detection (ADWIN) and adaptive retraining (AutoGluon)
   - Supports both classification and regression (problem type from predictor or heuristic)
   - Drift signal: 0/1 error for classification, absolute error for regression
-- If drift is detected: retrains, uploads the new model to the Data Warehouse, sends concept-drift-complete with new model version
-- If no drift is detected: skips upload and sends concept-drift-complete with success and message "No concept drift detected"
+- If drift is detected: retrains, uploads the new model to the Data Warehouse, POSTs the concept drift report to the DW, sends concept-drift-complete with new model version
+- If no drift is detected: skips upload, POSTs the concept drift report to the DW, sends concept-drift-complete with success and message "No concept drift detected"
 
 Requires: river, autogluon.tabular, pandas, requests, aiokafka.
 Optional (needed when AutoGluon loads a FastAI model): ipython (fastai/fastprogress imports IPython.display).
@@ -476,6 +476,29 @@ def zip_dir(path: str) -> bytes:
     return buf.getvalue()
 
 
+def post_concept_drift_report(
+    user_id: str,
+    dataset_id: str,
+    dataset_version: str,
+    model_id: str,
+    model_version: str,
+    report: dict,
+) -> dict:
+    """POST concept drift report (JSON) to Data Warehouse. Does not send Kafka event (consumer sends that)."""
+    url = f"{API_BASE}/concept-drift-reports/"
+    payload = {
+        "user_id": user_id,
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+        "model_id": model_id,
+        "model_version": model_version,
+        "report": report,
+    }
+    r = requests.post(url, json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
 def upload_model_to_dw(
     user_id: str,
     model_id: str,
@@ -588,8 +611,20 @@ async def process_drift_trigger(event: dict, producer: AIOKafkaProducer) -> None
             n_drifts = metrics.get("total_drifts", 0)
 
             if n_drifts == 0:
-                # No drift detected: do not upload (retrain_path is empty). Send success with no new model.
+                # No drift detected: do not upload (retrain_path is empty). POST report to DW, then send success.
                 logger.info("[Drift] No concept drift detected; skipping model upload and sending success")
+                drift_report = {
+                    "drift_detected": False,
+                    "drift_metrics": metrics,
+                    "message": "No concept drift detected",
+                }
+                try:
+                    saved = post_concept_drift_report(
+                        user_id, dataset_id, dataset_version, model_id, model_version, drift_report
+                    )
+                    logger.info(f"Concept drift report saved (no drift): id={saved.get('id', '')}")
+                except Exception as e:
+                    logger.warning("Failed to POST concept drift report to DW: %s", e)
                 await _send_complete(
                     producer, task_id, user_id, model_id, model_version, dataset_id, dataset_version,
                     success=True, drift_metrics=metrics, drift_detected=False
@@ -622,6 +657,18 @@ async def process_drift_trigger(event: dict, producer: AIOKafkaProducer) -> None
         )
         new_version = new_metadata.get("version", "v2")
         logger.info(f"Uploaded retrained model version {new_version}")
+        drift_report = {
+            "drift_detected": True,
+            "drift_metrics": metrics,
+            "new_model_version": new_version,
+        }
+        try:
+            saved = post_concept_drift_report(
+                user_id, dataset_id, dataset_version, model_id, new_version, drift_report
+            )
+            logger.info(f"Concept drift report saved (drift detected): id={saved.get('id', '')}")
+        except Exception as e:
+            logger.warning("Failed to POST concept drift report to DW: %s", e)
         await _send_complete(
             producer, task_id, user_id, model_id, new_version, dataset_id, dataset_version,
             success=True, drift_metrics=metrics, drift_detected=True
