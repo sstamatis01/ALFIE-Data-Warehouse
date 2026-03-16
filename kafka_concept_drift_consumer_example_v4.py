@@ -5,47 +5,35 @@ Kafka Consumer for Concept Drift Trigger Events
 Listens to concept-drift-trigger-events. On trigger:
 - Downloads the drift split of the dataset (15%) from the Data Warehouse
 - Downloads the trained model (from AutoML) from the Data Warehouse
-- Optionally induces synthetic drift on the drift split (for testing)
 - Runs concept drift detection (ADWIN) and adaptive retraining (AutoGluon)
-  - Supports both classification and regression (problem type from predictor or heuristic)
-  - Drift signal: 0/1 error for classification, absolute error for regression
-- If drift is detected: retrains, uploads the new model to the Data Warehouse, POSTs the concept drift report to the DW, sends concept-drift-complete with new model version
-- If no drift is detected: skips upload, POSTs the concept drift report to the DW, sends concept-drift-complete with success and message "No concept drift detected"
+- If drift is detected: retrains, uploads the new model to the Data Warehouse, sends concept-drift-complete with new model version
+- If no drift is detected: skips upload and sends concept-drift-complete with success and message "No concept drift detected"
 
 Requires: river, autogluon.tabular, pandas, requests, aiokafka.
-Optional (needed when AutoGluon loads a FastAI model): ipython (fastai/fastprogress imports IPython.display).
 Dataset must have train/test/drift split (use split=drift when downloading).
 """
 
 import os
 import io
 import shutil
-import sys
 import time
+import uuid
 import asyncio
 import json
 import logging
-import pathlib
 import tempfile
 import zipfile
 from datetime import datetime, timezone
 from collections import deque
-
-# Allow loading models trained on Linux (PosixPath) when running on Windows, and vice versa.
-# AutoGluon/torch pickle can contain pathlib paths from the training OS.
-if sys.platform == "win32":
-    pathlib.PosixPath = pathlib.WindowsPath
-else:
-    pathlib.WindowsPath = pathlib.PosixPath
 
 # Required by AutoGluon during TabularPredictor.load; provided by setuptools (in requirements.txt / Dockerfile).
 try:
     import pkg_resources  # noqa: F401
 except ModuleNotFoundError:
     raise RuntimeError(
-        "pkg_resources not found (setuptools). Install it and rerun:\n"
-        "  pip install 'setuptools>=65.0.0'\n"
-        "When running in Docker, rebuild the image: docker compose build --no-cache concept-drift-consumer"
+        "pkg_resources not found. Rebuild the Docker image so setuptools is installed: "
+        "requirements.txt includes setuptools>=65.0.0 and the Dockerfile reinstalls it after other deps. "
+        "Run: docker compose build --no-cache concept-drift-consumer"
     ) from None
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -53,6 +41,14 @@ import numpy as np
 import requests
 import pandas as pd
 from dotenv import load_dotenv, find_dotenv
+from river.drift import ADWIN
+from autogluon.tabular import TabularPredictor
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    mean_absolute_error, mean_squared_error, r2_score
+)
+import matplotlib.pyplot as plt
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("kafka_concept_drift_consumer")
@@ -60,7 +56,7 @@ logger = logging.getLogger("kafka_concept_drift_consumer")
 load_dotenv(find_dotenv())
 
 # Kafka
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "alfie.iti.gr:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_DRIFT_TRIGGER_TOPIC = os.getenv("KAFKA_CONCEPT_DRIFT_TRIGGER_TOPIC", "concept-drift-trigger-events")
 KAFKA_DRIFT_COMPLETE_TOPIC = os.getenv("KAFKA_CONCEPT_DRIFT_COMPLETE_TOPIC", "concept-drift-complete-events")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONCEPT_DRIFT_CONSUMER_GROUP", "concept-drift-consumer")
@@ -135,21 +131,14 @@ def predict_autogluon(predictor, row, feature_cols):
     return predictor.predict(X).iloc[0]
 
 
-def monitor_drift_and_retrain(
-    df,
-    predictor,
-    feature_cols,
-    target_col,
-    retrain_path: str,
-    window_size: int = 150,
-    delta: float = 0.1,
-    clock: int = 1,
-    batch_predict_size: int = 512,
-    retrain_presets: str = "medium_quality_faster_train",
-    min_samples_before_detection: int = 50,
-    cooldown_samples: int = 50,
-    verbose: bool = True,
-):
+def monitor_drift_and_retrain(df, predictor, feature_cols, target_col, retrain_path: str, window_size: int = 150,
+    delta=0.1,
+    clock=1,
+    batch_predict_size=512,
+    retrain_presets="medium_quality_faster_train",
+    min_samples_before_detection=50,
+    cooldown_samples=50,
+    verbose=True):
     """
     Monitor drift with ADWIN and retrain AutoGluon on a sliding window.
 
@@ -158,19 +147,40 @@ def monitor_drift_and_retrain(
 
     Regression:
         ADWIN monitors absolute error
-    """
-    from river.drift import ADWIN
-    from autogluon.tabular import TabularPredictor
-    from sklearn.metrics import (
-        accuracy_score,
-        f1_score,
-        precision_score,
-        recall_score,
-        mean_absolute_error,
-        mean_squared_error,
-        r2_score,
-    )
 
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Drift stream data.
+    predictor : TabularPredictor
+        Already-trained AutoGluon predictor.
+    feature_cols : list[str]
+        Input feature columns.
+    target_col : str
+        Target column.
+    window_size : int
+        Number of recent rows used for retraining when drift is detected.
+    delta : float
+        ADWIN sensitivity parameter. Larger => easier to trigger.
+    clock : int
+        ADWIN check frequency. 1 = every sample.
+    batch_predict_size : int
+        Batch size for predictor.predict / predict_proba.
+    retrain_presets : str
+        AutoGluon presets used during retraining.
+    min_samples_before_detection : int
+        Ignore detections until at least this many samples have been processed.
+    cooldown_samples : int
+        After drift detection, ignore further detections for this many samples.
+    retrain_path : str
+        Root folder where retrained models are saved.
+    verbose : bool
+        Print diagnostics and drift events.
+    """
+
+    # --------------------------
+    # 1) Detect problem type
+    # --------------------------
     def infer_problem_type(df_: pd.DataFrame, target: str, pred) -> str:
         pt = getattr(pred, "problem_type", None)
         if isinstance(pt, str) and pt:
@@ -185,6 +195,7 @@ def monitor_drift_and_retrain(
             return "regression"
         return "multiclass"
 
+
     def normalize_label(v):
         if pd.isna(v):
             return "NA"
@@ -192,10 +203,12 @@ def monitor_drift_and_retrain(
             v = int(v)
         return str(v).strip()
 
+
     def coerce_classification_labels(y_true_ser, y_pred_ser):
         y_true_labels = y_true_ser.map(normalize_label)
         y_pred_labels = y_pred_ser.map(normalize_label)
         return y_true_labels, y_pred_labels
+
 
     if df is None or df.empty:
         raise ValueError("Input df is empty.")
@@ -208,9 +221,7 @@ def monitor_drift_and_retrain(
         raise ValueError(f"Target column '{target_col}' not found in df.")
 
     problem_type = infer_problem_type(df, target_col, predictor)
-    is_regression = (problem_type == "regression") or (
-        "regress" in str(problem_type).lower()
-    )
+    is_regression = (problem_type == "regression") or ("regress" in str(problem_type).lower())
 
     n_rows = len(df)
     logger.info(
@@ -221,6 +232,9 @@ def monitor_drift_and_retrain(
         retrain_path,
     )
 
+    # --------------------------
+    # 2) Drift detector
+    # --------------------------
     adwin = ADWIN(delta=delta, clock=clock)
     window_rows = deque(maxlen=window_size)
     events = []
@@ -230,10 +244,13 @@ def monitor_drift_and_retrain(
     window_y_pred = deque(maxlen=window_size)
     total_retrain_time = 0.0
     start_time = __import__("time").time()
-    log_interval = max(1, n_rows // 10)
+    log_interval = max(1, n_rows // 10)  # log progress ~10 times over the run
     samples_seen = 0
     cooldown_until = -1
 
+    # --------------------------
+    # 4) Main monitoring loop
+    # --------------------------
     for batch_start in range(0, n_rows, batch_predict_size):
         batch_end = min(batch_start + batch_predict_size, n_rows)
         batch_df = df.iloc[batch_start:batch_end].copy()
@@ -252,13 +269,12 @@ def monitor_drift_and_retrain(
             y_true = row[target_col]
             y_pred = batch_preds.iloc[offset]
 
+            # -------------------------
+            # Build monitored signal
+            # -------------------------
             if is_regression:
-                y_true_num = pd.to_numeric(
-                    pd.Series([y_true]), errors="coerce"
-                ).iloc[0]
-                y_pred_num = pd.to_numeric(
-                    pd.Series([y_pred]), errors="coerce"
-                ).iloc[0]
+                y_true_num = pd.to_numeric(pd.Series([y_true]), errors="coerce").iloc[0]
+                y_pred_num = pd.to_numeric(pd.Series([y_pred]), errors="coerce").iloc[0]
 
                 if pd.isna(y_true_num) or pd.isna(y_pred_num):
                     error = 0.0
@@ -276,8 +292,12 @@ def monitor_drift_and_retrain(
 
             error_stream.append(error)
 
+            # -------------------------
+            # Store for metrics/retrain
+            # -------------------------
             y_true_all.append(y_true)
             y_pred_all.append(y_pred)
+
             window_y_true.append(y_true)
             window_y_pred.append(y_pred)
             window_rows.append(row)
@@ -286,9 +306,7 @@ def monitor_drift_and_retrain(
             elapsed = __import__("time").time() - start_time
 
             if (i + 1) % log_interval == 0 or i == 0:
-                correct_so_far = sum(
-                    1 for a, b in zip(y_true_all, y_pred_all) if a == b
-                )
+                correct_so_far = sum(1 for a, b in zip(y_true_all, y_pred_all) if a == b)
                 logger.info(
                     "[Drift] Progress row %d/%d, cumulative_accuracy=%.4f, window_fill=%d",
                     i + 1,
@@ -297,12 +315,15 @@ def monitor_drift_and_retrain(
                     len(window_rows),
                 )
 
+            # -------------------------
+            # Detection logic
+            # -------------------------
             adwin.update(error)
 
             detection_allowed = (
-                samples_seen >= min_samples_before_detection
-                and i > cooldown_until
-                and len(window_rows) >= min_samples_before_detection
+                    samples_seen >= min_samples_before_detection and
+                    i > cooldown_until and
+                    len(window_rows) >= min_samples_before_detection
             )
 
             if detection_allowed and adwin.drift_detected:
@@ -311,14 +332,14 @@ def monitor_drift_and_retrain(
                         "[Drift] Concept drift DETECTED at index %d. Retraining on last %d samples at path=%s",
                         i,
                         len(window_rows),
-                        retrain_path,
-                    )
+                        retrain_path,)
 
                 window_df = pd.DataFrame(list(window_rows))
                 retrain_start = __import__("time").time()
 
                 unique_path = os.path.join(
-                    retrain_path, f"retrain_{i}_{uuid.uuid4().hex[:8]}"
+                    retrain_path,
+                    f"retrain_{i}_{uuid.uuid4().hex[:8]}"
                 )
 
                 fit_kwargs = {}
@@ -332,55 +353,77 @@ def monitor_drift_and_retrain(
                 predictor = TabularPredictor(
                     label=target_col,
                     path=unique_path,
-                    **fit_kwargs,
-                ).fit(train_data=window_df, presets=retrain_presets)
+                    **fit_kwargs
+                ).fit(
+                    train_data=window_df,
+                    presets=retrain_presets
+                )
 
                 retrain_time = __import__("time").time() - retrain_start
                 total_retrain_time += retrain_time
 
-                events.append(
-                    {
-                        "index": i,
-                        "elapsed_seconds": elapsed,
-                        "window_size": len(window_rows),
-                        "retrain_time_seconds": retrain_time,
-                        "mean_error_so_far": float(np.mean(error_stream))
-                        if error_stream
-                        else np.nan,
-                    }
-                )
+                events.append({
+                    "index": i,
+                    "elapsed_seconds": elapsed,
+                    "window_size": len(window_rows),
+                    "retrain_time_seconds": retrain_time,
+                    "mean_error_so_far": float(np.mean(error_stream)) if error_stream else np.nan,
+                })
 
                 if verbose:
-                    logger.info("[Drift] Retraining took %.4f seconds.", retrain_time)
+                    logger.info("[Drift] Retraining took %s seconds.", {retrain_time:.4})
 
+                # Reset detector after confirmed drift
                 adwin = ADWIN(delta=delta, clock=clock)
+
+                # Cooldown to avoid repeated detections from same change point
                 cooldown_until = i + cooldown_samples
 
+                # Confirm that fit() wrote to retrain_path (and list contents)
                 try:
                     contents = []
                     for _root, _dirs, files in os.walk(retrain_path):
-                        contents.extend(
-                            os.path.join(os.path.relpath(_root, retrain_path), f)
-                            for f in files
-                        )
-                    logger.info(
-                        "[Drift] After retrain: path=%s has %d files: %s",
-                        retrain_path,
-                        len(contents),
-                        contents[:20],
-                    )
+                        contents.extend(os.path.join(os.path.relpath(_root, retrain_path), f) for f in files)
+                    logger.info("[Drift] After retrain: path=%s has %d files: %s", retrain_path, len(contents),
+                                contents[:20])
                 except Exception as e:
-                    logger.warning(
-                        "[Drift] Could not list retrain_path after fit: %s", e
-                    )
+                    logger.warning("[Drift] Could not list retrain_path after fit: %s", e)
 
+    # -------------------------
+    # Signal diagnostics
+    # -------------------------
+    if verbose and error_stream:
+        error_arr = np.asarray(error_stream, dtype=float)
+        print("\n--- Drift Signal Diagnostics ---")
+        print(f"Mean error: {error_arr.mean():.4f}")
+        print(f"Std error: {error_arr.std():.4f}")
+
+        mid = len(error_arr) // 2
+        if mid > 0:
+            print(f"First half mean error: {error_arr[:mid].mean():.4f}")
+            print(f"Second half mean error: {error_arr[mid:].mean():.4f}")
+
+        q = len(error_arr) // 4
+        if q > 0:
+            print(f"Q1 mean error: {error_arr[:q].mean():.4f}")
+            print(f"Q2 mean error: {error_arr[q:2 * q].mean():.4f}")
+            print(f"Q3 mean error: {error_arr[2 * q:3 * q].mean():.4f}")
+            print(f"Q4 mean error: {error_arr[3 * q:].mean():.4f}")
+
+        seg_edges = np.linspace(0, len(error_arr), 12, dtype=int)
+        print("\n--- Segment mean errors ---")
+        for s in range(11):
+            a, b = seg_edges[s], seg_edges[s + 1]
+            if b > a:
+                print(f"Segment {s}: {error_arr[a:b].mean():.4f}")
+
+    # Summary: whether any retrain happened (if not, retrain_path stays empty and upload will fail)
     drift_log = pd.DataFrame(events)
     total_runtime = __import__("time").time() - start_time
     total_drifts = len(events)
     n_drifts = len(events)
     total_count = len(y_true_all)
     correct_count = sum(1 for a, b in zip(y_true_all, y_pred_all) if a == b)
-
     try:
         retrain_files = []
         for root, _d, files in os.walk(retrain_path):
@@ -399,6 +442,9 @@ def monitor_drift_and_retrain(
     except Exception as e:
         logger.warning("[Drift] Could not list retrain_path at end: %s", e)
 
+    # --------------------------
+    # 5) Compute correct metrics
+    # --------------------------
     if not y_true_all:
         if is_regression:
             metrics = {
@@ -428,12 +474,8 @@ def monitor_drift_and_retrain(
         return predictor, drift_log, metrics
 
     if is_regression:
-        y_true_arr = np.asarray(
-            pd.to_numeric(pd.Series(y_true_all), errors="coerce")
-        )
-        y_pred_arr = np.asarray(
-            pd.to_numeric(pd.Series(y_pred_all), errors="coerce")
-        )
+        y_true_arr = np.asarray(pd.to_numeric(pd.Series(y_true_all), errors="coerce"))
+        y_pred_arr = np.asarray(pd.to_numeric(pd.Series(y_pred_all), errors="coerce"))
 
         valid_mask = ~np.isnan(y_true_arr) & ~np.isnan(y_pred_arr)
         y_true_arr = y_true_arr[valid_mask]
@@ -448,18 +490,12 @@ def monitor_drift_and_retrain(
             r2 = r2_score(y_true_arr, y_pred_arr)
 
         if window_y_true:
-            wy_true = np.asarray(
-                pd.to_numeric(pd.Series(list(window_y_true)), errors="coerce")
-            )
-            wy_pred = np.asarray(
-                pd.to_numeric(pd.Series(list(window_y_pred)), errors="coerce")
-            )
+            wy_true = np.asarray(pd.to_numeric(pd.Series(list(window_y_true)), errors="coerce"))
+            wy_pred = np.asarray(pd.to_numeric(pd.Series(list(window_y_pred)), errors="coerce"))
             valid_mask = ~np.isnan(wy_true) & ~np.isnan(wy_pred)
             wy_true = wy_true[valid_mask]
             wy_pred = wy_pred[valid_mask]
-            final_window_mae = (
-                mean_absolute_error(wy_true, wy_pred) if len(wy_true) else float("nan")
-            )
+            final_window_mae = mean_absolute_error(wy_true, wy_pred) if len(wy_true) else float("nan")
         else:
             final_window_mae = float("nan")
 
@@ -476,29 +512,22 @@ def monitor_drift_and_retrain(
         }
 
     else:
+        # Classification problem
         y_true_ser = pd.Series(y_true_all)
         y_pred_ser = pd.Series(y_pred_all)
 
-        y_true_labels, y_pred_labels = coerce_classification_labels(
-            y_true_ser, y_pred_ser
-        )
+        y_true_labels, y_pred_labels = coerce_classification_labels(y_true_ser, y_pred_ser)
 
         final_accuracy = accuracy_score(y_true_labels, y_pred_labels)
         f1 = f1_score(y_true_labels, y_pred_labels, average="weighted")
-        precision = precision_score(
-            y_true_labels, y_pred_labels, average="weighted", zero_division=0
-        )
-        recall = recall_score(
-            y_true_labels, y_pred_labels, average="weighted", zero_division=0
-        )
+        precision = precision_score(y_true_labels, y_pred_labels, average="weighted", zero_division=0)
+        recall = recall_score(y_true_labels, y_pred_labels, average="weighted", zero_division=0)
         cumulative_accuracy = float((y_true_labels == y_pred_labels).mean())
 
         if window_y_true:
             wy_true = pd.Series(list(window_y_true))
             wy_pred = pd.Series(list(window_y_pred))
-            wy_true_labels, wy_pred_labels = coerce_classification_labels(
-                wy_true, wy_pred
-            )
+            wy_true_labels, wy_pred_labels = coerce_classification_labels(wy_true, wy_pred)
             final_window_accuracy = accuracy_score(wy_true_labels, wy_pred_labels)
         else:
             final_window_accuracy = float("nan")
@@ -535,11 +564,37 @@ def drift_induction(
     random_state=None,
     target_col=None,
     task="auto",
-    n_drifts=10,
+    n_drifts=10
 ):
     """
     Inject exactly `n_drifts` abrupt drifts by splitting the data into `n_drifts + 1`
     consecutive segments and applying a different transformation to each segment.
+
+    Notes:
+    - Guarantees 10 *induced change points* when there are enough rows.
+    - Does NOT guarantee that a drift detector will detect all of them.
+    - For classification, target_col is required.
+    - For regression, target drift is optional but supported if target_col is provided.
+
+    Parameters
+    ----------
+    data : pd.DataFrame or array-like
+        Input data.
+    drift_strength : float
+        Base intensity of the drift.
+    random_state : int or None
+        Random seed.
+    target_col : str or None
+        Target column name for supervised datasets.
+    task : {"auto", "classification", "regression"}
+        Task type.
+    n_drifts : int
+        Number of drift points to inject.
+
+    Returns
+    -------
+    pd.DataFrame or np.ndarray
+        Drifted dataset of the same shape as input.
     """
     if random_state is not None:
         np.random.seed(random_state)
@@ -555,6 +610,7 @@ def drift_induction(
                 f"Need at least {n_drifts + 1} rows to induce {n_drifts} drifts, got {len(arr)}."
             )
 
+        # NumPy path: treat as regression-style numeric data only
         if not np.issubdtype(arr.dtype, np.number):
             raise TypeError("NumPy input must be numeric.")
 
@@ -567,6 +623,7 @@ def drift_induction(
             if start >= end:
                 continue
 
+            # Keep first segment untouched as baseline
             if seg_id == 0:
                 continue
 
@@ -574,6 +631,7 @@ def drift_induction(
 
             seg_strength = drift_strength * seg_id
 
+            # abrupt alternating regimes
             shift = seg_strength * (1 if seg_id % 2 == 1 else -1)
             scale = 1.0 + (0.8 if seg_id % 3 == 0 else -0.5)
             noise_std = max(0.05, drift_strength * 0.25)
@@ -586,6 +644,9 @@ def drift_induction(
 
         return drifted
 
+    # -------------------------
+    # DataFrame path
+    # -------------------------
     df = data.copy()
 
     if len(df) < (n_drifts + 1):
@@ -593,6 +654,7 @@ def drift_induction(
             f"Need at least {n_drifts + 1} rows to induce {n_drifts} drifts, got {len(df)}."
         )
 
+    # infer task
     if task == "auto":
         if target_col is None or target_col not in df.columns:
             task = "regression"
@@ -607,19 +669,13 @@ def drift_induction(
             else:
                 task = "classification"
 
-    if task == "classification" and (
-        target_col is None or target_col not in df.columns
-    ):
-        raise ValueError(
-            "For classification, target_col must be provided and exist in the DataFrame."
-        )
+    if task == "classification" and (target_col is None or target_col not in df.columns):
+        raise ValueError("For classification, target_col must be provided and exist in the DataFrame.")
 
     drifted = df.copy()
 
     numeric_cols = drifted.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_cols = drifted.select_dtypes(
-        include=["object", "category", "bool"]
-    ).tolist()
+    categorical_cols = drifted.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
 
     if target_col is not None and target_col in numeric_cols:
         numeric_cols.remove(target_col)
@@ -636,14 +692,19 @@ def drift_induction(
 
         idx = drifted.index[start:end]
 
+        # Keep first segment untouched as clean baseline
         if seg_id == 0:
             continue
 
         seg_strength = drift_strength * seg_id
 
+        # -------------------------
+        # Numeric feature drift
+        # -------------------------
         if numeric_cols:
             block = drifted.loc[idx, numeric_cols].to_numpy(dtype=float)
 
+            # abrupt alternating regimes
             shift = seg_strength * (1 if seg_id % 2 == 1 else -1)
             scale = 1.0 + (0.8 if seg_id % 3 == 0 else -0.5)
             noise_std = max(0.05, drift_strength * 0.25)
@@ -654,6 +715,9 @@ def drift_induction(
 
             drifted.loc[idx, numeric_cols] = block
 
+        # -------------------------
+        # Categorical feature drift
+        # -------------------------
         if categorical_cols:
             for col in categorical_cols:
                 values = drifted.loc[idx, col].astype("object")
@@ -664,55 +728,42 @@ def drift_induction(
                     n_replace = int(len(idx) * replace_frac)
 
                     if n_replace > 0:
-                        replace_idx = np.random.choice(
-                            idx, size=n_replace, replace=False
-                        )
+                        replace_idx = np.random.choice(idx, size=n_replace, replace=False)
 
                         def sample_other(v):
                             choices = [x for x in unique_vals if x != v]
-                            return (
-                                np.random.choice(choices)
-                                if len(choices) > 0
-                                else v
-                            )
+                            return np.random.choice(choices) if len(choices) > 0 else v
 
-                        drifted.loc[replace_idx, col] = drifted.loc[
-                            replace_idx, col
-                        ].apply(sample_other)
+                        drifted.loc[replace_idx, col] = drifted.loc[replace_idx, col].apply(sample_other)
 
+        # -------------------------
+        # Target drift
+        # -------------------------
         if target_col is not None:
             if task == "classification":
                 classes = drifted[target_col].dropna().unique()
                 if len(classes) > 1:
+                    # strong post-baseline label drift
                     flip_frac = min(0.7, 0.20 + 0.05 * seg_id)
                     n_flip = int(len(idx) * flip_frac)
 
                     if n_flip > 0:
-                        flip_idx = np.random.choice(
-                            idx, size=n_flip, replace=False
-                        )
+                        flip_idx = np.random.choice(idx, size=n_flip, replace=False)
 
                         def sample_other_class(v):
                             choices = [c for c in classes if c != v]
-                            return (
-                                np.random.choice(choices)
-                                if len(choices) > 0
-                                else v
-                            )
+                            return np.random.choice(choices) if len(choices) > 0 else v
 
-                        drifted.loc[flip_idx, target_col] = drifted.loc[
-                            flip_idx, target_col
-                        ].apply(sample_other_class)
+                        drifted.loc[flip_idx, target_col] = drifted.loc[flip_idx, target_col].apply(sample_other_class)
 
-            elif task == "regression" and pd.api.types.is_numeric_dtype(
-                drifted[target_col]
-            ):
+
+            elif task == "regression" and pd.api.types.is_numeric_dtype(drifted[target_col]):
                 target_shift = seg_strength * (1 if seg_id % 2 == 1 else -1) * 0.75
                 target_noise = max(0.02, drift_strength * 0.08)
                 drifted.loc[idx, target_col] = (
-                    pd.to_numeric(drifted.loc[idx, target_col], errors="coerce")
-                    + target_shift
-                    + np.random.normal(0, target_noise, size=len(idx))
+                        pd.to_numeric(drifted.loc[idx, target_col], errors="coerce")
+                        + target_shift
+                        + np.random.normal(0, target_noise, size=len(idx))
                 )
 
     return drifted
@@ -737,29 +788,6 @@ def zip_dir(path: str) -> bytes:
         logger.info("zip_dir: zipped %d files from %s", count, path)
     buf.seek(0)
     return buf.getvalue()
-
-
-def post_concept_drift_report(
-    user_id: str,
-    dataset_id: str,
-    dataset_version: str,
-    model_id: str,
-    model_version: str,
-    report: dict,
-) -> dict:
-    """POST concept drift report (JSON) to Data Warehouse. Does not send Kafka event (consumer sends that)."""
-    url = f"{API_BASE}/concept-drift-reports/"
-    payload = {
-        "user_id": user_id,
-        "dataset_id": dataset_id,
-        "dataset_version": dataset_version,
-        "model_id": model_id,
-        "model_version": model_version,
-        "report": report,
-    }
-    r = requests.post(url, json=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()
 
 
 def upload_model_to_dw(
@@ -867,10 +895,12 @@ async def process_drift_trigger(event: dict, producer: AIOKafkaProducer) -> None
                 raise RuntimeError("Failed to load TabularPredictor")
             retrain_path = os.path.join(tmp, "retrained")
             os.makedirs(retrain_path, exist_ok=True)
-
-            # Configure drift parameters based on task type and sample size (v4 pipeline)
             task_type = infer_task_type(df_drift, target_column)
+            # -------------------------
+            # Drift configuration
+            # -------------------------
             logger.info("[Drift] Starting drift configuration!")
+
             if task_type == "classification":
                 if len(df_drift) < 500:
                     window_size = 150
@@ -885,26 +915,15 @@ async def process_drift_trigger(event: dict, producer: AIOKafkaProducer) -> None
                 else:
                     window_size = min(200, max(50, len(df_drift) // 10))
                     drift_strength = 0.05
-            logger.info(
-                "[Drift] Drift configuration finished. Using window_size=%s, drift_strength=%s",
-                window_size,
-                drift_strength,
-            )
 
-            drifted_df = drift_induction(
-                df_drift,
-                drift_strength=drift_strength,
-                random_state=45,
-                target_col=target_column,
-                task=task_type,
-                n_drifts=10,
-            )
+            logger.info("[Drift] Drift Configuration finished!. Using window_size=%s, drift_strength=%s", window_size, drift_strength)
+
+            drifted_df = drift_induction(df_drift, drift_strength=drift_strength, random_state=45, target_col=target_column, task=task_type, n_drifts=10)
             predictor, drift_log, metrics = monitor_drift_and_retrain(
                 df=drifted_df,
                 predictor=predictor,
                 feature_cols=feature_cols,
                 target_col=target_column,
-                retrain_path=retrain_path,
                 window_size=window_size,
                 delta=0.2,
                 clock=1,
@@ -912,25 +931,14 @@ async def process_drift_trigger(event: dict, producer: AIOKafkaProducer) -> None
                 min_samples_before_detection=30,
                 cooldown_samples=30,
                 retrain_presets="medium_quality_faster_train",
-                verbose=True,
+                verbose=True
             )
+
             n_drifts = metrics.get("total_drifts", 0)
 
             if n_drifts == 0:
-                # No drift detected: do not upload (retrain_path is empty). POST report to DW, then send success.
+                # No drift detected: do not upload (retrain_path is empty). Send success with no new model.
                 logger.info("[Drift] No concept drift detected; skipping model upload and sending success")
-                drift_report = {
-                    "drift_detected": False,
-                    "drift_metrics": metrics,
-                    "message": "No concept drift detected",
-                }
-                try:
-                    saved = post_concept_drift_report(
-                        user_id, dataset_id, dataset_version, model_id, model_version, drift_report
-                    )
-                    logger.info(f"Concept drift report saved (no drift): id={saved.get('id', '')}")
-                except Exception as e:
-                    logger.warning("Failed to POST concept drift report to DW: %s", e)
                 await _send_complete(
                     producer, task_id, user_id, model_id, model_version, dataset_id, dataset_version,
                     success=True, drift_metrics=metrics, drift_detected=False
@@ -963,18 +971,6 @@ async def process_drift_trigger(event: dict, producer: AIOKafkaProducer) -> None
         )
         new_version = new_metadata.get("version", "v2")
         logger.info(f"Uploaded retrained model version {new_version}")
-        drift_report = {
-            "drift_detected": True,
-            "drift_metrics": metrics,
-            "new_model_version": new_version,
-        }
-        try:
-            saved = post_concept_drift_report(
-                user_id, dataset_id, dataset_version, model_id, new_version, drift_report
-            )
-            logger.info(f"Concept drift report saved (drift detected): id={saved.get('id', '')}")
-        except Exception as e:
-            logger.warning("Failed to POST concept drift report to DW: %s", e)
         await _send_complete(
             producer, task_id, user_id, model_id, new_version, dataset_id, dataset_version,
             success=True, drift_metrics=metrics, drift_detected=True
@@ -1021,14 +1017,7 @@ async def _send_complete(
             payload["output"]["drift_metrics"] = drift_metrics
         payload["failure"] = None
     else:
-        # Include context so orchestrators can still proceed to XAI / next step
-        payload["output"] = {
-            "user_id": user_id,
-            "dataset_id": dataset_id,
-            "model_id": model_id,
-            "model_version": model_version,
-            "dataset_version": dataset_version,
-        }
+        payload["output"] = None
         payload["failure"] = {"error_type": "ConceptDriftError", "error_message": error_message or "Concept drift failed"}
     await producer.send_and_wait(KAFKA_DRIFT_COMPLETE_TOPIC, value=payload, key=task_id)
     logger.info(f"Sent concept-drift-complete task_id={task_id} success={success}")

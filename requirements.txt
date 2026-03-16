@@ -1,5 +1,7 @@
 fastapi==0.104.1
 uvicorn==0.24.0
+# Optional: observability for connecting DW logs with Task Manager, orchestrator, UI (set LOGFIRE_TOKEN to enable)
+logfire[fastapi]>=0.54.0
 # Needed at runtime by AutoGluon (`pkg_resources`).
 setuptools>=65.0.0
 pymongo==4.6.0
