@@ -154,21 +154,33 @@ def upload_mitigated_dataset_folder(
 
 
 def clean_for_json(obj):
-    """Recursively clean data structure to be JSON serializable by replacing NaN/inf with None"""
+    """Recursively clean data so requests/json.dumps never sees NaN/inf or unsupported pandas/numpy scalars."""
+    if obj is None:
+        return None
     if isinstance(obj, dict):
-        return {k: clean_for_json(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
+        return {str(clean_for_json(k)): clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
         return [clean_for_json(v) for v in obj]
-    elif isinstance(obj, (np.floating, float)):
-        if np.isnan(obj) or np.isinf(obj):
+    if isinstance(obj, np.ndarray):
+        return [clean_for_json(v) for v in obj.tolist()]
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if isinstance(obj, (np.integer, int)):
+        return int(obj)
+    if isinstance(obj, (np.floating, float)):
+        if not np.isfinite(obj):
             return None
         return float(obj)
-    elif isinstance(obj, (np.integer, int)):
-        return int(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    else:
-        return obj
+    if isinstance(obj, np.generic):
+        return clean_for_json(obj.item())
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+    return obj
 
 
 def post_bias_report(user_id: str, dataset_id: str, report: dict, 
@@ -195,6 +207,7 @@ def post_bias_report(user_id: str, dataset_id: str, report: dict,
     headers = {}
     if task_id:
         headers["X-Task-ID"] = task_id
+    payload = clean_for_json(payload)
     r = requests.post(url, json=payload, headers=headers, timeout=30)
     r.raise_for_status()
     return r.json()
