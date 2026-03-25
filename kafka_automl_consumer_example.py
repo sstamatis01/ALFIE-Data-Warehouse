@@ -25,6 +25,8 @@ from aiokafka import AIOKafkaConsumer
 import requests
 import pandas as pd
 from io import BytesIO
+import io
+import zipfile
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger("kafka_automl_consumer")
@@ -50,41 +52,79 @@ def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -
 
 def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
     """
-    Try to read CSV with multiple encodings
+    Read CSV bytes with robust fallbacks.
 
-    Handles files with different encodings:
-    - utf-8: Standard
-    - latin-1 (ISO-8859-1): Western European
-    - cp1252 (Windows-1252): Windows default
-    - utf-16: Some Excel exports
+    Uses multiple encodings and the Python parser to reduce tokenizer failures on malformed rows.
     """
-    from io import BytesIO
-    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1', 'utf-16']
+    encodings = ["utf-8", "latin-1", "cp1252", "iso-8859-1", "utf-16"]
 
     for encoding in encodings:
         try:
-            df = pd.read_csv(BytesIO(file_data), encoding=encoding)
+            df = pd.read_csv(
+                BytesIO(file_data),
+                encoding=encoding,
+                engine="python",
+                on_bad_lines="skip",
+            )
             logger.info(f"Successfully read CSV with encoding: {encoding}")
             return df
-        except (UnicodeDecodeError, Exception):
+        except Exception:
             continue
 
-    # If all encodings fail, try with error handling
+    # Last resort: ignore undecodable chars and skip malformed lines
     try:
-        df = pd.read_csv(BytesIO(file_data), encoding='utf-8', encoding_errors='ignore')
-        logger.warning("Read CSV with 'ignore' errors - some characters may be missing")
+        df = pd.read_csv(
+            BytesIO(file_data),
+            encoding="utf-8",
+            encoding_errors="ignore",
+            engine="python",
+            on_bad_lines="skip",
+        )
+        logger.warning("Read CSV with lenient parser (encoding_errors='ignore', on_bad_lines='skip')")
         return df
     except Exception as e:
         logger.error(f"Failed to read CSV with all encodings: {e}")
         raise
 
 
-def download_dataset_file(user_id: str, dataset_id: str, version: str = None) -> bytes:
-    """Download dataset file (single file or folder as ZIP) - specific version or latest"""
+def load_tabular_dataframe(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Load tabular data from bytes.
+
+    Supports:
+    - raw CSV bytes
+    - ZIP bytes containing one or more CSV files (uses first CSV)
+    """
+    import zipfile
+
+    try:
+        return read_csv_with_encoding(file_bytes)
+    except Exception:
+        pass
+
+    try:
+        with zipfile.ZipFile(BytesIO(file_bytes), "r") as zf:
+            csv_names = [
+                n
+                for n in zf.namelist()
+                if n.lower().endswith(".csv") and not n.startswith("__")
+            ]
+            if not csv_names:
+                raise ValueError("ZIP does not contain any CSV files")
+            with zf.open(csv_names[0]) as f:
+                return read_csv_with_encoding(f.read())
+    except Exception as e:
+        raise ValueError(f"Could not load tabular dataframe from downloaded bytes: {e}")
+
+
+def download_dataset_file(user_id: str, dataset_id: str, version: str = None, split: str = None) -> bytes:
+    """Download dataset file (single file or folder as ZIP). If split is train/test/drift, download that subset."""
     if version:
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}/download"
     else:
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
+    if split and split in ("train", "test", "drift"):
+        url += f"?split={split}"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
@@ -117,7 +157,20 @@ def extract_dataset_folder(zip_bytes: bytes, extract_to: str = "temp_dataset") -
     return extracted_files
 
 
-def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_path: str,
+def _zip_dir(path: str) -> bytes:
+    """Zip a local directory and return bytes."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(path):
+            for fname in files:
+                abspath = os.path.join(root, fname)
+                arcname = os.path.relpath(abspath, path).replace("\\", "/")
+                zf.write(abspath, arcname)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_folder_path: str,
                        model_type: str, framework: str = "sklearn", accuracy: float = None,
                        dataset_version: str = None, task_id: str | None = None) -> dict:
     """
@@ -125,7 +178,7 @@ def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_
     This will automatically trigger an automl-events message
     Version is auto-incremented by the DW
     """
-    url = f"{API_BASE}/ai-models/upload/single/{user_id}"
+    url = f"{API_BASE}/ai-models/upload/folder/{user_id}"
 
     # Include dataset version in description for data lineage tracking
     description = f"AutoML trained model for {model_type}"
@@ -134,22 +187,23 @@ def upload_model_to_dw(user_id: str, model_id: str, dataset_id: str, model_file_
     else:
         description += f" (trained on dataset {dataset_id})"
 
-    with open(model_file_path, 'rb') as f:
-        files = {'file': (os.path.basename(model_file_path), f)}
-        data = {
-            'model_id': model_id,
-            'name': f"AutoML Model - {model_id}",
-            'description': description,
-            'framework': framework,
-            'model_type': model_type,
-            'training_dataset': dataset_id,  # Link to dataset
-            'training_accuracy': accuracy,
-        }
+    model_zip = _zip_dir(model_folder_path)
+    files = {"zip_file": ("model.zip", io.BytesIO(model_zip), "application/zip")}
+    data = {
+        "model_id": model_id,
+        "name": f"AutoML Model - {model_id}",
+        "description": description,
+        "framework": framework,
+        "model_type": model_type,
+        "training_dataset": dataset_id,  # Link to dataset
+        "training_accuracy": accuracy,
+        "preserve_structure": "true",
+    }
 
-        headers = {"X-Task-ID": task_id} if task_id else None
-        r = requests.post(url, files=files, data=data, headers=headers, timeout=120)
-        r.raise_for_status()
-        return r.json()
+    headers = {"X-Task-ID": task_id} if task_id else None
+    r = requests.post(url, files=files, data=data, headers=headers, timeout=120)
+    r.raise_for_status()
+    return r.json()
 
 
 async def process_automl_trigger(event: dict) -> None:
@@ -194,15 +248,21 @@ async def process_automl_trigger(event: dict) -> None:
         try:
             metadata = fetch_dataset_metadata(user_id, dataset_id, dataset_version)
 
-            # Simplified schema doesn't include these; default values
-            is_folder = False
-            file_count = 1
+            # Detect dataset shape and split support from metadata
+            is_folder = metadata.get("is_folder", False)
+            file_count = metadata.get("file_count", 1)
+            has_split = bool(metadata.get("custom_metadata", {}).get("split"))
+            download_split = "train" if has_split else None
 
             logger.info(f"Dataset type: {'FOLDER' if is_folder else 'SINGLE FILE'}")
             if is_folder:
                 logger.info(f"File count: {file_count}")
+            if download_split:
+                logger.info(f"Dataset has train/test/drift split; downloading '{download_split}' split for dummy AutoML")
 
-            file_bytes = download_dataset_file(user_id, dataset_id, dataset_version)
+            file_bytes = download_dataset_file(
+                user_id, dataset_id, dataset_version, split=download_split
+            )
             logger.info(f"Dataset downloaded: {len(file_bytes)} bytes")
         except Exception as e:
             logger.error(f"Failed to fetch dataset: {e}")
@@ -210,44 +270,24 @@ async def process_automl_trigger(event: dict) -> None:
 
         # Step 2: Load dataset into pandas
         df = None
-        extracted_files = []
 
         try:
-            if is_folder:
-                # Handle folder dataset - extract ZIP
-                logger.info("Extracting folder dataset...")
-                extracted_files = extract_dataset_folder(file_bytes, f"temp_automl_{dataset_id}")
-                logger.info(f"Extracted {len(extracted_files)} files:")
-                for file_path in extracted_files:
-                    logger.info(f"  - {file_path}")
-
-                # TODO: Process multiple files for AutoML training
-                # For now, find and load a CSV file
-                csv_files = [f for f in extracted_files if f.endswith('.csv')]
-                if csv_files:
-                    logger.info(f"Found {len(csv_files)} CSV file(s), loading first one for training")
-                    with open(csv_files[0], 'rb') as f:
-                        csv_bytes = f.read()
-                    df = read_csv_with_encoding(csv_bytes)
-                    logger.info(f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns")
-                else:
-                    logger.error("No CSV files found in folder for training")
-                    return
-            else:
-                # Handle single file dataset
-                df = read_csv_with_encoding(file_bytes)
-                logger.info(f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns")
-
+            df = load_tabular_dataframe(file_bytes)
+            logger.info(f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns")
+            if target_column and target_column not in df.columns:
+                logger.warning(
+                    f"Target column '{target_column}' not found in dataset columns; dummy upload will proceed."
+                )
         except Exception as e:
             logger.error(f"Failed to parse dataset: {e}")
             return
 
         # Step 3: Identify the problem and train model
         # TODO: Replace this with actual AutoML training logic
-        # For now, we'll use a dummy model.pkl file for testing
+        # For now, we'll use a dummy local model folder for testing
 
         logger.info("=" * 80)
-        logger.info("Training model (using dummy model.pkl for testing)")
+        logger.info("Training model (using dummy local /model folder for testing)")
         logger.info(f"  - Target column: {target_column}")
         logger.info(f"  - Task type: {task_type}")
         logger.info(f"  - Dataset shape: {df.shape}")
@@ -256,12 +296,12 @@ async def process_automl_trigger(event: dict) -> None:
         # Generate model ID
         model_id = f"automl_{dataset_id}_{int(datetime.now(timezone.utc).timestamp())}"
 
-        # Use dummy model.pkl file for testing
-        dummy_model_path = "model.pkl"
+        # Use dummy local model folder for testing
+        dummy_model_folder = "model"
 
-        if not os.path.exists(dummy_model_path):
-            logger.warning(f"Dummy model file not found: {dummy_model_path}")
-            logger.info("Skipping model upload - create a dummy model.pkl file in the root directory to test")
+        if not os.path.isdir(dummy_model_folder):
+            logger.warning(f"Dummy model folder not found: {dummy_model_folder}")
+            logger.info("Skipping model upload - provide a model folder in the repository root to test")
             return
 
         # Upload the trained model to DW
@@ -271,7 +311,7 @@ async def process_automl_trigger(event: dict) -> None:
                 user_id=user_id,
                 model_id=model_id,
                 dataset_id=dataset_id,
-                model_file_path=dummy_model_path,
+                model_folder_path=dummy_model_folder,
                 model_type=task_type,
                 framework="sklearn",
                 accuracy=0.92,  # Dummy accuracy for testing

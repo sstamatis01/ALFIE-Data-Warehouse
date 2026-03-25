@@ -27,6 +27,7 @@ import json
 import logging
 import pathlib
 import tempfile
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from collections import deque
@@ -60,6 +61,7 @@ logger = logging.getLogger("kafka_concept_drift_consumer")
 load_dotenv(find_dotenv())
 
 # Kafka
+# Default is deployment Kafka; override with env for local testing (e.g. localhost:9092).
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "alfie.iti.gr:9092")
 KAFKA_DRIFT_TRIGGER_TOPIC = os.getenv("KAFKA_CONCEPT_DRIFT_TRIGGER_TOPIC", "concept-drift-trigger-events")
 KAFKA_DRIFT_COMPLETE_TOPIC = os.getenv("KAFKA_CONCEPT_DRIFT_COMPLETE_TOPIC", "concept-drift-complete-events")
@@ -617,9 +619,8 @@ def drift_induction(
     drifted = df.copy()
 
     numeric_cols = drifted.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_cols = drifted.select_dtypes(
-        include=["object", "category", "bool"]
-    ).tolist()
+    # select_dtypes returns a DataFrame subset; extract column names as a list
+    categorical_cols = drifted.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
 
     if target_col is not None and target_col in numeric_cols:
         numeric_cols.remove(target_col)

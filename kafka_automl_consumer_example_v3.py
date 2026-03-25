@@ -124,33 +124,71 @@ def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -
 
 def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
     """
-    Try to read CSV with multiple encodings
-    
-    Handles files with different encodings:
-    - utf-8: Standard
-    - latin-1 (ISO-8859-1): Western European
-    - cp1252 (Windows-1252): Windows default
-    - utf-16: Some Excel exports
+    Read CSV bytes with robust fallbacks.
+
+    Uses multiple encodings and the Python parser to reduce tokenizer failures on malformed rows.
     """
-    from io import BytesIO
-    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1', 'utf-16']
-    
+    encodings = ["utf-8", "latin-1", "cp1252", "iso-8859-1", "utf-16"]
+
     for encoding in encodings:
         try:
-            df = pd.read_csv(BytesIO(file_data), encoding=encoding)
+            df = pd.read_csv(
+                BytesIO(file_data),
+                encoding=encoding,
+                engine="python",
+                on_bad_lines="skip",
+            )
             logger.info(f"Successfully read CSV with encoding: {encoding}")
             return df
-        except (UnicodeDecodeError, Exception):
+        except Exception:
             continue
-    
-    # If all encodings fail, try with error handling
+
+    # Last resort: ignore undecodable chars and skip malformed lines
     try:
-        df = pd.read_csv(BytesIO(file_data), encoding='utf-8', encoding_errors='ignore')
-        logger.warning("Read CSV with 'ignore' errors - some characters may be missing")
+        df = pd.read_csv(
+            BytesIO(file_data),
+            encoding="utf-8",
+            encoding_errors="ignore",
+            engine="python",
+            on_bad_lines="skip",
+        )
+        logger.warning("Read CSV with lenient parser (encoding_errors='ignore', on_bad_lines='skip')")
         return df
     except Exception as e:
         logger.error(f"Failed to read CSV with all encodings: {e}")
         raise
+
+
+def load_tabular_dataframe(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Load tabular data from bytes.
+
+    Supports:
+    - raw CSV bytes
+    - ZIP bytes containing one or more CSV files (uses first CSV)
+    """
+    import zipfile
+
+    # Try direct CSV first
+    try:
+        return read_csv_with_encoding(file_bytes)
+    except Exception:
+        pass
+
+    # Then try ZIP -> first CSV
+    try:
+        with zipfile.ZipFile(BytesIO(file_bytes), "r") as zf:
+            csv_names = [
+                n
+                for n in zf.namelist()
+                if n.lower().endswith(".csv") and not n.startswith("__")
+            ]
+            if not csv_names:
+                raise ValueError("ZIP does not contain any CSV files")
+            with zf.open(csv_names[0]) as f:
+                return read_csv_with_encoding(f.read())
+    except Exception as e:
+        raise ValueError(f"Could not load tabular dataframe from downloaded bytes: {e}")
 
 
 def download_dataset_file(user_id: str, dataset_id: str, version: str = None, split: str = None) -> bytes:
@@ -393,7 +431,7 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
         logger.info(f"  Target column: {target_column}")
         logger.info(f"  Task type: {task_type}")
         logger.info(f"  Task category: {task_category}")
-        logger.info(f"  Time budget: {time_budget} minutes (will be converted to seconds)")
+        logger.info(f"  Time budget: {time_budget} seconds")
         
         # Step 1: Fetch dataset metadata and download file (for validation/preprocessing)
         try:
@@ -442,13 +480,32 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
         
         # Step 2: Call AutoML service with all necessary information
         if task_category == "tabular":
-            # Convert time_budget from string to int, and from minutes to seconds
-            # The endpoint expects time_budget in seconds as an integer
+            # Optional validation before calling AutoML service: ensure bytes are readable tabular data.
+            # This catches malformed/incorrect dataset payloads early with clear logs.
             try:
-                time_budget_seconds = int(time_budget) * 60  # Convert minutes to seconds
+                df_preview = load_tabular_dataframe(file_bytes)
+                logger.info(f"Tabular dataset validation OK: shape={df_preview.shape}")
+                if target_column and target_column not in df_preview.columns:
+                    logger.warning(
+                        f"Target column '{target_column}' not found in preview columns; AutoML service may fail."
+                    )
+            except Exception as e:
+                err_msg = f"Tabular dataset could not be parsed locally before AutoML call: {e}"
+                logger.error(err_msg)
+                if producer and task_id:
+                    await send_automl_failure_to_kafka(
+                        producer, task_id, user_id, dataset_id, err_msg, dataset_version
+                    )
+                return
+
+            # Convert time_budget from string to int.
+            # IMPORTANT: time_budget is interpreted as SECONDS end-to-end (not minutes).
+            # The endpoint expects time_budget in seconds as an integer.
+            try:
+                time_budget_seconds = int(time_budget)
             except (ValueError, TypeError):
-                logger.warning(f"Invalid time_budget '{time_budget}', using default 10 minutes (600 seconds)")
-                time_budget_seconds = 600
+                logger.warning(f"Invalid time_budget '{time_budget}', using default 10 seconds")
+                time_budget_seconds = 10
             
             data = {
                 "user_id": user_id,
@@ -481,10 +538,13 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                 logger.warning(f"   This might indicate the service is not running or not accessible")
             
             try:
-                # Calculate timeout: training time + buffer for download/upload/processing
-                # Add 5 minutes (300 seconds) buffer for dataset download, model upload, and processing overhead
-                request_timeout = time_budget_seconds + 300
-                logger.info(f"Setting request timeout to {request_timeout} seconds ({request_timeout // 60} minutes) to accommodate {time_budget_seconds // 60} minutes of training")
+                # Calculate timeout: time_budget (seconds) + small buffer for request/overhead.
+                # Keep buffer small so local tests like time_budget=10 complete quickly end-to-end.
+                request_timeout = time_budget_seconds + 10
+                logger.info(
+                    f"Setting request timeout to {request_timeout} seconds to accommodate "
+                    f"{time_budget_seconds} seconds of training + overhead"
+                )
                 r = requests.post(AUTOML_TABULAR_BEST_MODEL_URL, data=data, headers=headers, timeout=request_timeout)
                 r.raise_for_status()
             except requests.exceptions.ConnectionError as e:
@@ -557,10 +617,10 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
         elif task_category == "vision":
             # Vision AutoML: time_budget in seconds (vision API expects seconds)
             try:
-                time_budget_seconds = int(time_budget) * 60  # event in minutes -> seconds
+                time_budget_seconds = int(time_budget)
             except (ValueError, TypeError):
-                logger.warning(f"Invalid time_budget '{time_budget}', using default 10 minutes (600 seconds)")
-                time_budget_seconds = 600
+                logger.warning(f"Invalid time_budget '{time_budget}', using default 10 seconds")
+                time_budget_seconds = 10
 
             data = {
                 "user_id": user_id,
@@ -577,7 +637,7 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                 logger.info("  Passing dataset_split=train so Vision service uses train split from DW")
             headers = {"X-Task-ID": task_id} if task_id else None
 
-            request_timeout = time_budget_seconds + 300
+            request_timeout = time_budget_seconds + 10
             logger.info(f"Calling AutoML Vision: {AUTOML_VISION_BEST_MODEL_URL}")
             logger.info(f"   filename_column={filename_column}, label_column={label_column}, model_size={model_size}")
             logger.info(f"   time_budget={time_budget_seconds}s, request_timeout={request_timeout}s")
