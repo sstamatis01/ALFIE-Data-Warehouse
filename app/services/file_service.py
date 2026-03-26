@@ -389,9 +389,36 @@ class FileService:
                     detail="Annotations missing: image datasets must be accompanied by an annotation file (CSV, JSON, or XML).",
                 )
 
+            # Detect if the uploaded ZIP already contains a train/test/drift split structure.
+            # This commonly happens for bias-mitigated datasets that are uploaded as:
+            #   train/data.csv, test/data.csv, drift/data.csv
+            # In that case we should preserve the split and record split_counts on THIS version,
+            # not create an extra "version_split" with a random reassignment.
+            split_counts_existing: Optional[Dict[str, int]] = None
+            split_prefixes = ("train" + os.sep, "test" + os.sep, "drift" + os.sep)
+            existing_counts = {"train": 0, "test": 0, "drift": 0}
+            for relative_path, _file, _data, _size, _ftype in collected:
+                # Normalize to OS separator for the startswith check (paths come from os.walk)
+                rp = relative_path
+                if rp.startswith(split_prefixes[0]):
+                    existing_counts["train"] += 1
+                elif rp.startswith(split_prefixes[1]):
+                    existing_counts["test"] += 1
+                elif rp.startswith(split_prefixes[2]):
+                    existing_counts["drift"] += 1
+            if all(existing_counts[k] > 0 for k in ("train", "test", "drift")):
+                split_counts_existing = existing_counts
+                logger.info(
+                    "Detected pre-split folder structure in uploaded ZIP: %s. Will preserve split on version=%s and skip auto-splitting.",
+                    split_counts_existing,
+                    version,
+                )
+
             num_samples = len(collected)
             num_features = 1
             do_split = self._should_split_dataset(num_samples, num_features)
+            if split_counts_existing is not None:
+                do_split = False
 
             # Always upload original to v1 (no split)
             dataset_files_v1 = []
@@ -432,7 +459,7 @@ class FileService:
 
             if do_split and not version_split:
                 logger.info("Folder large enough to split but version_split not set; only v1 stored")
-            return ((dataset_files_v1, total_size_v1, None), None)
+            return ((dataset_files_v1, total_size_v1, split_counts_existing), None)
 
         except zipfile.BadZipFile:
             logger.error("Invalid zip file")

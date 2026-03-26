@@ -279,7 +279,7 @@ async def upload_dataset_folder(
         
         # Upload: original always to v1; split to v2 when large enough
         try:
-            (dataset_files_v1, total_size_v1, _), v2_result = await file_service.upload_dataset_folder(
+            (dataset_files_v1, total_size_v1, split_counts_v1), v2_result = await file_service.upload_dataset_folder(
                 zip_file=zip_file,
                 user_id=user_id,
                 dataset_id=dataset_id,
@@ -306,6 +306,10 @@ async def upload_dataset_folder(
         file_types_v1 = list(set([f.file_type for f in dataset_files_v1]))
         folder_path_v1 = f"datasets/{user_id}/{dataset_id}/{v1}/"
         custom_meta_v1 = {"file_count": len(dataset_files_v1), "preserve_structure": preserve_structure}
+        # If the uploaded folder already had train/test/drift structure (e.g., mitigated dataset zip),
+        # preserve split metadata on this version so split=train|test|drift downloads work.
+        if split_counts_v1:
+            custom_meta_v1["split"] = split_counts_v1
         
         dataset_metadata_v1 = DatasetMetadata(
             dataset_id=dataset_id,

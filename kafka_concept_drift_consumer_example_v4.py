@@ -924,6 +924,7 @@ async def process_drift_trigger(event: dict, producer: AIOKafkaProducer) -> None
                 predictor=predictor,
                 feature_cols=feature_cols,
                 target_col=target_column,
+                retrain_path=retrain_path,
                 window_size=window_size,
                 delta=0.2,
                 clock=1,
