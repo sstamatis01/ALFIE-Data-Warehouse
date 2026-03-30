@@ -17,7 +17,7 @@ def validate_object_id(v):
 PyObjectId = Annotated[
     ObjectId,
     BeforeValidator(validate_object_id),
-    PlainSerializer(lambda x: str(x), return_type=str)
+    PlainSerializer(lambda x: str(x), return_type=str),
 ]
 
 
@@ -32,27 +32,38 @@ class ModelFramework(str, Enum):
 
 
 class ModelType(str, Enum):
-    CLASSIFICATION = "classification"
-    REGRESSION = "regression"
-    CLUSTERING = "clustering"
-    NLP = "nlp"
-    COMPUTER_VISION = "computer_vision"
-    RECOMMENDATION = "recommendation"
-    TIME_SERIES = "time_series"
-    REINFORCEMENT_LEARNING = "reinforcement_learning"
+    IMAGE_CLASSIFICATION = "image_classification"
+    IMAGE_SEGMENTATION = "image_segmentation"
+    OBJECT_DETECTION = "object_detection"
+    VIDEO_CLASSIFICATION = "video_classification"
+    KEYPOINT_DETECTION = "keypoint_detection"
+    AUDIO_CLASSIFICATION = "audio_classification"
+    TEXT_CLASSIFICATION = "text_classification"
+    QUESTION_ANSWERING = "question_answering"
+    CAUSAL_LM = "causal_lm"
+    SEQ2SEQ_LM = "seq2seq_lm"
+    MASKED_LM = "masked_lm"
+    TABULAR_CLASSIFICATION = "tabular_classification"
+    TABULAR_REGRESSION = "tabular_regression"
+    TABULAR_TIME_SERIES = "tabular_time_series"
     OTHER = "other"
 
 
 class ModelFile(BaseModel):
     """Represents a single file within a model"""
+
     filename: str = Field(..., description="Original filename")
     file_path: str = Field(..., description="Path in MinIO storage")
     file_size: int = Field(..., description="File size in bytes")
     file_type: str = Field(..., description="File extension")
     file_hash: str = Field(..., description="MD5 hash of the file")
     content_type: Optional[str] = Field(None, description="MIME type of the file")
-    is_primary: bool = Field(default=False, description="Whether this is the main model file")
-    description: Optional[str] = Field(None, description="Description of this file's purpose")
+    is_primary: bool = Field(
+        default=False, description="Whether this is the main model file"
+    )
+    description: Optional[str] = Field(
+        None, description="Description of this file's purpose"
+    )
 
 
 class AIModelMetadata(BaseModel):
@@ -62,47 +73,67 @@ class AIModelMetadata(BaseModel):
     name: str = Field(..., description="Model name")
     description: Optional[str] = Field(None, description="Model description")
     version: str = Field(default="v1", description="Model version")
-    
+
     # Model characteristics
     framework: ModelFramework = Field(..., description="ML framework used")
     model_type: ModelType = Field(..., description="Type of ML model")
     algorithm: Optional[str] = Field(None, description="Specific algorithm used")
-    
+
     # Model files
-    files: List[ModelFile] = Field(default_factory=list, description="List of model files")
-    primary_file_path: Optional[str] = Field(None, description="Path to the primary model file")
-    is_model_folder: bool = Field(default=False, description="Whether this is a folder upload (multiple files)")
+    files: List[ModelFile] = Field(
+        default_factory=list, description="List of model files"
+    )
+    primary_file_path: Optional[str] = Field(
+        None, description="Path to the primary model file"
+    )
+    is_model_folder: bool = Field(
+        default=False, description="Whether this is a folder upload (multiple files)"
+    )
     model_file_count: int = Field(default=1, description="Number of model files")
-    
+
     # Model metadata
     input_shape: Optional[List[int]] = Field(None, description="Expected input shape")
     output_shape: Optional[List[int]] = Field(None, description="Expected output shape")
-    num_parameters: Optional[int] = Field(None, description="Number of model parameters")
+    num_parameters: Optional[int] = Field(
+        None, description="Number of model parameters"
+    )
     model_size_mb: Optional[float] = Field(None, description="Total model size in MB")
-    
+
     # Training metadata
-    training_dataset: Optional[str] = Field(None, description="Training dataset identifier")
+    training_dataset: Optional[str] = Field(
+        None, description="Training dataset identifier"
+    )
     training_accuracy: Optional[float] = Field(None, description="Training accuracy")
-    validation_accuracy: Optional[float] = Field(None, description="Validation accuracy")
+    validation_accuracy: Optional[float] = Field(
+        None, description="Validation accuracy"
+    )
     test_accuracy: Optional[float] = Field(None, description="Test accuracy")
     training_loss: Optional[float] = Field(None, description="Final training loss")
-    
+
     # Model requirements
     python_version: Optional[str] = Field(None, description="Required Python version")
-    dependencies: List[str] = Field(default_factory=list, description="Required dependencies")
-    hardware_requirements: Optional[str] = Field(None, description="Hardware requirements")
-    
+    dependencies: List[str] = Field(
+        default_factory=list, description="Required dependencies"
+    )
+    hardware_requirements: Optional[str] = Field(
+        None, description="Hardware requirements"
+    )
+
     # Additional metadata
     tags: List[str] = Field(default_factory=list, description="Tags for categorization")
-    custom_metadata: Dict[str, Any] = Field(default_factory=dict, description="Custom metadata fields")
-    
+    custom_metadata: Dict[str, Any] = Field(
+        default_factory=dict, description="Custom metadata fields"
+    )
+
     # Timestamps
     created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
-    
+
     # Model status
     is_active: bool = Field(default=True, description="Whether the model is active")
-    is_production_ready: bool = Field(default=False, description="Whether the model is production ready")
+    is_production_ready: bool = Field(
+        default=False, description="Whether the model is production ready"
+    )
 
     class Config:
         populate_by_name = True
@@ -185,6 +216,7 @@ class ModelResponse(BaseModel):
 
 class ModelFileUpload(BaseModel):
     """Request model for uploading a single model file"""
+
     user_id: str
     model_id: str
     version: str = "v1"
@@ -194,6 +226,7 @@ class ModelFileUpload(BaseModel):
 
 class ModelFolderUpload(BaseModel):
     """Request model for uploading a model folder"""
+
     user_id: str
     model_id: str
     version: str = "v1"
