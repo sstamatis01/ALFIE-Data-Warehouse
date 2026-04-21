@@ -326,13 +326,18 @@ The application automatically creates necessary indexes for optimal performance:
 4. Add tests
 5. Submit a pull request
 
-## License
-
-MIT License - see LICENSE file for details
-
 ## Support
 
 For issues and questions:
 - Create an issue in the repository
 - Check the API documentation at `/docs`
 - Review the logs for debugging information
+
+## Licence 
+
+MIT Licence
+
+## Acknowledgement
+ALFIE has received funding by the European Union’s Horizon Europe research and innovation programme under Grant Agreement Nº 101177912 [ALFIE](https://alfie-project.eu/)
+
+<img src="alfie_logo-100x100.png" />
