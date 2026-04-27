@@ -25,7 +25,8 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
     
     # Kafka Configuration
-    kafka_bootstrap_servers: str = "alfie.iti.gr:9092"
+    # Default to localhost for local development; deployment should override via env.
+    kafka_bootstrap_servers: str = "localhost:9092"
     kafka_dataset_topic: str = "dataset-events"
     kafka_client_id: str = "data-warehouse-api"
     kafka_bias_topic: str = "bias-detection-complete-events"

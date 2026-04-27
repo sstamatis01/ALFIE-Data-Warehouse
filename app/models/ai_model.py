@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Annotated
-from pydantic import BaseModel, Field, BeforeValidator, PlainSerializer
+from pydantic import BaseModel, Field, BeforeValidator, PlainSerializer, ConfigDict
 from bson import ObjectId
 from enum import Enum
 
@@ -32,15 +32,69 @@ class ModelFramework(str, Enum):
 
 
 class ModelType(str, Enum):
+    """
+    Stored on each model record and validated on read/write.
+
+    Prefer modality-specific values for new uploads (e.g. tabular_classification).
+    Generic ``classification`` / ``regression`` are kept for legacy integrations
+    (e.g. AutoML pipelines that pass sklearn-style task_type strings).
+    """
+
+    # Vision / multimedia
+    IMAGE_CLASSIFICATION = "image_classification"
+    IMAGE_SEGMENTATION = "image_segmentation"
+    OBJECT_DETECTION = "object_detection"
+    VIDEO_CLASSIFICATION = "video_classification"
+    KEYPOINT_DETECTION = "keypoint_detection"
+    AUDIO_CLASSIFICATION = "audio_classification"
+
+    # NLP / LLM
+    TEXT_CLASSIFICATION = "text_classification"
+    QUESTION_ANSWERING = "question_answering"
+    CAUSAL_LM = "causal_lm"
+    SEQ2SEQ_LM = "seq2seq_lm"
+    MASKED_LM = "masked_lm"
+
+    # Tabular / AutoML (preferred for structured data)
+    TABULAR_CLASSIFICATION = "tabular_classification"
+    TABULAR_REGRESSION = "tabular_regression"
+    TABULAR_TIME_SERIES = "tabular_time_series"
+
+    # Generic task names (legacy; many clients send these instead of tabular_*)
     CLASSIFICATION = "classification"
     REGRESSION = "regression"
+
+    # Original coarse-grained categories (existing DB rows)
     CLUSTERING = "clustering"
     NLP = "nlp"
     COMPUTER_VISION = "computer_vision"
     RECOMMENDATION = "recommendation"
     TIME_SERIES = "time_series"
     REINFORCEMENT_LEARNING = "reinforcement_learning"
+
     OTHER = "other"
+
+def _normalize_model_type_slug(v):
+    """
+    Normalize legacy task/model type slugs to the canonical set.
+
+    - AutoML Tabular vNext expects tabular_* slugs.
+    - Older DW records and Kafka events may still contain generic 'classification'/'regression'/'time_series'.
+    """
+    if v is None:
+        return v
+    # Accept enums/objects, and tolerate "ModelType.foo" / "modeltype.foo" strings from external services.
+    raw = getattr(v, "value", v)
+    s = str(raw).strip()
+    if "." in s:
+        s = s.split(".")[-1]
+    s = s.strip().lower()
+    legacy_to_canonical = {
+        "regression": "tabular_regression",
+        "time_series": "tabular_time_series",
+        "timeseries": "tabular_time_series",
+    }
+    return legacy_to_canonical.get(s, s)
 
 
 class ModelFile(BaseModel):
@@ -65,7 +119,7 @@ class AIModelMetadata(BaseModel):
     
     # Model characteristics
     framework: ModelFramework = Field(..., description="ML framework used")
-    model_type: ModelType = Field(..., description="Type of ML model")
+    model_type: Annotated[ModelType, BeforeValidator(_normalize_model_type_slug)] = Field(..., description="Type of ML model")
     algorithm: Optional[str] = Field(None, description="Specific algorithm used")
     
     # Model files
@@ -104,9 +158,11 @@ class AIModelMetadata(BaseModel):
     is_active: bool = Field(default=True, description="Whether the model is active")
     is_production_ready: bool = Field(default=False, description="Whether the model is production ready")
 
-    class Config:
-        populate_by_name = True
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        protected_namespaces=(),
+    )
 
 
 class ModelCreate(BaseModel):
@@ -116,7 +172,7 @@ class ModelCreate(BaseModel):
     description: Optional[str] = None
     version: str = "v1"
     framework: ModelFramework
-    model_type: ModelType
+    model_type: Annotated[ModelType, BeforeValidator(_normalize_model_type_slug)]
     algorithm: Optional[str] = None
     input_shape: Optional[List[int]] = None
     output_shape: Optional[List[int]] = None
@@ -130,6 +186,8 @@ class ModelCreate(BaseModel):
     hardware_requirements: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
     custom_metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(protected_namespaces=())
 
 
 class ModelUpdate(BaseModel):
@@ -151,6 +209,8 @@ class ModelUpdate(BaseModel):
     is_active: Optional[bool] = None
     is_production_ready: Optional[bool] = None
 
+    model_config = ConfigDict(protected_namespaces=())
+
 
 class ModelResponse(BaseModel):
     model_id: str
@@ -159,7 +219,7 @@ class ModelResponse(BaseModel):
     description: Optional[str]
     version: str
     framework: ModelFramework
-    model_type: ModelType
+    model_type: Annotated[ModelType, BeforeValidator(_normalize_model_type_slug)]
     algorithm: Optional[str]
     files: List[ModelFile]
     primary_file_path: Optional[str]
@@ -182,6 +242,8 @@ class ModelResponse(BaseModel):
     is_active: bool
     is_production_ready: bool
 
+    model_config = ConfigDict(protected_namespaces=())
+
 
 class ModelFileUpload(BaseModel):
     """Request model for uploading a single model file"""
@@ -191,6 +253,8 @@ class ModelFileUpload(BaseModel):
     is_primary: bool = False
     description: Optional[str] = None
 
+    model_config = ConfigDict(protected_namespaces=())
+
 
 class ModelFolderUpload(BaseModel):
     """Request model for uploading a model folder"""
@@ -198,3 +262,5 @@ class ModelFolderUpload(BaseModel):
     model_id: str
     version: str = "v1"
     preserve_structure: bool = True
+
+    model_config = ConfigDict(protected_namespaces=())

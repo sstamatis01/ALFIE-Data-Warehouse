@@ -56,8 +56,9 @@ services:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       # PLAINTEXT_HOST must advertise the host external clients use (IP or hostname).
-      # Deployment default is alfie.iti.gr; override with KAFKA_ADVERTISED_HOST=localhost for local testing.
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://${KAFKA_ADVERTISED_HOST:-alfie.iti.gr}:9092
+      # IMPORTANT: For local stacks, Kafka must advertise localhost so host clients don't get redirected to deployment.
+      # Override KAFKA_ADVERTISED_HOST in deployment (e.g. alfie.iti.gr).
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://${KAFKA_ADVERTISED_HOST:-localhost}:9092
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1

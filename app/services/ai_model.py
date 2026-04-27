@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Annotated
-from pydantic import BaseModel, Field, BeforeValidator, PlainSerializer
+from pydantic import BaseModel, Field, BeforeValidator, PlainSerializer, ConfigDict
 from bson import ObjectId
 from enum import Enum
 
@@ -32,6 +32,12 @@ class ModelFramework(str, Enum):
 
 
 class ModelType(str, Enum):
+    # Preferred (matches AutoML vNext and DW `app/models/ai_model.py`)
+    TABULAR_CLASSIFICATION = "tabular_classification"
+    TABULAR_REGRESSION = "tabular_regression"
+    TABULAR_TIME_SERIES = "tabular_time_series"
+
+    # Legacy (kept for backward compatibility; normalized to tabular_* on read/write)
     CLASSIFICATION = "classification"
     REGRESSION = "regression"
     CLUSTERING = "clustering"
@@ -41,6 +47,21 @@ class ModelType(str, Enum):
     TIME_SERIES = "time_series"
     REINFORCEMENT_LEARNING = "reinforcement_learning"
     OTHER = "other"
+
+def _normalize_model_type_slug(v):
+    if v is None:
+        return v
+    raw = getattr(v, "value", v)
+    s = str(raw).strip()
+    if "." in s:
+        s = s.split(".")[-1]
+    s = s.strip().lower()
+    legacy_to_canonical = {
+        "regression": "tabular_regression",
+        "time_series": "tabular_time_series",
+        "timeseries": "tabular_time_series",
+    }
+    return legacy_to_canonical.get(s, s)
 
 
 class ModelFile(BaseModel):
@@ -65,7 +86,7 @@ class AIModelMetadata(BaseModel):
     
     # Model characteristics
     framework: ModelFramework = Field(..., description="ML framework used")
-    model_type: ModelType = Field(..., description="Type of ML model")
+    model_type: Annotated[ModelType, BeforeValidator(_normalize_model_type_slug)] = Field(..., description="Type of ML model")
     algorithm: Optional[str] = Field(None, description="Specific algorithm used")
     
     # Model files
@@ -104,9 +125,11 @@ class AIModelMetadata(BaseModel):
     is_active: bool = Field(default=True, description="Whether the model is active")
     is_production_ready: bool = Field(default=False, description="Whether the model is production ready")
 
-    class Config:
-        populate_by_name = True
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        protected_namespaces=(),
+    )
 
 
 class ModelCreate(BaseModel):

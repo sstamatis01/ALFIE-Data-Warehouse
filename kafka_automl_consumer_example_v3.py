@@ -78,6 +78,64 @@ logger.info(f"  AutoML Vision: {AUTOML_VISION_BEST_MODEL_URL}")
 if VISION_AUTOML_HOST == "localhost" and os.getenv("KAFKA_BOOTSTRAP_SERVERS", "").find("kafka") >= 0:
     logger.warning("  When running in Docker, set VISION_AUTOML_HOST=host.docker.internal so the container can reach Vision on the host")
 
+def compute_request_timeouts(time_budget_seconds: int) -> tuple[float, float]:
+    """
+    Compute robust timeouts for long AutoML jobs.
+    - connect timeout: short (network)
+    - read timeout: long (download + unzip + dataloaders + training + upload)
+    """
+    try:
+        tb = int(time_budget_seconds)
+    except Exception:
+        tb = 0
+    read_timeout = max(120, tb + 120)
+    return (10, float(read_timeout))
+
+def normalize_tabular_task_type(task_type: str | None) -> str | None:
+    """
+    AutoML Tabular service vNext expects:
+      - tabular_classification
+      - tabular_regression
+      - tabular_time_series
+
+    For backward compatibility, map legacy slugs commonly emitted by orchestrators.
+    """
+    if task_type is None:
+        return None
+    t = str(task_type).strip().lower()
+    legacy_map = {
+        "classification": "tabular_classification",
+        "tabular_classification": "tabular_classification",
+        "regression": "tabular_regression",
+        "tabular_regression": "tabular_regression",
+        "time_series": "tabular_time_series",
+        "timeseries": "tabular_time_series",
+        "tabular_time_series": "tabular_time_series",
+    }
+    return legacy_map.get(t, t)
+
+def normalize_vision_task_type(task_type: str | None) -> str | None:
+    """
+    AutoML Vision often uses modality-specific slugs (e.g. image_classification).
+    Keep backward compatibility with orchestrators that still send generic 'classification'.
+    """
+    if task_type is None:
+        return None
+    t = str(task_type).strip().lower()
+    legacy_map = {
+        # generic -> canonical (most common)
+        "classification": "image_classification",
+        # already canonical / accepted
+        "image_classification": "image_classification",
+        "image_segmentation": "image_segmentation",
+        "object_detection": "object_detection",
+        "video_classification": "video_classification",
+        "keypoint_detection": "keypoint_detection",
+        "audio_classification": "audio_classification",
+        "text_classification": "text_classification",
+    }
+    return legacy_map.get(t, t)
+
 
 async def send_automl_failure_to_kafka(
     producer: AIOKafkaProducer,
@@ -480,6 +538,10 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
         
         # Step 2: Call AutoML service with all necessary information
         if task_category == "tabular":
+            normalized_task_type = normalize_tabular_task_type(task_type)
+            if normalized_task_type != (str(task_type).strip().lower() if task_type is not None else None):
+                logger.info(f"  Normalized tabular task_type: {task_type} -> {normalized_task_type}")
+
             # Optional validation before calling AutoML service: ensure bytes are readable tabular data.
             # This catches malformed/incorrect dataset payloads early with clear logs.
             try:
@@ -513,7 +575,7 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                 "dataset_version": dataset_version,
                 "target_column_name": target_column,
                 "time_stamp_column_name": "",  # Empty string for non-time-series tasks
-                "task_type": task_type,
+                "task_type": normalized_task_type,
                 "time_budget": time_budget_seconds  # Send as integer in seconds
             }
             # Tell the AutoML tabular service to request the train split when downloading from DW (split datasets)
@@ -538,14 +600,17 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                 logger.warning(f"   This might indicate the service is not running or not accessible")
             
             try:
-                # Calculate timeout: time_budget (seconds) + small buffer for request/overhead.
-                # Keep buffer small so local tests like time_budget=10 complete quickly end-to-end.
-                request_timeout = time_budget_seconds + 10
+                connect_timeout, read_timeout = compute_request_timeouts(time_budget_seconds)
                 logger.info(
-                    f"Setting request timeout to {request_timeout} seconds to accommodate "
-                    f"{time_budget_seconds} seconds of training + overhead"
+                    f"Setting request timeout to connect={connect_timeout}s, read={read_timeout}s "
+                    f"(time_budget={time_budget_seconds}s + overhead)"
                 )
-                r = requests.post(AUTOML_TABULAR_BEST_MODEL_URL, data=data, headers=headers, timeout=request_timeout)
+                r = requests.post(
+                    AUTOML_TABULAR_BEST_MODEL_URL,
+                    data=data,
+                    headers=headers,
+                    timeout=(connect_timeout, read_timeout),
+                )
                 r.raise_for_status()
             except requests.exceptions.ConnectionError as e:
                 logger.error(f"Failed to connect to AutoML Tabular at {AUTOML_TABULAR_BEST_MODEL_URL}")
@@ -576,11 +641,11 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                     await send_automl_failure_to_kafka(producer, task_id, user_id, dataset_id, err_msg, dataset_version)
                 return
             except requests.exceptions.Timeout as e:
-                logger.error(f"Request to AutoML service timed out after {request_timeout} seconds")
+                logger.error(f"Request to AutoML service timed out (connect/read): {e}")
                 logger.error(f"   Training may have taken longer than expected")
                 logger.error(f"   Consider increasing time_budget or checking service logs")
                 if producer and task_id:
-                    await send_automl_failure_to_kafka(producer, task_id, user_id, dataset_id, f"Timeout after {request_timeout}s: {e}", dataset_version)
+                    await send_automl_failure_to_kafka(producer, task_id, user_id, dataset_id, f"Timeout: {e}", dataset_version)
                 return
             
             response_data = r.json() if r.content else {}
@@ -622,32 +687,40 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                 logger.warning(f"Invalid time_budget '{time_budget}', using default 10 seconds")
                 time_budget_seconds = 10
 
+            normalized_vision_task_type = normalize_vision_task_type(task_type or "classification")
+            if (task_type or "classification") != normalized_vision_task_type:
+                logger.info(f"  Normalized vision task_type: {task_type} -> {normalized_vision_task_type}")
+
             data = {
                 "user_id": user_id,
                 "dataset_id": dataset_id,
                 "dataset_version": dataset_version or "v1",
                 "filename_column": filename_column,
                 "label_column": label_column,
-                "task_type": task_type or "classification",
+                "task_type": normalized_vision_task_type,
                 "time_budget": time_budget_seconds,
                 "model_size": (model_size or "small").strip().lower(),
             }
-            if has_split:
+            requested_split = (input_obj.get("dataset_split") or "").strip().lower()
+            if has_split and requested_split in ("train", "test", "drift"):
+                data["dataset_split"] = requested_split
+                logger.info(f"  Passing dataset_split={requested_split} so Vision service uses split from DW")
+            elif has_split:
                 data["dataset_split"] = "train"
                 logger.info("  Passing dataset_split=train so Vision service uses train split from DW")
             headers = {"X-Task-ID": task_id} if task_id else None
 
-            request_timeout = time_budget_seconds + 10
+            connect_timeout, read_timeout = compute_request_timeouts(time_budget_seconds)
             logger.info(f"Calling AutoML Vision: {AUTOML_VISION_BEST_MODEL_URL}")
             logger.info(f"   filename_column={filename_column}, label_column={label_column}, model_size={model_size}")
-            logger.info(f"   time_budget={time_budget_seconds}s, request_timeout={request_timeout}s")
+            logger.info(f"   time_budget={time_budget_seconds}s, timeout=connect={connect_timeout}s read={read_timeout}s")
 
             try:
                 r = requests.post(
                     AUTOML_VISION_BEST_MODEL_URL,
                     data=data,
                     headers=headers,
-                    timeout=request_timeout,
+                    timeout=(connect_timeout, read_timeout),
                 )
                 r.raise_for_status()
             except requests.exceptions.ConnectionError as e:
@@ -663,20 +736,26 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
             except requests.exceptions.HTTPError as e:
                 logger.error(f"AutoML Vision HTTP error: {e}")
                 err_msg = str(e)
-                if e.response and e.response.content:
+                if e.response is not None:
                     try:
-                        err_msg = f"{e.response.status_code}: {json.dumps(e.response.json())}"
-                        logger.error(f"   Response: {e.response.json()}")
+                        body_json = e.response.json() if e.response.content else None
+                        if body_json is not None:
+                            err_msg = f"{e.response.status_code} {e.response.url}: {json.dumps(body_json)}"
+                            logger.error(f"   Response body: {json.dumps(body_json)}")
+                        else:
+                            err_msg = f"{e.response.status_code} {e.response.url}: <empty body>"
+                            logger.error("   Response body: <empty>")
                     except Exception:
-                        err_msg = f"{e.response.status_code}: {e.response.text[:500]}"
-                        logger.error(f"   Response: {e.response.text[:500]}")
+                        txt = (e.response.text or "")[:1000]
+                        err_msg = f"{e.response.status_code} {e.response.url}: {txt}"
+                        logger.error(f"   Response body (text): {txt}")
                 if producer and task_id:
                     await send_automl_failure_to_kafka(producer, task_id, user_id, dataset_id, err_msg, dataset_version)
                 return
             except requests.exceptions.Timeout as e:
-                logger.error(f"AutoML Vision request timed out after {request_timeout}s")
+                logger.error(f"AutoML Vision request timed out (connect/read): {e}")
                 if producer and task_id:
-                    await send_automl_failure_to_kafka(producer, task_id, user_id, dataset_id, f"Timeout after {request_timeout}s: {e}", dataset_version)
+                    await send_automl_failure_to_kafka(producer, task_id, user_id, dataset_id, f"Timeout: {e}", dataset_version)
                 return
 
             response_data = r.json() if r.content else {}
@@ -742,6 +821,12 @@ async def run_consumer() -> None:
         group_id=KAFKA_CONSUMER_GROUP,
         auto_offset_reset="earliest",
         enable_auto_commit=True,
+        # Prevent group rebalances during long training jobs (time_budget + overhead).
+        # max_poll_interval_ms is the max time between successive polls.
+        max_poll_interval_ms=int(os.getenv("KAFKA_MAX_POLL_INTERVAL_MS", str(10 * 60 * 1000))),
+        session_timeout_ms=int(os.getenv("KAFKA_SESSION_TIMEOUT_MS", "30000")),
+        heartbeat_interval_ms=int(os.getenv("KAFKA_HEARTBEAT_INTERVAL_MS", "10000")),
+        max_poll_records=int(os.getenv("KAFKA_MAX_POLL_RECORDS", "1")),
         value_deserializer=lambda m: json.loads(m.decode("utf-8")),
         key_deserializer=lambda m: m.decode("utf-8") if m else None,
     )

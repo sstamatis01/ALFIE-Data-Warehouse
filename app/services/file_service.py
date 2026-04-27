@@ -11,6 +11,7 @@ from ..models.dataset import DatasetMetadata, DatasetFile
 import logging
 import tempfile
 import zipfile
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,9 @@ class FileService:
 
     # Extensions treated as images vs annotation files for folder upload validation
     _IMAGE_EXTENSIONS = frozenset({"jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif"})
-    _ANNOTATION_EXTENSIONS = frozenset({"csv", "json", "xml", "txt"})
+    # AutoML Vision contract: annotations must be machine-readable.
+    # We intentionally do NOT accept "txt" as it could be a readme and not a label mapping.
+    _ANNOTATION_EXTENSIONS = frozenset({"csv", "json"})
 
     @staticmethod
     def _check_image_folder_has_annotations(
@@ -75,6 +78,275 @@ class FileService:
         # Consider it an image folder if at least one file is an image
         is_image_folder = image_count > 0
         return is_image_folder, has_annotation
+
+    @staticmethod
+    def _normalize_relpath(p: str) -> str:
+        """Normalize to forward-slash relative paths for comparisons."""
+        return (p or "").replace("\\", "/").lstrip("./")
+
+    @staticmethod
+    def _validate_automl_vision_annotations(
+        collected: List[Tuple[str, str, bytes, int, str]],
+        *,
+        filename_column: str = "filename",
+        label_column: str = "label",
+    ) -> None:
+        """
+        Enforce the AutoML Vision dataset contract for image folder uploads.
+
+        Contract enforced at dataset-upload time (so training can't proceed with bad inputs):
+        - ZIP contains >=1 image file
+        - ZIP contains an annotation file in CSV or JSON
+        - Annotation rows reference image paths that exist in the ZIP
+        - Annotation file contains at least the columns: filename_column + label_column
+          (defaults to 'filename' and 'label' as used by orchestrator/consumer)
+        """
+        if not collected:
+            return
+
+        images: set[str] = set()
+        annotation_candidates: list[tuple[str, str, bytes]] = []  # (relpath, ext, data)
+
+        for rel, name, data, _size, ext in collected:
+            ext_lower = (ext or "").lower()
+            rel_norm = FileService._normalize_relpath(rel)
+            if ext_lower in FileService._IMAGE_EXTENSIONS:
+                images.add(rel_norm)
+            if ext_lower in FileService._ANNOTATION_EXTENSIONS:
+                annotation_candidates.append((rel_norm, ext_lower, data))
+
+        if not images:
+            return  # not a vision dataset
+
+        # Prefer explicit "annotations.*" files if present.
+        preferred = [c for c in annotation_candidates if os.path.basename(c[0]).lower().startswith("annotations.")]
+        candidates = preferred or annotation_candidates
+
+        if not candidates:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing annotations file. Please provide an annotations CSV or JSON (with filename+label) and re-upload your dataset.",
+            )
+
+        fn_col = (filename_column or "filename").strip().lower()
+        lbl_col = (label_column or "label").strip().lower()
+
+        def _coerce_filename_value(v) -> str | None:
+            if v is None:
+                return None
+            s = str(v).strip()
+            if not s:
+                return None
+            return FileService._normalize_relpath(s)
+
+        # Try candidates until we find one that validates.
+        last_error: str | None = None
+        for rel_norm, ext_lower, data in candidates:
+            try:
+                if ext_lower == "csv":
+                    try:
+                        df = pd.read_csv(BytesIO(data))
+                    except Exception as e:
+                        raise ValueError(f"Could not parse CSV: {e}") from e
+
+                    cols = {str(c).strip().lower(): c for c in df.columns}
+                    if fn_col not in cols or lbl_col not in cols:
+                        raise ValueError(
+                            f"CSV must contain columns '{filename_column}' and '{label_column}'. Found: {list(df.columns)[:30]}"
+                        )
+                    if df.empty:
+                        raise ValueError("CSV has no rows")
+
+                    filenames = df[cols[fn_col]].apply(_coerce_filename_value).dropna()
+                    if filenames.empty:
+                        raise ValueError("CSV has no valid filenames")
+
+                    # Require that at least one annotation row references an existing image file.
+                    # We allow both full relative paths and basenames as long as they match uniquely.
+                    image_basenames = {}
+                    for img in images:
+                        bn = os.path.basename(img).lower()
+                        image_basenames.setdefault(bn, 0)
+                        image_basenames[bn] += 1
+
+                    matched = 0
+                    for fn in filenames.head(5000):  # cap work on huge annotation files
+                        if fn in images:
+                            matched += 1
+                            continue
+                        bn = os.path.basename(fn).lower()
+                        if image_basenames.get(bn, 0) == 1:
+                            matched += 1
+                    if matched == 0:
+                        raise ValueError(
+                            "CSV does not reference any images found in the ZIP (check paths in the filename column)."
+                        )
+
+                    return  # valid
+
+                if ext_lower == "json":
+                    try:
+                        obj = json.loads(data.decode("utf-8", errors="strict"))
+                    except Exception as e:
+                        raise ValueError(f"Could not parse JSON: {e}") from e
+
+                    # Support a simple list-of-objects format: [{"filename": "...", "label": "..."}]
+                    if isinstance(obj, dict) and "annotations" in obj:
+                        obj = obj["annotations"]
+                    if not isinstance(obj, list) or not obj:
+                        raise ValueError("JSON must be a non-empty list (or a dict with key 'annotations' as a list)")
+
+                    first = obj[0]
+                    if not isinstance(first, dict):
+                        raise ValueError("JSON list items must be objects")
+
+                    # Case-insensitive key lookup
+                    def _get_ci(d: dict, key: str):
+                        for k, v in d.items():
+                            if str(k).strip().lower() == key:
+                                return v
+                        return None
+
+                    image_basenames = {}
+                    for img in images:
+                        bn = os.path.basename(img).lower()
+                        image_basenames.setdefault(bn, 0)
+                        image_basenames[bn] += 1
+
+                    matched = 0
+                    checked = 0
+                    for item in obj[:5000]:
+                        if not isinstance(item, dict):
+                            continue
+                        checked += 1
+                        fn_val = _coerce_filename_value(_get_ci(item, fn_col))
+                        lbl_val = _get_ci(item, lbl_col)
+                        if fn_val is None or lbl_val is None or str(lbl_val).strip() == "":
+                            continue
+                        if fn_val in images:
+                            matched += 1
+                            continue
+                        bn = os.path.basename(fn_val).lower()
+                        if image_basenames.get(bn, 0) == 1:
+                            matched += 1
+                    if checked == 0:
+                        raise ValueError("JSON contains no object annotations")
+                    if matched == 0:
+                        raise ValueError(
+                            "JSON does not reference any images found in the ZIP (check paths in the filename key)."
+                        )
+                    return  # valid
+
+                last_error = f"Unsupported annotation extension: {ext_lower}"
+            except Exception as e:
+                last_error = f"{rel_norm}: {e}"
+                continue
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid or missing annotations for image dataset. "
+                f"Expected CSV/JSON with '{filename_column}' and '{label_column}' referencing images in the ZIP. "
+                f"Last error: {last_error or 'unknown'}"
+            ),
+        )
+
+    @staticmethod
+    def _select_annotation_candidate(
+        collected: List[Tuple[str, str, bytes, int, str]],
+    ) -> tuple[str, str, bytes] | None:
+        """
+        Pick the annotation file for a vision dataset.
+        Preference order:
+        1) basename starts with 'annotations.' (any folder)
+        2) first csv/json found
+        Returns (relative_path_normalized, ext_lower, data) or None.
+        """
+        candidates: list[tuple[str, str, bytes]] = []
+        preferred: list[tuple[str, str, bytes]] = []
+        for rel, _name, data, _size, ext in collected:
+            ext_lower = (ext or "").lower()
+            if ext_lower not in FileService._ANNOTATION_EXTENSIONS:
+                continue
+            rel_norm = FileService._normalize_relpath(rel)
+            item = (rel_norm, ext_lower, data)
+            candidates.append(item)
+            if os.path.basename(rel_norm).lower().startswith("annotations."):
+                preferred.append(item)
+        if preferred:
+            return preferred[0]
+        if candidates:
+            return candidates[0]
+        return None
+
+    @staticmethod
+    def _parse_vision_annotations_to_rows(
+        annotation_relpath: str,
+        ext_lower: str,
+        data: bytes,
+        *,
+        filename_column: str = "filename",
+        label_column: str = "label",
+    ) -> list[dict]:
+        """
+        Parse CSV/JSON annotations into list-of-dicts rows.
+        For CSV we preserve all columns; for JSON we preserve keys.
+        """
+        fn_key = (filename_column or "filename").strip()
+        lbl_key = (label_column or "label").strip()
+        fn_key_l = fn_key.lower()
+        lbl_key_l = lbl_key.lower()
+
+        def _has_required_keys_dict(d: dict) -> bool:
+            keys_l = {str(k).strip().lower() for k in d.keys()}
+            return fn_key_l in keys_l and lbl_key_l in keys_l
+
+        if ext_lower == "csv":
+            try:
+                df = pd.read_csv(BytesIO(data))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid annotations CSV '{annotation_relpath}': {e}")
+            cols_l = {str(c).strip().lower() for c in df.columns}
+            if fn_key_l not in cols_l or lbl_key_l not in cols_l:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Annotations CSV '{annotation_relpath}' must contain columns '{fn_key}' and '{lbl_key}'.",
+                )
+            return [{str(c): r[c] for c in df.columns} for _, r in df.iterrows()]
+
+        if ext_lower == "json":
+            try:
+                obj = json.loads(data.decode("utf-8", errors="strict"))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid annotations JSON '{annotation_relpath}': {e}")
+            if isinstance(obj, dict) and "annotations" in obj:
+                obj = obj["annotations"]
+            if not isinstance(obj, list):
+                raise HTTPException(status_code=400, detail=f"Annotations JSON '{annotation_relpath}' must be a list (or a dict with key 'annotations').")
+            rows = [dict(x) for x in obj if isinstance(x, dict)]
+            if not rows:
+                raise HTTPException(status_code=400, detail=f"Annotations JSON '{annotation_relpath}' is empty.")
+            if not any(_has_required_keys_dict(r) for r in rows[:50]):
+                raise HTTPException(status_code=400, detail=f"Annotations JSON '{annotation_relpath}' must contain keys '{fn_key}' and '{lbl_key}'.")
+            return rows
+
+        raise HTTPException(status_code=400, detail=f"Unsupported annotation file '{annotation_relpath}'")
+
+    @staticmethod
+    def _write_split_annotations_bytes(
+        *,
+        ext_lower: str,
+        rows: list[dict],
+    ) -> bytes:
+        """Serialize filtered annotation rows back to CSV/JSON bytes."""
+        if ext_lower == "csv":
+            df = pd.DataFrame(rows)
+            buf = BytesIO()
+            df.to_csv(buf, index=False)
+            return buf.getvalue()
+        if ext_lower == "json":
+            return json.dumps(rows, ensure_ascii=False).encode("utf-8")
+        raise ValueError(f"Unsupported annotation extension: {ext_lower}")
 
     def calculate_file_hash(self, file_data: bytes) -> str:
         """Calculate MD5 hash of file data"""
@@ -381,13 +653,11 @@ class FileService:
                             self._get_file_extension(file),
                         ))
 
-            # Require annotation file when folder contains images
-            is_image_folder, has_annotation = self._check_image_folder_has_annotations(collected)
-            if is_image_folder and not has_annotation:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Annotations missing: image datasets must be accompanied by an annotation file (CSV, JSON, or XML).",
-                )
+            # Enforce AutoML Vision contract for image datasets:
+            # require machine-readable annotations that reference images in the ZIP.
+            is_image_folder, _has_annotation = self._check_image_folder_has_annotations(collected)
+            if is_image_folder:
+                self._validate_automl_vision_annotations(collected, filename_column="filename", label_column="label")
 
             # Detect if the uploaded ZIP already contains a train/test/drift split structure.
             # This commonly happens for bias-mitigated datasets that are uploaded as:
@@ -452,9 +722,20 @@ class FileService:
             logger.info(f"Uploaded {len(dataset_files_v1)} original files to v1, total size: {total_size_v1} bytes")
 
             if do_split and version_split:
-                v2_files, v2_size, split_counts = await self._upload_folder_with_split(
-                    collected, user_id, dataset_id, version_split, preserve_structure
-                )
+                if is_image_folder:
+                    v2_files, v2_size, split_counts = await self._upload_vision_folder_with_split(
+                        collected,
+                        user_id,
+                        dataset_id,
+                        version_split,
+                        preserve_structure,
+                        filename_column="filename",
+                        label_column="label",
+                    )
+                else:
+                    v2_files, v2_size, split_counts = await self._upload_folder_with_split(
+                        collected, user_id, dataset_id, version_split, preserve_structure
+                    )
                 return ((dataset_files_v1, total_size_v1, None), (v2_files, v2_size, split_counts))
 
             if do_split and not version_split:
@@ -527,6 +808,229 @@ class FileService:
             logger.info(f"Uploaded split file: {minio_path}")
 
         logger.info(f"Folder split into train={split_counts['train']}, test={split_counts['test']}, drift={split_counts['drift']}")
+        return dataset_files, total_size, split_counts
+
+    async def _upload_vision_folder_with_split(
+        self,
+        collected: List[Tuple[str, str, bytes, int, str]],
+        user_id: str,
+        dataset_id: str,
+        version: str,
+        preserve_structure: bool,
+        *,
+        filename_column: str = "filename",
+        label_column: str = "label",
+    ) -> Tuple[List[DatasetFile], int, Dict[str, int]]:
+        """
+        Split an image dataset into train/test/drift and generate split-specific annotations.
+
+        - Split assignment is based on image files only.
+        - The original annotation file is not randomly assigned; instead, we generate one per split:
+          train/<annotations.*>, test/<annotations.*>, drift/<annotations.*>
+        - Filenames in annotations are normalized to match paths inside the split ZIP
+          (the DW download strips the train/test/drift prefix).
+        """
+        # Collect image relpaths
+        image_relpaths: list[str] = []
+        image_relset: set[str] = set()
+        image_basename_counts: dict[str, int] = {}
+        for rel, _name, _data, _size, ext in collected:
+            ext_lower = (ext or "").lower()
+            if ext_lower in self._IMAGE_EXTENSIONS:
+                rel_norm = self._normalize_relpath(rel)
+                image_relpaths.append(rel_norm)
+                image_relset.add(rel_norm)
+                bn = os.path.basename(rel_norm).lower()
+                image_basename_counts[bn] = image_basename_counts.get(bn, 0) + 1
+
+        if not image_relpaths:
+            return await self._upload_folder_with_split(collected, user_id, dataset_id, version, preserve_structure)
+
+        # Select + parse annotations
+        ann = self._select_annotation_candidate(collected)
+        if not ann:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing annotations file. Please provide an annotations CSV or JSON (with filename+label) and re-upload your dataset.",
+            )
+        ann_rel, ann_ext, ann_bytes = ann
+        ann_basename = os.path.basename(ann_rel) or f"annotations.{ann_ext}"
+        rows = self._parse_vision_annotations_to_rows(
+            ann_rel, ann_ext, ann_bytes, filename_column=filename_column, label_column=label_column
+        )
+
+        fn_key_l = (filename_column or "filename").strip().lower()
+        lbl_key_l = (label_column or "label").strip().lower()
+
+        def _find_key(d: dict, key_l: str) -> str | None:
+            for k in d.keys():
+                if str(k).strip().lower() == key_l:
+                    return str(k)
+            return None
+
+        fn_key = _find_key(rows[0], fn_key_l) or (filename_column or "filename")
+        lbl_key = _find_key(rows[0], lbl_key_l) or (label_column or "label")
+
+        # Split image list
+        indices = list(range(len(image_relpaths)))
+        random.shuffle(indices)
+        n = len(indices)
+        n_train = int(n * SPLIT_TRAIN_RATIO)
+        n_test = int(n * SPLIT_TEST_RATIO)
+        if n_train == 0 and n > 0:
+            n_train = 1
+        if n_test == 0 and n > 2:
+            n_test = 1
+        n_train = min(n_train, n)
+        n_test = min(n_test, n - n_train)
+        train_idx = set(indices[:n_train])
+        test_idx = set(indices[n_train : n_train + n_test])
+        drift_idx = set(indices[n_train + n_test :])
+
+        split_to_images: dict[str, set[str]] = {"train": set(), "test": set(), "drift": set()}
+        for i, rel_norm in enumerate(image_relpaths):
+            if i in train_idx:
+                split_to_images["train"].add(rel_norm)
+            elif i in test_idx:
+                split_to_images["test"].add(rel_norm)
+            else:
+                split_to_images["drift"].add(rel_norm)
+
+        # Map a filename from annotations to an image relpath in the ZIP
+        def _map_to_rel(fn_val) -> str | None:
+            if fn_val is None:
+                return None
+            rel_norm = self._normalize_relpath(str(fn_val))
+            if rel_norm in image_relset:
+                return rel_norm
+            bn = os.path.basename(rel_norm).lower()
+            if image_basename_counts.get(bn, 0) == 1:
+                for r in image_relset:
+                    if os.path.basename(r).lower() == bn:
+                        return r
+            return None
+
+        # Build split annotation rows
+        split_rows: dict[str, list[dict]] = {"train": [], "test": [], "drift": []}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            mapped = _map_to_rel(row.get(fn_key))
+            lbl_val = row.get(lbl_key)
+            if mapped is None or lbl_val is None or str(lbl_val).strip() == "":
+                continue
+            for split_name in ("train", "test", "drift"):
+                if mapped in split_to_images[split_name]:
+                    r2 = dict(row)
+                    r2[fn_key] = mapped.replace("\\", "/")
+                    split_rows[split_name].append(r2)
+                    break
+
+        # Identify original annotation files to skip uploading into split as-is
+        annotation_relpaths = {
+            self._normalize_relpath(rel)
+            for rel, _n, _d, _s, ext in collected
+            if (ext or "").lower() in self._ANNOTATION_EXTENSIONS
+        }
+
+        dataset_files: List[DatasetFile] = []
+        total_size = 0
+        split_counts: Dict[str, int] = {"train": 0, "test": 0, "drift": 0}
+
+        # Upload images to their assigned split; copy other non-annotation files to all splits
+        rel_to_split = {}
+        for split_name, rels in split_to_images.items():
+            for r in rels:
+                rel_to_split[r] = split_name
+
+        for relative_path, file, file_data, file_size, file_type in collected:
+            rel_norm = self._normalize_relpath(relative_path)
+            ext_lower = (file_type or "").lower()
+
+            if rel_norm in annotation_relpaths:
+                continue
+
+            if ext_lower in self._IMAGE_EXTENSIONS:
+                subfolder = rel_to_split.get(rel_norm, "train")
+                path_in_split = f"{subfolder}/{relative_path}" if preserve_structure else f"{subfolder}/{file}"
+                minio_path = f"datasets/{user_id}/{dataset_id}/{version}/{path_in_split}"
+                self.client.put_object(
+                    bucket_name=self.bucket_name,
+                    object_name=minio_path,
+                    data=BytesIO(file_data),
+                    length=file_size,
+                    content_type="application/octet-stream",
+                )
+                file_hash = self.calculate_file_hash(file_data)
+                dataset_files.append(
+                    DatasetFile(
+                        filename=file,
+                        file_path=minio_path,
+                        file_size=file_size,
+                        file_type=file_type,
+                        file_hash=file_hash,
+                        content_type="application/octet-stream",
+                    )
+                )
+                total_size += file_size
+                split_counts[subfolder] += 1
+            else:
+                for subfolder in ("train", "test", "drift"):
+                    path_in_split = f"{subfolder}/{relative_path}" if preserve_structure else f"{subfolder}/{file}"
+                    minio_path = f"datasets/{user_id}/{dataset_id}/{version}/{path_in_split}"
+                    self.client.put_object(
+                        bucket_name=self.bucket_name,
+                        object_name=minio_path,
+                        data=BytesIO(file_data),
+                        length=file_size,
+                        content_type="application/octet-stream",
+                    )
+                    file_hash = self.calculate_file_hash(file_data)
+                    dataset_files.append(
+                        DatasetFile(
+                            filename=file,
+                            file_path=minio_path,
+                            file_size=file_size,
+                            file_type=file_type,
+                            file_hash=file_hash,
+                            content_type="application/octet-stream",
+                        )
+                    )
+                    total_size += file_size
+                    split_counts[subfolder] += 1
+
+        # Upload generated annotations at root of each split folder
+        for subfolder in ("train", "test", "drift"):
+            out_bytes = self._write_split_annotations_bytes(ext_lower=ann_ext, rows=split_rows[subfolder])
+            minio_path = f"datasets/{user_id}/{dataset_id}/{version}/{subfolder}/{ann_basename}"
+            self.client.put_object(
+                bucket_name=self.bucket_name,
+                object_name=minio_path,
+                data=BytesIO(out_bytes),
+                length=len(out_bytes),
+                content_type="application/octet-stream",
+            )
+            file_hash = self.calculate_file_hash(out_bytes)
+            dataset_files.append(
+                DatasetFile(
+                    filename=ann_basename,
+                    file_path=minio_path,
+                    file_size=len(out_bytes),
+                    file_type=ann_ext,
+                    file_hash=file_hash,
+                    content_type="application/octet-stream",
+                )
+            )
+            total_size += len(out_bytes)
+            split_counts[subfolder] += 1
+
+        logger.info(
+            "Vision folder split complete: train=%d test=%d drift=%d (image files=%d)",
+            split_counts["train"],
+            split_counts["test"],
+            split_counts["drift"],
+            len(image_relpaths),
+        )
         return dataset_files, total_size, split_counts
     
     async def delete_folder_files(self, folder_path: str) -> int:
