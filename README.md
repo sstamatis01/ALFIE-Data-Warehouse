@@ -65,42 +65,69 @@ datasets/
 
 ```bash
 git clone <repository-url>
-cd data-warehouse-app
+cd ALFIE-Data-Warehouse
 ```
 
 ### 2. Environment Configuration
 
-Copy and modify the environment file:
+#### `.env` basics
+
+- **`.env` is required** by `docker-compose.yml` (`env_file: .env`) but is **not committed** to git.
+- Start from the example file and customize it for your environment.
 
 ```bash
-cp .env.example .env
+cp env.example.txt .env
 ```
 
-Edit `.env` with your configuration:
+#### Localhost (default dev stack)
+
+- Keep `KAFKA_BOOTSTRAP_SERVERS=localhost:9092` for running services on your host.
+- When running the provided Docker stack, Kafka inside Docker exposes `9092` on your machine.
+
+#### Deployment / static IP or DNS
+
+For a deployment server (static IP / DNS) you typically change:
+
+- **Kafka advertised host** (so external clients can connect):
+  - `KAFKA_ADVERTISED_HOST=<your_public_ip_or_dns>`
+- **Kafka bootstrap servers** for external clients:
+  - `KAFKA_BOOTSTRAP_SERVERS=<your_public_ip_or_dns>:9092`
+- **API base** (when your API is behind a reverse proxy and served under `/autodw`):
+  - `API_BASE=https://<your_public_ip_or_dns>/autodw`
+
+Edit `.env` with your configuration (example snippet):
 
 ```env
-# MongoDB Configuration
-MONGODB_URL=mongodb://localhost:27017
-MONGODB_DATABASE=data_warehouse
+# Local example
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+KAFKA_ADVERTISED_HOST=localhost
 
-# MinIO Configuration
-MINIO_ENDPOINT=localhost:9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin
-MINIO_SECURE=False
-MINIO_BUCKET_NAME=data-warehouse
-
-# API Configuration
-API_HOST=0.0.0.0
-API_PORT=8000
-SECRET_KEY=your-secret-key-change-this-in-production
+# Deployment example (static IP / DNS)
+# KAFKA_BOOTSTRAP_SERVERS=alfie.iti.gr:9092
+# KAFKA_ADVERTISED_HOST=alfie.iti.gr
+# API_BASE=https://alfie.iti.gr/autodw
 ```
 
-### 3. Start Infrastructure Services
+### 3. Build + Run with Docker (recommended)
+
+This repo ships a Docker image for the API + consumer services and a `docker-compose.yml` that starts:
+MongoDB, MinIO, Kafka, the DW API, and the Kafka consumers.
 
 ```bash
-# Start MongoDB and MinIO
-docker-compose up -d mongodb minio
+# Build the AutoDW container image
+docker compose build
+
+# Start everything
+docker compose up -d
+
+# Follow API logs
+docker compose logs -f api
+```
+
+If you only want the infrastructure services:
+
+```bash
+docker compose up -d mongodb minio zookeeper kafka
 ```
 
 ### 4. Install Python Dependencies
@@ -305,13 +332,13 @@ pytest tests/
 
 ```bash
 # Build and start all services
-docker-compose up -d
+docker compose up -d --build
 
 # View logs
-docker-compose logs -f api
+docker compose logs -f api
 
 # Scale API instances
-docker-compose up -d --scale api=3
+docker compose up -d --scale api=3
 ```
 
 ### Environment Variables for Production
