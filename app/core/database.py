@@ -93,6 +93,12 @@ async def create_indexes():
         await user_files_collection.create_index([("user_id", 1), ("project_id", 1)])
         await user_files_collection.create_index("created_at")
 
+        # Upload jobs (folder ingestion async tracking)
+        upload_jobs = mongodb.database.upload_jobs
+        await upload_jobs.create_index("job_id", unique=True)
+        await upload_jobs.create_index([("user_id", 1), ("dataset_id", 1)])
+        await upload_jobs.create_index("created_at")
+
         logger.info("Database indexes created successfully")
         
     except Exception as e:

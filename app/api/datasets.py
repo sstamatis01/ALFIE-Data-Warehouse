@@ -1,18 +1,198 @@
 from typing import List, Optional
 from datetime import datetime, timezone
 from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, Query, Form
+from fastapi import status
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 from ..models.dataset import DatasetCreate, DatasetUpdate, DatasetResponse, DatasetMetadata, DatasetFile
+from ..models.upload_job import UploadJobResponse
 from ..services.file_service import file_service
 from ..services.metadata_service import metadata_service
 from ..services.kafka_service import kafka_producer_service
 import logging
 import uuid
+import asyncio
+import tempfile
+import os
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
+
+
+async def _update_upload_job(job_id: str, patch: dict) -> None:
+    from ..core.database import get_database
+    db = get_database()
+    await db.upload_jobs.update_one({"job_id": job_id}, {"$set": patch})
+
+
+async def _run_folder_upload_job(
+    *,
+    job_id: str,
+    user_id: str,
+    dataset_id: str,
+    name: str,
+    description: str | None,
+    preserve_structure: bool,
+    tags: list[str],
+    zip_object_name: str,
+    v1: str,
+    v2: str,
+) -> None:
+    """Background ingestion task. Downloads staged ZIP and performs extraction + upload + optional split."""
+    from ..core.database import get_database
+    db = get_database()
+
+    try:
+        await _update_upload_job(
+            job_id,
+            {
+                "status": "running",
+                "updated_at": UploadJobResponse.now(),
+                "progress": {"phase": "download_zip", "processed_files": 0, "message": "Downloading ZIP from object storage"},
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            local_zip = os.path.join(td, "staged.zip")
+            await file_service.download_object_to_path(object_name=zip_object_name, dest_path=local_zip)
+
+            await _update_upload_job(
+                job_id,
+                {
+                    "updated_at": UploadJobResponse.now(),
+                    "progress": {"phase": "ingest", "processed_files": 0, "message": "Extracting and uploading dataset files"},
+                },
+            )
+
+            (dataset_files_v1, total_size_v1, split_counts_v1), v2_result = await file_service.upload_dataset_folder_from_zip_path(
+                zip_path=local_zip,
+                user_id=user_id,
+                dataset_id=dataset_id,
+                version=v1,
+                version_split=v2,
+                preserve_structure=preserve_structure,
+            )
+
+        if not dataset_files_v1:
+            raise HTTPException(status_code=400, detail="No valid files found in ZIP")
+
+        file_types_v1 = list(set([f.file_type for f in dataset_files_v1]))
+        folder_path_v1 = f"datasets/{user_id}/{dataset_id}/{v1}/"
+        custom_meta_v1 = {"file_count": len(dataset_files_v1), "preserve_structure": preserve_structure}
+        if split_counts_v1:
+            custom_meta_v1["split"] = split_counts_v1
+
+        dataset_metadata_v1 = DatasetMetadata(
+            dataset_id=dataset_id,
+            user_id=user_id,
+            name=name,
+            description=description,
+            version=v1,
+            file_type=", ".join(file_types_v1),
+            file_size=total_size_v1,
+            file_path=folder_path_v1,
+            original_filename=os.path.basename(zip_object_name),
+            files=dataset_files_v1,
+            is_folder=True,
+            columns=None,
+            row_count=None,
+            data_types=None,
+            tags=tags,
+            custom_metadata=custom_meta_v1,
+            created_at=datetime.now(tz=timezone.utc),
+            updated_at=datetime.now(tz=timezone.utc),
+            file_hash=None,
+        )
+        await db.datasets.insert_one(dataset_metadata_v1.dict(by_alias=True, exclude={"id"}))
+
+        result_version = v1
+
+        if v2_result is not None:
+            dataset_files_v2, total_size_v2, split_counts = v2_result
+            file_types_v2 = list(set([f.file_type for f in dataset_files_v2]))
+            folder_path_v2 = f"datasets/{user_id}/{dataset_id}/{v2}/"
+            custom_meta_v2 = {
+                "file_count": len(dataset_files_v2),
+                "preserve_structure": preserve_structure,
+                "split": split_counts,
+            }
+            dataset_metadata_v2 = DatasetMetadata(
+                dataset_id=dataset_id,
+                user_id=user_id,
+                name=name,
+                description=description,
+                version=v2,
+                file_type=", ".join(file_types_v2),
+                file_size=total_size_v2,
+                file_path=folder_path_v2,
+                original_filename=os.path.basename(zip_object_name),
+                files=dataset_files_v2,
+                is_folder=True,
+                columns=None,
+                row_count=None,
+                data_types=None,
+                tags=tags,
+                custom_metadata=custom_meta_v2,
+                created_at=datetime.now(tz=timezone.utc),
+                updated_at=datetime.now(tz=timezone.utc),
+                file_hash=None,
+            )
+            await db.datasets.insert_one(dataset_metadata_v2.dict(by_alias=True, exclude={"id"}))
+            result_version = v2
+
+            # Kafka only once (on split version)
+            try:
+                await kafka_producer_service.send_dataset_uploaded_event(dataset_metadata_v2)
+            except Exception as kafka_error:
+                logger.warning(f"Failed to send Kafka event for v2: {kafka_error}")
+        else:
+            try:
+                await kafka_producer_service.send_dataset_uploaded_event(dataset_metadata_v1)
+            except Exception as kafka_error:
+                logger.warning(f"Failed to send Kafka event for upload: {kafka_error}")
+
+        await _update_upload_job(
+            job_id,
+            {
+                "status": "completed",
+                "updated_at": UploadJobResponse.now(),
+                "progress": {"phase": "completed", "processed_files": 0, "message": "Dataset upload completed"},
+                "result": {"dataset_id": dataset_id, "v1": v1, "v2": (v2 if v2_result else None), "result_version": result_version},
+            },
+        )
+
+    except HTTPException as e:
+        try:
+            if e.status_code == 400 and e.detail and "annotation" in str(e.detail).lower():
+                await kafka_producer_service.send_dataset_upload_failed_event(
+                    user_id=user_id,
+                    dataset_id=dataset_id,
+                    filename=os.path.basename(zip_object_name),
+                    error_message=str(e.detail),
+                )
+        except Exception as kafka_err:
+            logger.warning(f"Failed to send dataset upload failed event: {kafka_err}")
+
+        await _update_upload_job(
+            job_id,
+            {
+                "status": "failed",
+                "updated_at": UploadJobResponse.now(),
+                "error": str(e.detail),
+                "progress": {"phase": "failed", "processed_files": 0, "message": str(e.detail)},
+            },
+        )
+    except Exception as e:
+        await _update_upload_job(
+            job_id,
+            {
+                "status": "failed",
+                "updated_at": UploadJobResponse.now(),
+                "error": str(e),
+                "progress": {"phase": "failed", "processed_files": 0, "message": "Upload failed"},
+            },
+        )
 
 
 async def _get_next_dataset_name(user_id: str) -> str:
@@ -232,7 +412,11 @@ async def upload_dataset(
         raise HTTPException(status_code=500, detail="Failed to upload dataset")
 
 
-@router.post("/upload/folder/{user_id}", response_model=DatasetResponse)
+@router.post(
+    "/upload/folder/{user_id}",
+    response_model=UploadJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def upload_dataset_folder(
     user_id: str,
     zip_file: UploadFile = File(...),
@@ -256,135 +440,134 @@ async def upload_dataset_folder(
     dataset_id is optional - if not provided, a UUID will be generated automatically.
     dataset_name is optional - if not provided, an automatic name will be generated.
     """
-    try:
-        if not zip_file.filename or not zip_file.filename.endswith('.zip'):
-            raise HTTPException(status_code=400, detail="File must be a ZIP archive")
-        
-        # Generate dataset_id if not provided
-        if not dataset_id:
-            dataset_id = str(uuid.uuid4())
-            logger.info(f"Generated new dataset_id: {dataset_id}")
-        
-        # Generate dataset_name if not provided
-        if not name:
-            name = await _get_next_dataset_name(user_id)
-            logger.info(f"Generated new dataset_name: {name}")
-        
-        tag_list = []
-        if tags:
-            tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
-        
-        v1, v2 = await _get_next_dataset_versions(user_id, dataset_id, count=2)
-        logger.info(f"Reserved versions: v1={v1}, v2={v2} for dataset folder {dataset_id}")
-        
-        # Upload: original always to v1; split to v2 when large enough
-        try:
-            (dataset_files_v1, total_size_v1, split_counts_v1), v2_result = await file_service.upload_dataset_folder(
-                zip_file=zip_file,
-                user_id=user_id,
-                dataset_id=dataset_id,
-                version=v1,
-                version_split=v2,
-                preserve_structure=preserve_structure
-            )
-        except HTTPException as e:
-            if e.status_code == 400 and e.detail and "annotation" in str(e.detail).lower():
-                try:
-                    await kafka_producer_service.send_dataset_upload_failed_event(
-                        user_id=user_id,
-                        dataset_id=dataset_id,
-                        filename=zip_file.filename or "archive.zip",
-                        error_message=e.detail,
-                    )
-                except Exception as kafka_err:
-                    logger.warning(f"Failed to send dataset upload failed event: {kafka_err}")
-            raise
+    # Async upload: stage ZIP → return job_id → ingest in background
+    if not zip_file.filename or not zip_file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="File must be a ZIP archive")
 
-        if not dataset_files_v1:
-            raise HTTPException(status_code=400, detail="No valid files found in ZIP")
-        
-        file_types_v1 = list(set([f.file_type for f in dataset_files_v1]))
-        folder_path_v1 = f"datasets/{user_id}/{dataset_id}/{v1}/"
-        custom_meta_v1 = {"file_count": len(dataset_files_v1), "preserve_structure": preserve_structure}
-        # If the uploaded folder already had train/test/drift structure (e.g., mitigated dataset zip),
-        # preserve split metadata on this version so split=train|test|drift downloads work.
-        if split_counts_v1:
-            custom_meta_v1["split"] = split_counts_v1
-        
-        dataset_metadata_v1 = DatasetMetadata(
-            dataset_id=dataset_id,
+    if not dataset_id:
+        dataset_id = str(uuid.uuid4())
+        logger.info(f"Generated new dataset_id: {dataset_id}")
+
+    if not name:
+        name = await _get_next_dataset_name(user_id)
+        logger.info(f"Generated new dataset_name: {name}")
+
+    tag_list: list[str] = []
+    if tags:
+        tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+
+    v1, v2 = await _get_next_dataset_versions(user_id, dataset_id, count=2)
+    logger.info(f"Reserved versions: v1={v1}, v2={v2} for dataset folder {dataset_id}")
+
+    job_id = str(uuid.uuid4())
+    zip_object_name = f"uploads/{user_id}/{dataset_id}/{job_id}.zip"
+
+    from ..core.database import get_database
+    db = get_database()
+
+    now = UploadJobResponse.now()
+    job_doc = {
+        "job_id": job_id,
+        "status": "queued",
+        "user_id": user_id,
+        "dataset_id": dataset_id,
+        "name": name,
+        "description": description,
+        "tags": tag_list,
+        "preserve_structure": preserve_structure,
+        "zip_object_name": zip_object_name,
+        "v1": v1,
+        "v2": v2,
+        "created_at": now,
+        "updated_at": now,
+        "progress": {"phase": "upload_zip", "processed_files": 0, "message": "Staging ZIP in object storage"},
+        "result": None,
+        "error": None,
+        "metadata": {"original_filename": zip_file.filename},
+    }
+    await db.upload_jobs.insert_one(job_doc)
+
+    # Stage ZIP in MinIO (multipart, unknown length)
+    await file_service.put_object_from_upload_file(object_name=zip_object_name, upload=zip_file, content_type="application/zip")
+
+    await _update_upload_job(
+        job_id,
+        {
+            "updated_at": UploadJobResponse.now(),
+            "progress": {"phase": "queued", "processed_files": 0, "message": "ZIP staged; ingestion queued"},
+        },
+    )
+
+    asyncio.create_task(
+        _run_folder_upload_job(
+            job_id=job_id,
             user_id=user_id,
+            dataset_id=dataset_id,
             name=name,
             description=description,
-            version=v1,
-            file_type=", ".join(file_types_v1),
-            file_size=total_size_v1,
-            file_path=folder_path_v1,
-            original_filename=zip_file.filename,
-            files=dataset_files_v1,
-            is_folder=True,
-            columns=None,
-            row_count=None,
-            data_types=None,
+            preserve_structure=preserve_structure,
             tags=tag_list,
-            custom_metadata=custom_meta_v1,
-            created_at=datetime.now(tz=timezone.utc),
-            updated_at=datetime.now(tz=timezone.utc),
-            file_hash=None
+            zip_object_name=zip_object_name,
+            v1=v1,
+            v2=v2,
         )
-        from ..core.database import get_database
-        db = get_database()
-        await db.datasets.insert_one(dataset_metadata_v1.dict(by_alias=True, exclude={'id'}))
-        
-        if v2_result is not None:
-            dataset_files_v2, total_size_v2, split_counts = v2_result
-            file_types_v2 = list(set([f.file_type for f in dataset_files_v2]))
-            folder_path_v2 = f"datasets/{user_id}/{dataset_id}/{v2}/"
-            custom_meta_v2 = {"file_count": len(dataset_files_v2), "preserve_structure": preserve_structure, "split": split_counts}
-            dataset_metadata_v2 = DatasetMetadata(
-                dataset_id=dataset_id,
-                user_id=user_id,
-                name=name,
-                description=description,
-                version=v2,
-                file_type=", ".join(file_types_v2),
-                file_size=total_size_v2,
-                file_path=folder_path_v2,
-                original_filename=zip_file.filename,
-                files=dataset_files_v2,
-                is_folder=True,
-                columns=None,
-                row_count=None,
-                data_types=None,
-                tags=tag_list,
-                custom_metadata=custom_meta_v2,
-                created_at=datetime.now(tz=timezone.utc),
-                updated_at=datetime.now(tz=timezone.utc),
-                file_hash=None
-            )
-            await db.datasets.insert_one(dataset_metadata_v2.dict(by_alias=True, exclude={'id'}))
-            # Send Kafka only for v2 so the pipeline runs once on the split version (orchestrator expects one event per upload)
-            try:
-                await kafka_producer_service.send_dataset_uploaded_event(dataset_metadata_v2)
-            except Exception as kafka_error:
-                logger.warning(f"Failed to send Kafka event for v2: {kafka_error}")
-            created_dataset = await db.datasets.find_one({"dataset_id": dataset_id, "user_id": user_id, "version": v2})
-        else:
-            try:
-                await kafka_producer_service.send_dataset_uploaded_event(dataset_metadata_v1)
-            except Exception as kafka_error:
-                logger.warning(f"Failed to send Kafka event for upload: {kafka_error}")
-            created_dataset = await db.datasets.find_one({"dataset_id": dataset_id, "user_id": user_id, "version": v1})
-        
-        logger.info(f"Dataset folder uploaded: {dataset_id} (v1 + v2 split)" if v2_result else f"Dataset folder uploaded: {dataset_id} (v1 only)")
-        
-        return DatasetResponse(**created_dataset)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error uploading dataset folder: {e}")
-        raise HTTPException(status_code=500, detail="Failed to upload dataset folder")
+    )
+
+    return UploadJobResponse(
+        job_id=job_id,
+        status="queued",
+        user_id=user_id,
+        dataset_id=dataset_id,
+        name=name,
+        created_at=now,
+        updated_at=UploadJobResponse.now(),
+        progress=job_doc["progress"],
+        result=None,
+        error=None,
+        metadata=job_doc["metadata"],
+    )
+
+
+@router.get("/upload/jobs/{job_id}", response_model=UploadJobResponse)
+async def get_upload_job(job_id: str):
+    """Get current status/progress of an upload job."""
+    from ..core.database import get_database
+    db = get_database()
+    doc = await db.upload_jobs.find_one({"job_id": job_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Upload job not found")
+    return UploadJobResponse(**doc)
+
+
+@router.get("/upload/jobs/{job_id}/dataset", response_model=DatasetResponse)
+async def get_upload_job_dataset(job_id: str):
+    """
+    Return the resulting dataset metadata once the job is completed.
+    - If still running: 409
+    - If failed: 400 with error
+    """
+    from ..core.database import get_database
+    db = get_database()
+    job = await db.upload_jobs.find_one({"job_id": job_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Upload job not found")
+
+    if job.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=job.get("error") or "Upload job failed")
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Upload job not completed yet")
+
+    result = job.get("result") or {}
+    dataset_id = result.get("dataset_id")
+    user_id = job.get("user_id")
+    version = result.get("result_version")
+    if not dataset_id or not user_id or not version:
+        raise HTTPException(status_code=500, detail="Upload job completed but result is missing")
+
+    created_dataset = await db.datasets.find_one({"dataset_id": dataset_id, "user_id": user_id, "version": version})
+    if not created_dataset:
+        raise HTTPException(status_code=404, detail="Resulting dataset not found")
+    return DatasetResponse(**created_dataset)
 
 
 @router.get("/search/{user_id}", response_model=List[DatasetResponse])

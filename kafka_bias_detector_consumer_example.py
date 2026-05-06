@@ -146,11 +146,53 @@ def upload_mitigated_dataset_folder(
         "tags": ",".join(tags),
         "preserve_structure": "true",
     }
+
+    def _poll_upload_job(job_id: str, *, timeout_s: int = 1800, poll_s: float = 2.0) -> dict:
+        """Poll async folder-upload job until completed and return final DatasetResponse metadata."""
+        start = __import__("time").time()
+        status_url = f"{API_BASE}/datasets/upload/jobs/{job_id}"
+        result_url = f"{API_BASE}/datasets/upload/jobs/{job_id}/dataset"
+        last_status = None
+        while True:
+            if (__import__("time").time() - start) > timeout_s:
+                raise TimeoutError(f"Timed out waiting for upload job {job_id} after {timeout_s}s")
+
+            jr = requests.get(status_url, timeout=30)
+            jr.raise_for_status()
+            j = jr.json()
+            last_status = j.get("status")
+            if last_status == "failed":
+                raise RuntimeError(j.get("error") or j.get("progress", {}).get("message") or "Upload job failed")
+            if last_status == "completed":
+                dr = requests.get(result_url, timeout=60)
+                dr.raise_for_status()
+                return dr.json()
+            __import__("time").sleep(poll_s)
+
     r = requests.post(url, files=files, data=data, timeout=120)
+    # New servers return 202 + UploadJobResponse; older servers may return 200 + DatasetResponse.
+    # Some deployments may still respond 200 but with a job-shaped payload; handle that too.
+    if 200 <= r.status_code < 300:
+        payload = r.json()
+        job_id = payload.get("job_id")
+        if r.status_code == 202 or job_id:
+            if not job_id:
+                raise RuntimeError(f"Folder upload returned async response but missing job_id: {payload}")
+            logger.info(f"Mitigated folder upload queued: job_id={job_id}. Polling until complete...")
+            result = _poll_upload_job(job_id)
+            logger.info(
+                "Mitigated folder dataset uploaded (async): %s version %s",
+                original_dataset_id,
+                result.get("version"),
+            )
+            return result
+
+        # Synchronous dataset response
+        logger.info(f"Mitigated folder dataset uploaded: {original_dataset_id} version {payload.get('version')}")
+        return payload
+
     r.raise_for_status()
-    result = r.json()
-    logger.info(f"Mitigated folder dataset uploaded: {original_dataset_id} version {result.get('version')}")
-    return result
+    return r.json()
 
 
 def clean_for_json(obj):
@@ -732,6 +774,11 @@ async def run_consumer() -> None:
         group_id=KAFKA_BIAS_TRIGGER_CONSUMER_GROUP,
         auto_offset_reset="earliest",
         enable_auto_commit=True,
+        # Long-running work (downloads, mitigation, uploads) between polls — avoid UnknownMemberIdError.
+        max_poll_interval_ms=int(os.getenv("KAFKA_MAX_POLL_INTERVAL_MS", str(4 * 60 * 60 * 1000))),
+        session_timeout_ms=int(os.getenv("KAFKA_SESSION_TIMEOUT_MS", "30000")),
+        heartbeat_interval_ms=int(os.getenv("KAFKA_HEARTBEAT_INTERVAL_MS", "10000")),
+        max_poll_records=int(os.getenv("KAFKA_MAX_POLL_RECORDS", "1")),
         value_deserializer=lambda m: json.loads(m.decode("utf-8")),
         key_deserializer=lambda m: m.decode("utf-8") if m else None,
     )
@@ -885,7 +932,14 @@ async def run_consumer() -> None:
                                 mitigated_result = None
                         # Common follow-up when we uploaded a mitigated dataset (single or folder)
                         if mitigated_result:
-                            actual_mitigated_version = mitigated_result.get("version")
+                            # New async flow returns DatasetResponse from /upload/jobs/{job_id}/dataset (top-level "version").
+                            # Be defensive in case we got a job-shaped payload from an older integration point.
+                            actual_mitigated_version = (
+                                mitigated_result.get("version")
+                                or (mitigated_result.get("result") or {}).get("result_version")
+                                or (mitigated_result.get("result") or {}).get("v2")
+                                or (mitigated_result.get("result") or {}).get("v1")
+                            )
                             if not actual_mitigated_version:
                                 logger.error("Upload response missing version field!")
                                 logger.error(f"Response: {json.dumps(mitigated_result, indent=2, default=str)}")

@@ -12,6 +12,7 @@ import logging
 import tempfile
 import zipfile
 import json
+import anyio
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +55,118 @@ class FileService:
     # We intentionally do NOT accept "txt" as it could be a readme and not a label mapping.
     _ANNOTATION_EXTENSIONS = frozenset({"csv", "json"})
 
+    # Common alternative column names we accept for vision annotations and normalize to (filename,label)
+    _VISION_FILENAME_COLUMNS = ("filename", "image_file_path", "file_path", "path", "filepath", "image_path", "image")
+    _VISION_LABEL_COLUMNS = ("label", "class", "category", "target", "y")
+
+    @staticmethod
+    def _pick_annotation_column(cols_l: set[str], candidates: tuple[str, ...], preferred: str) -> str | None:
+        """Pick an annotation column name (lowercased) from candidates, preferring `preferred` first."""
+        pref = (preferred or "").strip().lower()
+        if pref and pref in cols_l:
+            return pref
+        for c in candidates:
+            c_l = (c or "").strip().lower()
+            if c_l and c_l in cols_l:
+                return c_l
+        return None
+
+    @staticmethod
+    def _calculate_md5_from_path(path: str, *, chunk_size: int = 1024 * 1024) -> str:
+        """Calculate MD5 hash without loading the entire file into memory."""
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+
+    async def _put_object_from_path(
+        self,
+        *,
+        object_name: str,
+        file_path: str,
+        file_size: int,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        """
+        Upload a local file to MinIO without blocking the event loop.
+        MinIO client is sync; run it in a worker thread.
+        """
+
+        def _upload() -> None:
+            with open(file_path, "rb") as f:
+                self.client.put_object(
+                    bucket_name=self.bucket_name,
+                    object_name=object_name,
+                    data=f,
+                    length=file_size,
+                    content_type=content_type,
+                )
+
+        await anyio.to_thread.run_sync(_upload)
+
+    async def put_object_from_upload_file(
+        self,
+        *,
+        object_name: str,
+        upload: UploadFile,
+        content_type: str = "application/zip",
+        part_size: int = 10 * 1024 * 1024,
+    ) -> None:
+        """
+        Stream an UploadFile into MinIO without loading it into memory.
+        Uses multipart upload (unknown length) and runs in a worker thread.
+        """
+
+        def _upload() -> None:
+            try:
+                upload.file.seek(0)
+            except Exception:
+                pass
+            self.client.put_object(
+                bucket_name=self.bucket_name,
+                object_name=object_name,
+                data=upload.file,
+                length=-1,
+                part_size=part_size,
+                content_type=content_type,
+            )
+
+        await anyio.to_thread.run_sync(_upload)
+
+    async def download_object_to_path(self, *, object_name: str, dest_path: str, chunk_size: int = 1024 * 1024) -> None:
+        """Download a MinIO object to a local file path without blocking the event loop."""
+
+        def _download() -> None:
+            resp = self.client.get_object(self.bucket_name, object_name)
+            try:
+                os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+                with open(dest_path, "wb") as f:
+                    for chunk in resp.stream(chunk_size):
+                        if chunk:
+                            f.write(chunk)
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                try:
+                    resp.release_conn()
+                except Exception:
+                    pass
+
+        await anyio.to_thread.run_sync(_download)
+
     @staticmethod
     def _check_image_folder_has_annotations(
-        collected: List[Tuple[str, str, bytes, int, str]],
+        collected: List[Tuple[str, str, str, int, str]],
     ) -> Tuple[bool, bool]:
         """
         Check if the folder looks like an image dataset and if it has an annotation file.
-        collected: list of (relative_path, file_basename, file_data, file_size, file_type).
+        collected: list of (relative_path, file_basename, absolute_path, file_size, file_type).
 
         Returns:
             (is_image_folder, has_annotation_file)
@@ -69,7 +175,7 @@ class FileService:
             return False, False
         image_count = 0
         has_annotation = False
-        for _rel, _name, _data, _size, ext in collected:
+        for _rel, _name, _abs, _size, ext in collected:
             ext_lower = (ext or "").lower()
             if ext_lower in FileService._IMAGE_EXTENSIONS:
                 image_count += 1
@@ -86,7 +192,7 @@ class FileService:
 
     @staticmethod
     def _validate_automl_vision_annotations(
-        collected: List[Tuple[str, str, bytes, int, str]],
+        collected: List[Tuple[str, str, str, int, str]],
         *,
         filename_column: str = "filename",
         label_column: str = "label",
@@ -105,15 +211,15 @@ class FileService:
             return
 
         images: set[str] = set()
-        annotation_candidates: list[tuple[str, str, bytes]] = []  # (relpath, ext, data)
+        annotation_candidates: list[tuple[str, str, str]] = []  # (relpath, ext, abs_path)
 
-        for rel, name, data, _size, ext in collected:
+        for rel, _name, abs_path, _size, ext in collected:
             ext_lower = (ext or "").lower()
             rel_norm = FileService._normalize_relpath(rel)
             if ext_lower in FileService._IMAGE_EXTENSIONS:
                 images.add(rel_norm)
             if ext_lower in FileService._ANNOTATION_EXTENSIONS:
-                annotation_candidates.append((rel_norm, ext_lower, data))
+                annotation_candidates.append((rel_norm, ext_lower, abs_path))
 
         if not images:
             return  # not a vision dataset
@@ -128,8 +234,8 @@ class FileService:
                 detail="Missing annotations file. Please provide an annotations CSV or JSON (with filename+label) and re-upload your dataset.",
             )
 
-        fn_col = (filename_column or "filename").strip().lower()
-        lbl_col = (label_column or "label").strip().lower()
+        fn_pref = (filename_column or "filename").strip().lower()
+        lbl_pref = (label_column or "label").strip().lower()
 
         def _coerce_filename_value(v) -> str | None:
             if v is None:
@@ -141,8 +247,10 @@ class FileService:
 
         # Try candidates until we find one that validates.
         last_error: str | None = None
-        for rel_norm, ext_lower, data in candidates:
+        for rel_norm, ext_lower, abs_path in candidates:
             try:
+                with open(abs_path, "rb") as f:
+                    data = f.read()
                 if ext_lower == "csv":
                     try:
                         df = pd.read_csv(BytesIO(data))
@@ -150,9 +258,12 @@ class FileService:
                         raise ValueError(f"Could not parse CSV: {e}") from e
 
                     cols = {str(c).strip().lower(): c for c in df.columns}
-                    if fn_col not in cols or lbl_col not in cols:
+                    cols_l = set(cols.keys())
+                    fn_col = FileService._pick_annotation_column(cols_l, FileService._VISION_FILENAME_COLUMNS, fn_pref)
+                    lbl_col = FileService._pick_annotation_column(cols_l, FileService._VISION_LABEL_COLUMNS, lbl_pref)
+                    if not fn_col or not lbl_col:
                         raise ValueError(
-                            f"CSV must contain columns '{filename_column}' and '{label_column}'. Found: {list(df.columns)[:30]}"
+                            f"CSV must contain a filename column (e.g. '{filename_column}' or 'image_file_path') and a label column (e.g. '{label_column}'). Found: {list(df.columns)[:30]}"
                         )
                     if df.empty:
                         raise ValueError("CSV has no rows")
@@ -207,6 +318,14 @@ class FileService:
                                 return v
                         return None
 
+                    keys_l = {str(k).strip().lower() for k in first.keys()}
+                    fn_col = FileService._pick_annotation_column(keys_l, FileService._VISION_FILENAME_COLUMNS, fn_pref)
+                    lbl_col = FileService._pick_annotation_column(keys_l, FileService._VISION_LABEL_COLUMNS, lbl_pref)
+                    if not fn_col or not lbl_col:
+                        raise ValueError(
+                            f"JSON items must contain a filename key (e.g. '{filename_column}' or 'image_file_path') and a label key (e.g. '{label_column}'). Found keys: {list(first.keys())[:30]}"
+                        )
+
                     image_basenames = {}
                     for img in images:
                         bn = os.path.basename(img).lower()
@@ -253,23 +372,23 @@ class FileService:
 
     @staticmethod
     def _select_annotation_candidate(
-        collected: List[Tuple[str, str, bytes, int, str]],
-    ) -> tuple[str, str, bytes] | None:
+        collected: List[Tuple[str, str, str, int, str]],
+    ) -> tuple[str, str, str] | None:
         """
         Pick the annotation file for a vision dataset.
         Preference order:
         1) basename starts with 'annotations.' (any folder)
         2) first csv/json found
-        Returns (relative_path_normalized, ext_lower, data) or None.
+        Returns (relative_path_normalized, ext_lower, abs_path) or None.
         """
-        candidates: list[tuple[str, str, bytes]] = []
-        preferred: list[tuple[str, str, bytes]] = []
-        for rel, _name, data, _size, ext in collected:
+        candidates: list[tuple[str, str, str]] = []
+        preferred: list[tuple[str, str, str]] = []
+        for rel, _name, abs_path, _size, ext in collected:
             ext_lower = (ext or "").lower()
             if ext_lower not in FileService._ANNOTATION_EXTENSIONS:
                 continue
             rel_norm = FileService._normalize_relpath(rel)
-            item = (rel_norm, ext_lower, data)
+            item = (rel_norm, ext_lower, abs_path)
             candidates.append(item)
             if os.path.basename(rel_norm).lower().startswith("annotations."):
                 preferred.append(item)
@@ -292,27 +411,36 @@ class FileService:
         Parse CSV/JSON annotations into list-of-dicts rows.
         For CSV we preserve all columns; for JSON we preserve keys.
         """
-        fn_key = (filename_column or "filename").strip()
-        lbl_key = (label_column or "label").strip()
-        fn_key_l = fn_key.lower()
-        lbl_key_l = lbl_key.lower()
-
-        def _has_required_keys_dict(d: dict) -> bool:
-            keys_l = {str(k).strip().lower() for k in d.keys()}
-            return fn_key_l in keys_l and lbl_key_l in keys_l
+        fn_pref = (filename_column or "filename").strip()
+        lbl_pref = (label_column or "label").strip()
 
         if ext_lower == "csv":
             try:
                 df = pd.read_csv(BytesIO(data))
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid annotations CSV '{annotation_relpath}': {e}")
-            cols_l = {str(c).strip().lower() for c in df.columns}
-            if fn_key_l not in cols_l or lbl_key_l not in cols_l:
+            cols = {str(c).strip().lower(): c for c in df.columns}
+            cols_l = set(cols.keys())
+            fn_col_l = FileService._pick_annotation_column(cols_l, FileService._VISION_FILENAME_COLUMNS, fn_pref)
+            lbl_col_l = FileService._pick_annotation_column(cols_l, FileService._VISION_LABEL_COLUMNS, lbl_pref)
+            if not fn_col_l or not lbl_col_l:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Annotations CSV '{annotation_relpath}' must contain columns '{fn_key}' and '{lbl_key}'.",
+                    detail=(
+                        f"Annotations CSV '{annotation_relpath}' must contain a filename column "
+                        f"(e.g. '{fn_pref}' or 'image_file_path') and a label column (e.g. '{lbl_pref}')."
+                    ),
                 )
-            return [{str(c): r[c] for c in df.columns} for _, r in df.iterrows()]
+            fn_col = cols[fn_col_l]
+            lbl_col = cols[lbl_col_l]
+            rows: list[dict] = []
+            for _, r in df.iterrows():
+                row = {str(c): r[c] for c in df.columns}
+                # Normalize to the orchestrator schema
+                row["filename"] = row.get(str(fn_col))
+                row["label"] = row.get(str(lbl_col))
+                rows.append(row)
+            return rows
 
         if ext_lower == "json":
             try:
@@ -326,9 +454,33 @@ class FileService:
             rows = [dict(x) for x in obj if isinstance(x, dict)]
             if not rows:
                 raise HTTPException(status_code=400, detail=f"Annotations JSON '{annotation_relpath}' is empty.")
-            if not any(_has_required_keys_dict(r) for r in rows[:50]):
-                raise HTTPException(status_code=400, detail=f"Annotations JSON '{annotation_relpath}' must contain keys '{fn_key}' and '{lbl_key}'.")
-            return rows
+            keys_l = {str(k).strip().lower() for k in rows[0].keys()}
+            fn_key_l = FileService._pick_annotation_column(keys_l, FileService._VISION_FILENAME_COLUMNS, fn_pref)
+            lbl_key_l = FileService._pick_annotation_column(keys_l, FileService._VISION_LABEL_COLUMNS, lbl_pref)
+            if not fn_key_l or not lbl_key_l:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Annotations JSON '{annotation_relpath}' must contain a filename key "
+                        f"(e.g. '{fn_pref}' or 'image_file_path') and a label key (e.g. '{lbl_pref}')."
+                    ),
+                )
+
+            def _find_key(d: dict, key_l: str) -> str | None:
+                for k in d.keys():
+                    if str(k).strip().lower() == key_l:
+                        return str(k)
+                return None
+
+            fn_key = _find_key(rows[0], fn_key_l) or fn_pref
+            lbl_key = _find_key(rows[0], lbl_key_l) or lbl_pref
+            out: list[dict] = []
+            for r in rows:
+                r2 = dict(r)
+                r2["filename"] = r2.get(fn_key)
+                r2["label"] = r2.get(lbl_key)
+                out.append(r2)
+            return out
 
         raise HTTPException(status_code=400, detail=f"Unsupported annotation file '{annotation_relpath}'")
 
@@ -626,13 +778,17 @@ class FileService:
             ((v1_files, v1_size, None), (v2_files, v2_size, split_counts) or None).
         """
         try:
-            zip_data = await zip_file.read()
-            collected: List[Tuple[str, str, bytes, int, str]] = []  # (relative_path, file_basename, data, size, file_type)
+            collected: List[Tuple[str, str, str, int, str]] = []  # (relative_path, file_basename, abs_path, size, file_type)
 
             with tempfile.TemporaryDirectory() as temp_dir:
                 zip_path = os.path.join(temp_dir, "dataset_files.zip")
+                # Stream ZIP to disk to avoid buffering entire archive in memory
                 with open(zip_path, "wb") as f:
-                    f.write(zip_data)
+                    while True:
+                        chunk = await zip_file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
                 with zipfile.ZipFile(zip_path, "r") as zip_ref:
                     zip_ref.extractall(temp_dir)
 
@@ -642,13 +798,11 @@ class FileService:
                             continue
                         file_path = os.path.join(root, file)
                         relative_path = os.path.relpath(file_path, temp_dir)
-                        with open(file_path, "rb") as f:
-                            file_data = f.read()
-                        file_size = len(file_data)
+                        file_size = os.path.getsize(file_path)
                         collected.append((
                             relative_path,
                             file,
-                            file_data,
+                            file_path,
                             file_size,
                             self._get_file_extension(file),
                         ))
@@ -667,7 +821,7 @@ class FileService:
             split_counts_existing: Optional[Dict[str, int]] = None
             split_prefixes = ("train" + os.sep, "test" + os.sep, "drift" + os.sep)
             existing_counts = {"train": 0, "test": 0, "drift": 0}
-            for relative_path, _file, _data, _size, _ftype in collected:
+            for relative_path, _file, _abs, _size, _ftype in collected:
                 # Normalize to OS separator for the startswith check (paths come from os.walk)
                 rp = relative_path
                 if rp.startswith(split_prefixes[0]):
@@ -693,17 +847,16 @@ class FileService:
             # Always upload original to v1 (no split)
             dataset_files_v1 = []
             total_size_v1 = 0
-            for relative_path, file, file_data, file_size, file_type in collected:
-                file_hash = self.calculate_file_hash(file_data)
+            for relative_path, file, abs_path, file_size, file_type in collected:
+                file_hash = self._calculate_md5_from_path(abs_path)
                 if preserve_structure:
                     minio_path = self.generate_file_path(user_id, dataset_id, version, relative_path)
                 else:
                     minio_path = self.generate_file_path(user_id, dataset_id, version, file)
-                self.client.put_object(
-                    bucket_name=self.bucket_name,
+                await self._put_object_from_path(
                     object_name=minio_path,
-                    data=BytesIO(file_data),
-                    length=file_size,
+                    file_path=abs_path,
+                    file_size=file_size,
                     content_type="application/octet-stream",
                 )
                 dataset_files_v1.append(
@@ -754,9 +907,146 @@ class FileService:
             logger.error(f"Unexpected error during folder upload: {e}")
             raise HTTPException(status_code=500, detail=f"Folder upload failed: {str(e)}")
 
+    async def upload_dataset_folder_from_zip_path(
+        self,
+        *,
+        zip_path: str,
+        user_id: str,
+        dataset_id: str,
+        version: str = "v1",
+        version_split: Optional[str] = None,
+        preserve_structure: bool = True,
+    ) -> Tuple[Tuple[List[DatasetFile], int, Optional[Dict[str, int]]], Optional[Tuple[List[DatasetFile], int, Dict[str, int]]]]:
+        """
+        Same as `upload_dataset_folder`, but reads a local ZIP file path.
+        Intended for background ingestion jobs (ZIP already staged in object storage).
+        """
+        try:
+            if not zip_path or not os.path.exists(zip_path):
+                raise HTTPException(status_code=400, detail="ZIP path not found")
+
+            collected: List[Tuple[str, str, str, int, str]] = []
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                    zip_ref.extractall(temp_dir)
+
+                for root, _dirs, files in os.walk(temp_dir):
+                    for file in files:
+                        if file.startswith(".") or "__MACOSX" in root:
+                            continue
+                        file_path = os.path.join(root, file)
+                        relative_path = os.path.relpath(file_path, temp_dir)
+                        file_size = os.path.getsize(file_path)
+                        collected.append(
+                            (
+                                relative_path,
+                                file,
+                                file_path,
+                                file_size,
+                                self._get_file_extension(file),
+                            )
+                        )
+
+                # Enforce AutoML Vision contract for image datasets:
+                is_image_folder, _has_annotation = self._check_image_folder_has_annotations(collected)
+                if is_image_folder:
+                    self._validate_automl_vision_annotations(collected, filename_column="filename", label_column="label")
+
+                # Detect pre-split folder structure
+                split_counts_existing: Optional[Dict[str, int]] = None
+                split_prefixes = ("train" + os.sep, "test" + os.sep, "drift" + os.sep)
+                existing_counts = {"train": 0, "test": 0, "drift": 0}
+                for relative_path, _file, _abs, _size, _ftype in collected:
+                    rp = relative_path
+                    if rp.startswith(split_prefixes[0]):
+                        existing_counts["train"] += 1
+                    elif rp.startswith(split_prefixes[1]):
+                        existing_counts["test"] += 1
+                    elif rp.startswith(split_prefixes[2]):
+                        existing_counts["drift"] += 1
+                if all(existing_counts[k] > 0 for k in ("train", "test", "drift")):
+                    split_counts_existing = existing_counts
+                    logger.info(
+                        "Detected pre-split folder structure in uploaded ZIP: %s. Will preserve split on version=%s and skip auto-splitting.",
+                        split_counts_existing,
+                        version,
+                    )
+
+                num_samples = len(collected)
+                num_features = 1
+                do_split = self._should_split_dataset(num_samples, num_features)
+                if split_counts_existing is not None:
+                    do_split = False
+
+                # Upload original to v1
+                dataset_files_v1: List[DatasetFile] = []
+                total_size_v1 = 0
+                for relative_path, file, abs_path, file_size, file_type in collected:
+                    file_hash = self._calculate_md5_from_path(abs_path)
+                    if preserve_structure:
+                        minio_path = self.generate_file_path(user_id, dataset_id, version, relative_path)
+                    else:
+                        minio_path = self.generate_file_path(user_id, dataset_id, version, file)
+                    await self._put_object_from_path(
+                        object_name=minio_path,
+                        file_path=abs_path,
+                        file_size=file_size,
+                        content_type="application/octet-stream",
+                    )
+                    dataset_files_v1.append(
+                        DatasetFile(
+                            filename=file,
+                            file_path=minio_path,
+                            file_size=file_size,
+                            file_type=file_type,
+                            file_hash=file_hash,
+                            content_type="application/octet-stream",
+                        )
+                    )
+                    total_size_v1 += file_size
+
+                logger.info(
+                    "Uploaded %d original files to %s, total size: %d bytes",
+                    len(dataset_files_v1),
+                    version,
+                    total_size_v1,
+                )
+
+                if do_split and version_split:
+                    if is_image_folder:
+                        v2_files, v2_size, split_counts = await self._upload_vision_folder_with_split(
+                            collected,
+                            user_id,
+                            dataset_id,
+                            version_split,
+                            preserve_structure,
+                            filename_column="filename",
+                            label_column="label",
+                        )
+                    else:
+                        v2_files, v2_size, split_counts = await self._upload_folder_with_split(
+                            collected, user_id, dataset_id, version_split, preserve_structure
+                        )
+                    return ((dataset_files_v1, total_size_v1, None), (v2_files, v2_size, split_counts))
+
+                return ((dataset_files_v1, total_size_v1, split_counts_existing), None)
+
+        except zipfile.BadZipFile:
+            logger.error("Invalid zip file")
+            raise HTTPException(status_code=400, detail="Invalid zip file")
+        except HTTPException:
+            raise
+        except S3Error as e:
+            logger.error(f"MinIO error during folder upload: {e}")
+            raise HTTPException(status_code=500, detail=f"Folder upload failed: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error during folder upload: {e}")
+            raise HTTPException(status_code=500, detail=f"Folder upload failed: {str(e)}")
+
     async def _upload_folder_with_split(
         self,
-        collected: List[Tuple[str, str, bytes, int, str]],
+        collected: List[Tuple[str, str, str, int, str]],
         user_id: str,
         dataset_id: str,
         version: str,
@@ -777,7 +1067,7 @@ class FileService:
         dataset_files: List[DatasetFile] = []
         total_size = 0
 
-        for i, (relative_path, file, file_data, file_size, file_type) in enumerate(collected):
+        for i, (relative_path, file, abs_path, file_size, file_type) in enumerate(collected):
             if i in train_idx:
                 subfolder = "train"
             elif i in test_idx:
@@ -786,14 +1076,13 @@ class FileService:
                 subfolder = "drift"
             path_in_split = f"{subfolder}/{relative_path}" if preserve_structure else f"{subfolder}/{file}"
             minio_path = f"datasets/{user_id}/{dataset_id}/{version}/{path_in_split}"
-            self.client.put_object(
-                bucket_name=self.bucket_name,
+            await self._put_object_from_path(
                 object_name=minio_path,
-                data=BytesIO(file_data),
-                length=file_size,
+                file_path=abs_path,
+                file_size=file_size,
                 content_type="application/octet-stream",
             )
-            file_hash = self.calculate_file_hash(file_data)
+            file_hash = self._calculate_md5_from_path(abs_path)
             dataset_files.append(
                 DatasetFile(
                     filename=file,
@@ -812,7 +1101,7 @@ class FileService:
 
     async def _upload_vision_folder_with_split(
         self,
-        collected: List[Tuple[str, str, bytes, int, str]],
+        collected: List[Tuple[str, str, str, int, str]],
         user_id: str,
         dataset_id: str,
         version: str,
@@ -834,7 +1123,7 @@ class FileService:
         image_relpaths: list[str] = []
         image_relset: set[str] = set()
         image_basename_counts: dict[str, int] = {}
-        for rel, _name, _data, _size, ext in collected:
+        for rel, _name, _abs, _size, ext in collected:
             ext_lower = (ext or "").lower()
             if ext_lower in self._IMAGE_EXTENSIONS:
                 rel_norm = self._normalize_relpath(rel)
@@ -853,8 +1142,10 @@ class FileService:
                 status_code=400,
                 detail="Missing annotations file. Please provide an annotations CSV or JSON (with filename+label) and re-upload your dataset.",
             )
-        ann_rel, ann_ext, ann_bytes = ann
+        ann_rel, ann_ext, ann_abs_path = ann
         ann_basename = os.path.basename(ann_rel) or f"annotations.{ann_ext}"
+        with open(ann_abs_path, "rb") as f:
+            ann_bytes = f.read()
         rows = self._parse_vision_annotations_to_rows(
             ann_rel, ann_ext, ann_bytes, filename_column=filename_column, label_column=label_column
         )
@@ -929,7 +1220,7 @@ class FileService:
         # Identify original annotation files to skip uploading into split as-is
         annotation_relpaths = {
             self._normalize_relpath(rel)
-            for rel, _n, _d, _s, ext in collected
+            for rel, _n, _abs, _s, ext in collected
             if (ext or "").lower() in self._ANNOTATION_EXTENSIONS
         }
 
@@ -943,7 +1234,7 @@ class FileService:
             for r in rels:
                 rel_to_split[r] = split_name
 
-        for relative_path, file, file_data, file_size, file_type in collected:
+        for relative_path, file, abs_path, file_size, file_type in collected:
             rel_norm = self._normalize_relpath(relative_path)
             ext_lower = (file_type or "").lower()
 
@@ -954,14 +1245,13 @@ class FileService:
                 subfolder = rel_to_split.get(rel_norm, "train")
                 path_in_split = f"{subfolder}/{relative_path}" if preserve_structure else f"{subfolder}/{file}"
                 minio_path = f"datasets/{user_id}/{dataset_id}/{version}/{path_in_split}"
-                self.client.put_object(
-                    bucket_name=self.bucket_name,
+                await self._put_object_from_path(
                     object_name=minio_path,
-                    data=BytesIO(file_data),
-                    length=file_size,
+                    file_path=abs_path,
+                    file_size=file_size,
                     content_type="application/octet-stream",
                 )
-                file_hash = self.calculate_file_hash(file_data)
+                file_hash = self._calculate_md5_from_path(abs_path)
                 dataset_files.append(
                     DatasetFile(
                         filename=file,
@@ -978,14 +1268,13 @@ class FileService:
                 for subfolder in ("train", "test", "drift"):
                     path_in_split = f"{subfolder}/{relative_path}" if preserve_structure else f"{subfolder}/{file}"
                     minio_path = f"datasets/{user_id}/{dataset_id}/{version}/{path_in_split}"
-                    self.client.put_object(
-                        bucket_name=self.bucket_name,
+                    await self._put_object_from_path(
                         object_name=minio_path,
-                        data=BytesIO(file_data),
-                        length=file_size,
+                        file_path=abs_path,
+                        file_size=file_size,
                         content_type="application/octet-stream",
                     )
-                    file_hash = self.calculate_file_hash(file_data)
+                    file_hash = self._calculate_md5_from_path(abs_path)
                     dataset_files.append(
                         DatasetFile(
                             filename=file,

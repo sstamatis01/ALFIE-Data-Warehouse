@@ -78,18 +78,45 @@ logger.info(f"  AutoML Vision: {AUTOML_VISION_BEST_MODEL_URL}")
 if VISION_AUTOML_HOST == "localhost" and os.getenv("KAFKA_BOOTSTRAP_SERVERS", "").find("kafka") >= 0:
     logger.warning("  When running in Docker, set VISION_AUTOML_HOST=host.docker.internal so the container can reach Vision on the host")
 
+# Large dataset downloads from DW (ZIP) can take many minutes; default 2h, override with env.
+DW_DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("AUTOML_DW_DOWNLOAD_TIMEOUT_SECONDS", str(2 * 60 * 60)))
+
+
 def compute_request_timeouts(time_budget_seconds: int) -> tuple[float, float]:
     """
     Compute robust timeouts for long AutoML jobs.
     - connect timeout: short (network)
     - read timeout: long (download + unzip + dataloaders + training + upload)
+
+    The AutoML HTTP endpoint may block until training + DW model upload completes, which can be
+    far longer than `time_budget` (e.g. vision with large ZIPs). Do not tie read timeout to
+    time_budget alone.
+
+    Override with AUTOML_HTTP_READ_TIMEOUT_SECONDS (seconds), e.g. 86400 for 24h.
     """
     try:
         tb = int(time_budget_seconds)
     except Exception:
         tb = 0
-    read_timeout = max(120, tb + 120)
+    env_read = os.getenv("AUTOML_HTTP_READ_TIMEOUT_SECONDS", "").strip()
+    if env_read:
+        read_timeout = max(60, int(env_read))
+    else:
+        # time_budget is a training budget hint, not an upper bound on wall-clock time.
+        # Default: at least 6h, or 10x budget + 2h buffer (whichever is larger), capped at 48h.
+        read_timeout = max(6 * 60 * 60, tb * 10 + 2 * 60 * 60)
+        read_timeout = min(read_timeout, 48 * 60 * 60)
     return (10, float(read_timeout))
+
+
+# Helpful startup diagnostics (esp. vision + large ZIP training)
+_c_demo, _r_demo = compute_request_timeouts(10)
+logger.info(
+    "AutoML HTTP timeouts: DW download read timeout=%ss, example AutoML read timeout (time_budget=10s)=%ss "
+    "(override read with AUTOML_HTTP_READ_TIMEOUT_SECONDS; override DW download with AUTOML_DW_DOWNLOAD_TIMEOUT_SECONDS)",
+    DW_DOWNLOAD_TIMEOUT_SECONDS,
+    int(_r_demo),
+)
 
 def normalize_tabular_task_type(task_type: str | None) -> str | None:
     """
@@ -257,7 +284,7 @@ def download_dataset_file(user_id: str, dataset_id: str, version: str = None, sp
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
     if split and split in ("train", "test", "drift"):
         url += f"?split={split}"
-    r = requests.get(url, timeout=60)
+    r = requests.get(url, timeout=DW_DOWNLOAD_TIMEOUT_SECONDS)
     r.raise_for_status()
     return r.content
 
@@ -501,6 +528,9 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
             is_folder = metadata.get("is_folder", False)
             file_count = metadata.get("file_count", 1)
             has_split = bool(metadata.get("custom_metadata", {}).get("split"))
+            # For tabular split datasets, we expect downstream services to use the train split
+            # when downloading from DW (so they get a stable training table).
+            dataset_version_for_automl = dataset_version
             # For split tabular datasets, download only the train split so we get a single CSV for validation
             download_split = "train" if (has_split and task_category == "tabular") else None
             if download_split:
@@ -572,7 +602,7 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
             data = {
                 "user_id": user_id,
                 "dataset_id": dataset_id,
-                "dataset_version": dataset_version,
+                "dataset_version": dataset_version_for_automl,
                 "target_column_name": target_column,
                 "time_stamp_column_name": "",  # Empty string for non-time-series tasks
                 "task_type": normalized_task_type,
@@ -823,7 +853,8 @@ async def run_consumer() -> None:
         enable_auto_commit=True,
         # Prevent group rebalances during long training jobs (time_budget + overhead).
         # max_poll_interval_ms is the max time between successive polls.
-        max_poll_interval_ms=int(os.getenv("KAFKA_MAX_POLL_INTERVAL_MS", str(10 * 60 * 1000))),
+        # Default 4h; training can exceed 10m easily (vision / large ZIP). Override via env.
+        max_poll_interval_ms=int(os.getenv("KAFKA_MAX_POLL_INTERVAL_MS", str(4 * 60 * 60 * 1000))),
         session_timeout_ms=int(os.getenv("KAFKA_SESSION_TIMEOUT_MS", "30000")),
         heartbeat_interval_ms=int(os.getenv("KAFKA_HEARTBEAT_INTERVAL_MS", "10000")),
         max_poll_records=int(os.getenv("KAFKA_MAX_POLL_RECORDS", "1")),

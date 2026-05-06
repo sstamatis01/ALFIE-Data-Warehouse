@@ -1048,6 +1048,10 @@ async def run_consumer() -> None:
         group_id=KAFKA_CONSUMER_GROUP,
         auto_offset_reset="earliest",
         enable_auto_commit=True,
+        max_poll_interval_ms=int(os.getenv("KAFKA_MAX_POLL_INTERVAL_MS", str(4 * 60 * 60 * 1000))),
+        session_timeout_ms=int(os.getenv("KAFKA_SESSION_TIMEOUT_MS", "30000")),
+        heartbeat_interval_ms=int(os.getenv("KAFKA_HEARTBEAT_INTERVAL_MS", "10000")),
+        max_poll_records=int(os.getenv("KAFKA_MAX_POLL_RECORDS", "1")),
         value_deserializer=lambda m: json.loads(m.decode("utf-8")),
         key_deserializer=lambda m: m.decode("utf-8") if m else None,
     )

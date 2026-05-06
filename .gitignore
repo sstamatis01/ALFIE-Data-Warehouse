@@ -4,6 +4,18 @@ concept_drift_upload_debug/
 # AutoGluon / saved models (local artifacts; do not commit)
 autogluon_models/
 
+# Local datasets / ML artifacts accidentally copied into repo
+Garbage_Dataset_Classification_subset/
+v2/
+model/
+model.zip
+model.pkl
+
+# Local reports / synthetic data dumps (generated)
+compact_report.html
+compliance_alerts_synthetic_*.csv
+tabular_data*.csv
+
 # Concept drift / AutoML generated data (local; do not commit)
 drift_log.csv
 metrics_summary.csv
