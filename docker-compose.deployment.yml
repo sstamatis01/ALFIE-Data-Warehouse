@@ -1,0 +1,29 @@
+services:
+  # Kafka broker (deployment)
+  kafka:
+    environment:
+      # External clients connect to the public DNS.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://alfie.iti.gr:9092
+
+  # Data Warehouse API (deployment behind reverse proxy at /autodw)
+  api:
+    environment:
+      ROOT_PATH: /autodw
+
+  # Consumers use in-stack Kafka + talk to DW API over the docker network.
+  bias-detector:
+    environment:
+      API_BASE: http://api:8000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+
+  automl-consumer:
+    environment:
+      API_BASE: http://api:8000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+
+  # If you later run xai-consumer in this stack, keep it consistent too.
+  # xai-consumer:
+  #   environment:
+  #     API_BASE: http://api:8000
+  #     KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+

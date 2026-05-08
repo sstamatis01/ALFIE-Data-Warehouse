@@ -1,4 +1,5 @@
 #!/bin/sh
+# Keep to the minimal option supported by all /bin/sh implementations.
 set -e
 GDB_HOME="${GDB_HOME:-/opt/graphdb/home}"
 GDB_DATA="${GDB_HOME}/data"

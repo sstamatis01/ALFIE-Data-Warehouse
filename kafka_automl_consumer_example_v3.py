@@ -254,6 +254,24 @@ def load_tabular_dataframe(file_bytes: bytes) -> pd.DataFrame:
     """
     import zipfile
 
+    # If this is a ZIP (folder download), do NOT try to parse as CSV first.
+    # Pandas can sometimes "successfully" parse ZIP bytes as a 1-column garbage CSV, which then
+    # makes downstream validation think the target column is missing.
+    if isinstance(file_bytes, (bytes, bytearray)) and len(file_bytes) >= 2 and file_bytes[:2] == b"PK":
+        try:
+            with zipfile.ZipFile(BytesIO(file_bytes), "r") as zf:
+                csv_names = [
+                    n
+                    for n in zf.namelist()
+                    if n.lower().endswith(".csv") and not n.startswith("__")
+                ]
+                if not csv_names:
+                    raise ValueError("ZIP does not contain any CSV files")
+                with zf.open(csv_names[0]) as f:
+                    return read_csv_with_encoding(f.read())
+        except Exception as e:
+            raise ValueError(f"Could not load tabular dataframe from ZIP bytes: {e}")
+
     # Try direct CSV first
     try:
         return read_csv_with_encoding(file_bytes)

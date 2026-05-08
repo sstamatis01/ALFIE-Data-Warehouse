@@ -113,7 +113,13 @@ services:
       - graphdb_logs:/opt/graphdb/home/logs
       - ./graphdb_init:/init-backup:ro
       - ./graphdb_init/entrypoint.sh:/entrypoint.sh:ro
-    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    # On Windows checkouts this file may have CRLF endings which break /bin/sh ("set: illegal option -").
+    # Normalize to LF at container start, then run the init entrypoint.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "tr -d '\\r' < /entrypoint.sh > /tmp/entrypoint.sh && chmod +x /tmp/entrypoint.sh && exec /bin/sh /tmp/entrypoint.sh \"$@\""
+      - --
     command: ["/opt/graphdb/dist/bin/graphdb", "-Dgraphdb.home=/opt/graphdb/home", "-Dgraphdb.distribution=docker"]
     networks:
       - data-warehouse-network
@@ -218,34 +224,6 @@ services:
     volumes:
       - ./app:/app/app:ro
       - ./kafka_automl_consumer_example_v3.py:/app/kafka_automl_consumer_example_v3.py:ro
-
-  # Concept Drift Consumer: listens to concept-drift-trigger-events, runs ADWIN + AutoGluon retrain, uploads model to DW, sends concept-drift-complete
-  concept-drift-consumer:
-    build: .
-    env_file:
-      - .env
-    container_name: data-warehouse-concept-drift-consumer
-    restart: unless-stopped
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_CONCEPT_DRIFT_TRIGGER_TOPIC: concept-drift-trigger-events
-      KAFKA_CONCEPT_DRIFT_COMPLETE_TOPIC: concept-drift-complete-events
-      KAFKA_CONCEPT_DRIFT_CONSUMER_GROUP: concept-drift-consumer
-      API_BASE: http://api:8000
-      DW_HOST: api
-      DW_PORT: 8000
-    depends_on:
-      api:
-        condition: service_started
-      kafka:
-        condition: service_healthy
-    networks:
-      - data-warehouse-network
-    command: >
-      sh -c "sleep 25 && python kafka_concept_drift_consumer_example.py"
-    volumes:
-      - ./app:/app/app:ro
-      - ./kafka_concept_drift_consumer_example.py:/app/kafka_concept_drift_consumer_example.py:ro
 
 volumes:
   mongodb_data:

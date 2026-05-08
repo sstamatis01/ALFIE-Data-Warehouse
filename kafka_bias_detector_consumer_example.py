@@ -429,6 +429,21 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
     target_column = eda_results.get("target_column")
     transformation_log = []
     try:
+        # Heuristic: keep free-form text features as raw strings.
+        # AutoGluon can natively consume text columns; encoding them to integers destroys meaning.
+        def _is_text_like(s: pd.Series) -> bool:
+            if not (pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s)):
+                return False
+            non_null = s.dropna()
+            if non_null.empty:
+                return False
+            # sample for speed
+            sample = non_null.astype(str).head(2000)
+            avg_len = float(sample.str.len().mean())
+            uniq = int(sample.nunique(dropna=True))
+            # "text-like" = longer strings and/or high cardinality
+            return avg_len >= 20 or uniq >= 50
+
         # 1. Fill missing values
         for col in eda_results.get("columns", df_cleaned.columns):
             if col not in df_cleaned.columns:
@@ -476,6 +491,18 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
             if col == target_column:
                 # Keep classification labels as-is for now; optionally label-encode below after task inference
                 continue
+            # Keep free-form text columns as raw text (do not encode)
+            if _is_text_like(df_cleaned[col]):
+                transformation_log.append(
+                    {
+                        "column": col,
+                        "transformation": "encoding_skipped",
+                        "method": "keep_text",
+                        "original_value": int(df_cleaned[col].nunique(dropna=True)),
+                        "modified_value": "kept as raw text",
+                    }
+                )
+                continue
             unique_vals = df_cleaned[col].nunique(dropna=True)
             if unique_vals <= 10:
                 dummies = pd.get_dummies(df_cleaned[col], prefix=col)
@@ -512,19 +539,15 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
 
         if target_column is not None and target_column in df_cleaned.columns:
             y = df_cleaned[target_column]
-
-            # If target is object/categorical, label-encode so type_of_target works cleanly
+            # Keep target labels discrete (strings/ints). Do NOT scale/transform them.
             if pd.api.types.is_object_dtype(y) or pd.api.types.is_categorical_dtype(y):
-                le_y = LabelEncoder()
-                df_cleaned[target_column] = le_y.fit_transform(y.astype(str))
-                y = df_cleaned[target_column]
                 transformation_log.append(
                     {
                         "column": target_column,
-                        "transformation": "target_encoding",
-                        "method": "label_encoding",
+                        "transformation": "target_encoding_skipped",
+                        "method": "keep_labels",
                         "original_value": "object/categorical labels",
-                        "modified_value": f"integers from 0 to {int(pd.Series(y).nunique()) - 1}",
+                        "modified_value": "kept as-is",
                     }
                 )
 
@@ -551,7 +574,7 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
         # 4. Handle skewed features (EXCLUDE target)
         numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns.tolist()
         feature_numeric_cols = [c for c in numeric_cols if c != target_column]
-        for col in numeric_cols:
+        for col in feature_numeric_cols:
             series = df_cleaned[col].dropna()
             if series.empty:
                 continue
@@ -584,84 +607,99 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
 
             # Only apply SMOTE for discrete class targets
             if type_of_target(y) in {"binary", "multiclass"}:
-                vc = y.value_counts()
-                n_classes = y.nunique()
-                if n_classes > 8:
+                # SMOTE requires numeric features; skip if any non-numeric (e.g., raw text) exists.
+                non_numeric = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
+                if non_numeric:
                     transformation_log.append(
                         {
                             "column": target_column,
                             "transformation": "oversampling_skipped",
                             "method": "SMOTE",
-                            "original_value": vc.to_dict(),
-                            "modified_value": f"Skipped (too many classes: {n_classes})",
+                            "original_value": y.value_counts().to_dict(),
+                            "modified_value": f"Skipped (non-numeric features present: {non_numeric[:5]}{'...' if len(non_numeric) > 5 else ''})",
                         }
                     )
+                    # Do not attempt SMOTE on mixed/text data
+                    pass
                 else:
-                    imbalance_ratio = vc.min() / vc.max() if vc.max() > 0 else 1.0
-                    minority_count = int(vc.min())
-
-                    # Extra guard: SMOTE is fragile when rare classes are tiny
-                    # Require at least 6 samples in the smallest class for default-like behavior
-                    if imbalance_ratio < 0.5 and minority_count >= 2:
-                        # dynamically choose k_neighbors so it is always valid
-                        k_neighbors = min(5, minority_count - 1)
-
-                        # If the class is too tiny, skip SMOTE rather than creating unstable synthetic points
-                        if k_neighbors < 1:
-                            transformation_log.append(
-                                {
-                                    "column": target_column,
-                                    "transformation": "oversampling_skipped",
-                                    "method": "SMOTE",
-                                    "original_value": vc.to_dict(),
-                                    "modified_value": f"Skipped (smallest class has {minority_count} sample)",
-                                }
-                            )
-                        else:
-                            try:
-                                smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
-                                X_resampled, y_resampled = smote.fit_resample(X, y)
-
-                                transformation_log.append(
-                                    {
-                                        "column": target_column,
-                                        "transformation": "oversampling",
-                                        "method": f"SMOTE(k_neighbors={k_neighbors})",
-                                        "original_value": vc.to_dict(),
-                                        "modified_value": pd.Series(
-                                            y_resampled
-                                        ).value_counts().to_dict(),
-                                    }
-                                )
-
-                                df_cleaned = pd.concat(
-                                    [
-                                        pd.DataFrame(X_resampled, columns=X.columns),
-                                        pd.Series(y_resampled, name=target_column),
-                                    ],
-                                    axis=1,
-                                )
-
-                            except ValueError as e:
-                                transformation_log.append(
-                                    {
-                                        "column": target_column,
-                                        "transformation": "oversampling_skipped",
-                                        "method": "SMOTE",
-                                        "original_value": vc.to_dict(),
-                                        "modified_value": f"Skipped due to SMOTE error: {str(e)}",
-                                    }
-                                )
-                    else:
+                    vc = y.value_counts()
+                    n_classes = y.nunique()
+                    if n_classes > 8:
                         transformation_log.append(
                             {
                                 "column": target_column,
                                 "transformation": "oversampling_skipped",
                                 "method": "SMOTE",
                                 "original_value": vc.to_dict(),
-                                "modified_value": f"Skipped (imbalance_ratio={imbalance_ratio:.3f}, min_class={minority_count})",
+                                "modified_value": f"Skipped (too many classes: {n_classes})",
                             }
                         )
+                    else:
+                        imbalance_ratio = vc.min() / vc.max() if vc.max() > 0 else 1.0
+                        minority_count = int(vc.min())
+
+                        # Extra guard: SMOTE is fragile when rare classes are tiny
+                        # Require at least 6 samples in the smallest class for default-like behavior
+                        if imbalance_ratio < 0.5 and minority_count >= 2:
+                            # dynamically choose k_neighbors so it is always valid
+                            k_neighbors = min(5, minority_count - 1)
+
+                            # If the class is too tiny, skip SMOTE rather than creating unstable synthetic points
+                            if k_neighbors < 1:
+                                transformation_log.append(
+                                    {
+                                        "column": target_column,
+                                        "transformation": "oversampling_skipped",
+                                        "method": "SMOTE",
+                                        "original_value": vc.to_dict(),
+                                        "modified_value": f"Skipped (smallest class has {minority_count} sample)",
+                                    }
+                                )
+                            else:
+                                try:
+                                    smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+                                    X_resampled, y_resampled = smote.fit_resample(X, y)
+
+                                    transformation_log.append(
+                                        {
+                                            "column": target_column,
+                                            "transformation": "oversampling",
+                                            "method": f"SMOTE(k_neighbors={k_neighbors})",
+                                            "original_value": vc.to_dict(),
+                                            "modified_value": pd.Series(
+                                                y_resampled
+                                            ).value_counts().to_dict(),
+                                        }
+                                    )
+
+                                    df_cleaned = pd.concat(
+                                        [
+                                            pd.DataFrame(X_resampled, columns=X.columns),
+                                            pd.Series(y_resampled, name=target_column),
+                                        ],
+                                        axis=1,
+                                    )
+
+                                except ValueError as e:
+                                    transformation_log.append(
+                                        {
+                                            "column": target_column,
+                                            "transformation": "oversampling_skipped",
+                                            "method": "SMOTE",
+                                            "original_value": vc.to_dict(),
+                                            "modified_value": f"Skipped due to SMOTE error: {str(e)}",
+                                        }
+                                    )
+                        else:
+                            transformation_log.append(
+                                {
+                                    "column": target_column,
+                                    "transformation": "oversampling_skipped",
+                                    "method": "SMOTE",
+                                    "original_value": vc.to_dict(),
+                                    "modified_value": f"Skipped (imbalance_ratio={imbalance_ratio:.3f}, min_class={minority_count})",
+                                }
+                            )
             else:
                 transformation_log.append(
                     {
@@ -674,7 +712,7 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
                 )
 
         # 6. Data drift detection & mitigation (features only)
-        for col in numeric_cols:
+        for col in feature_numeric_cols:
             series = df_cleaned[col].dropna()
             if series.empty:
                 continue
@@ -758,6 +796,22 @@ def upload_mitigated_dataset(user_id: str, original_dataset_id: str, original_ve
     return result
 
 
+def _safe_json_deserialize(m: bytes):
+    """Best-effort JSON deserializer for Kafka values; returns None on parse errors."""
+    if m is None:
+        return None
+    try:
+        return json.loads(m.decode("utf-8"))
+    except Exception as e:
+        # Do not crash the consumer group on a single malformed message.
+        try:
+            preview = m[:200]
+        except Exception:
+            preview = b"<unavailable>"
+        logger.warning(f"Skipping malformed Kafka message (not JSON): {e}; preview={preview!r}")
+        return None
+
+
 async def run_consumer() -> None:
     # Initialize Kafka producer for sending completion events
     producer = AIOKafkaProducer(
@@ -779,7 +833,7 @@ async def run_consumer() -> None:
         session_timeout_ms=int(os.getenv("KAFKA_SESSION_TIMEOUT_MS", "30000")),
         heartbeat_interval_ms=int(os.getenv("KAFKA_HEARTBEAT_INTERVAL_MS", "10000")),
         max_poll_records=int(os.getenv("KAFKA_MAX_POLL_RECORDS", "1")),
-        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+        value_deserializer=_safe_json_deserialize,
         key_deserializer=lambda m: m.decode("utf-8") if m else None,
     )
 
@@ -793,6 +847,9 @@ async def run_consumer() -> None:
         async for msg in consumer:
             key = msg.key
             value = msg.value
+            if value is None:
+                # Malformed message already logged by deserializer
+                continue
             logger.info("Message received")
             logger.info(f"  Partition={msg.partition} Offset={msg.offset}")
             logger.info(f"  Key={key}")
