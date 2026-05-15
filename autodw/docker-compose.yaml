@@ -131,7 +131,7 @@ services:
       start_period: 60s
 
   api:
-    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/autodw}:${AUTODW_VERSION:-1.0.0}
+    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw}:${AUTODW_VERSION:-1.0.0}
     container_name: autodw-api
     restart: unless-stopped
     ports:
@@ -161,7 +161,7 @@ services:
       sh -c "sleep 10 && uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
   bias-detector:
-    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/autodw}:${AUTODW_VERSION:-1.0.0}
+    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw}:${AUTODW_VERSION:-1.0.0}
     container_name: autodw-bias-detector
     restart: unless-stopped
     environment:
@@ -181,7 +181,7 @@ services:
 
   automl-consumer:
     profiles: [automl]
-    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/autodw}:${AUTODW_VERSION:-1.0.0}
+    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw}:${AUTODW_VERSION:-1.0.0}
     container_name: autodw-automl-consumer
     restart: unless-stopped
     environment:
