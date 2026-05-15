@@ -1,0 +1,17 @@
+.git
+.github
+Documentation
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+.env
+.env.*
+!.env.example
+autodw/.env
+.venv*
+**/.venv*
+*.md
+!autodw/README.md
+docker-build-push.yml
+terminals
+agent-transcripts
