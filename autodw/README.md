@@ -28,7 +28,7 @@ This is **not** one giant container with everything inside. Docker Compose start
 
 | Image | Registry | When |
 |-------|----------|------|
-| **`autodw`** (API + Python workers) | `gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:1.0.0` | Git tag `v1.0.0` → CI build |
+| **`autodw`** (API + Python workers) | `gitlab.catalink.eu:5050/external/alfie_eu/autodw:1.0.0` | Git tag `v1.0.0` → CI build |
 | MongoDB, MinIO, Kafka, GraphDB, Zookeeper | **Not** in GitLab — pulled from Docker Hub on `docker compose up` | Always |
 
 So you **do not** get seven separate GitLab images. You get **one application image** plus a **compose file** that pulls standard infrastructure images and wires them together.

@@ -7,7 +7,7 @@ on:
 
 env:
   REGISTRY: gitlab.catalink.eu:5050
-  IMAGE_PREFIX: gitlab.catalink.eu:5050/external/alfie_eu/alfie
+  IMAGE_PREFIX: gitlab.catalink.eu:5050/external/alfie_eu/autodw
 
 jobs:
   build-push:
@@ -42,5 +42,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.IMAGE_PREFIX }}/autodw:${{ steps.version.outputs.tag }}
-            ${{ env.IMAGE_PREFIX }}/autodw:latest
+            ${{ env.IMAGE_PREFIX }}:${{ steps.version.outputs.tag }}
+            ${{ env.IMAGE_PREFIX }}:latest
