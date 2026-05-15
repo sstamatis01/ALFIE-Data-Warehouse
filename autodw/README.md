@@ -1,104 +1,126 @@
-# AutoDW — GitLab integration package
+# AutoDW — localized stack (localhost)
 
-This folder contains what integrators need to run **AutoDW** (ALFIE Data Warehouse) from the GitLab Container Registry, without building from source.
+This folder runs a **self-contained AutoDW system** for integration testing. It does **not** use `alfie.iti.gr` (that host is only for the separate ITI deployment via `docker-compose.deployment.yml` in the repo root).
 
-## Container image
+## How images work (important)
 
-| Item | Value |
-|------|--------|
-| Registry | `gitlab.catalink.eu:5050` |
-| Image | `gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw` |
-| Example tags | `1.0.0` (pinned), `latest` (newest release) |
+This is **not** one giant container with everything inside. Docker Compose starts **several containers** on one private network:
 
-Legacy partner image tag `kinit-test` referred to an earlier build; new releases use **semver** tags (`1.0.0`, `1.1.0`, …).
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  docker network: autodw-network                                  │
+│                                                                  │
+│  mongodb   minio   zookeeper → kafka   graphdb                   │
+│                              ↑                                   │
+│                    api (autodw image)                            │
+│                    bias-detector (same autodw image, diff command)│
+│                    [automl-consumer] (optional profile)          │
+└─────────────────────────────────────────────────────────────────┘
+         │ ports published to your machine
+         ▼
+   localhost:8000  → API
+   localhost:9092  → Kafka (for other stacks on the same host)
+   localhost:9000  → MinIO
+   localhost:7200  → GraphDB
+```
 
-The same image runs:
+### What is pushed to GitLab?
 
-- **API** — `uvicorn app.main:app`
-- **bias-detector** — `python kafka_bias_detector_consumer_example.py`
-- **automl-consumer** — `python kafka_automl_consumer_example_v3.py`
+| Image | Registry | When |
+|-------|----------|------|
+| **`autodw`** (API + Python workers) | `gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:1.0.0` | Git tag `v1.0.0` → CI build |
+| MongoDB, MinIO, Kafka, GraphDB, Zookeeper | **Not** in GitLab — pulled from Docker Hub on `docker compose up` | Always |
 
-Concept drift is **not** included in this image workflow; run that script in a separate Python environment if needed.
+So you **do not** get seven separate GitLab images. You get **one application image** plus a **compose file** that pulls standard infrastructure images and wires them together.
 
-## Quick start
+The same `autodw` image is used three times with different commands:
 
-1. Copy environment template:
+| Container | Command |
+|-----------|---------|
+| `api` | `uvicorn app.main:app` |
+| `bias-detector` | `python kafka_bias_detector_consumer_example.py` |
+| `automl-consumer` (optional) | `python kafka_automl_consumer_example_v3.py` |
 
-   ```bash
-   cp autodw/.env.example autodw/.env
-   # Edit ports, PUBLIC_HOST, passwords, AUTODW_VERSION
-   ```
+### Inside the stack vs from outside
 
-2. Log in to the registry (credentials from your GitLab project):
+| Client | API | Kafka |
+|--------|-----|-------|
+| Containers **in** this compose file | `http://api:8000` | `kafka:29092` |
+| Your browser / curl on the host | `http://localhost:8000` | `localhost:9092` |
+| **Another** Docker Compose project on the same machine | `http://host.docker.internal:8000` | `host.docker.internal:9092` |
 
-   ```bash
-   docker login gitlab.catalink.eu:5050
-   ```
+`KAFKA_ADVERTISED_HOST=localhost` in `.env` ensures Kafka metadata tells clients to use **localhost:9092**, not a remote hostname.
 
-3. Start the stack:
+## Quick start (test after CI published `1.0.0`)
 
-   ```bash
-   docker compose -f autodw/docker-compose.yaml --env-file autodw/.env up -d
-   ```
+```bash
+# 1) Config
+cp autodw/.env.example autodw/.env
+# Edit passwords if needed; keep KAFKA_ADVERTISED_HOST=localhost
 
-4. Verify:
+# 2) Registry login (read access to alfie project)
+docker login gitlab.catalink.eu:5050
 
-   ```bash
-   docker compose -f autodw/docker-compose.yaml ps
-   curl -s "http://localhost:${API_PORT:-8000}/docs" | head
-   ```
+# 3) Pull app image + start full stack (core: api + bias-detector + infra)
+docker compose -f autodw/docker-compose.yaml --env-file autodw/.env pull api bias-detector
+docker compose -f autodw/docker-compose.yaml --env-file autodw/.env up -d
 
-When behind a reverse proxy at `https://<PUBLIC_HOST>/autodw`, set `ROOT_PATH=/autodw` in `.env`.
+# 4) Verify
+docker compose -f autodw/docker-compose.yaml ps
+curl -s http://localhost:8000/docs | head
+```
 
-## Resource guidelines
+Optional:
 
-| Component | Suggested minimum |
-|-----------|-------------------|
-| API + consumers | 2 GB RAM |
-| MongoDB | 1 GB RAM, persistent volume |
-| MinIO | 1 GB RAM, persistent volume for datasets |
-| Kafka + Zookeeper | 2 GB RAM |
-| GraphDB | 2 GB RAM (`GDB_HEAP_SIZE` / `GDB_MAX_MEM` default 1g each) |
+```bash
+# Kafka UI
+docker compose -f autodw/docker-compose.yaml --env-file autodw/.env --profile debug up -d
 
-Disk: plan for dataset storage in MinIO (size depends on uploads).
+# AutoML consumer (needs tabular/vision services on host ports 8001/8002)
+docker compose -f autodw/docker-compose.yaml --env-file autodw/.env --profile automl up -d
+```
 
-## Kafka integration
+## Connect another component (e.g. Agentic Core orchestrator)
 
-- **External clients** (orchestrator on host or another VM): `PUBLIC_HOST:9092` (must match `KAFKA_ADVERTISED_HOST`).
-- **In-stack services**: `kafka:29092`.
+If orchestrator runs **on the host** (not in this compose file):
 
-Main topics: `dataset-events`, `bias-detection-trigger-events`, `bias-detection-complete-events`, `automl-trigger-events`, `automl-complete-events`.
+```bash
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+API_BASE=http://localhost:8000
+```
 
-## Releasing a new image (maintainers)
+If orchestrator runs in **another Docker Compose** project, add to that compose file:
 
-Releases are triggered by **git tags**, not by every merge to `main`.
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+environment:
+  KAFKA_BOOTSTRAP_SERVERS: host.docker.internal:9092
+  API_BASE: http://host.docker.internal:8000
+```
 
-1. Configure GitHub repository:
-   - Variable: `DOCKER_REGISTRY_USERNAME`
-   - Secret: `DOCKER_REGISTRY_PASSWORD` (GitLab deploy token or PAT with `write_registry`)
+Or attach both stacks to the same external network (advanced).
 
-2. Tag and push:
+## Kafka topics (in-stack)
 
-   ```bash
-   git tag v1.0.0
-   git push origin v1.0.0
-   ```
+- `dataset-events` — produced by API on upload
+- `bias-detection-trigger-events` — consumed by `bias-detector`
+- `bias-detection-complete-events` — produced by bias worker
+- `automl-trigger-events` / `automl-complete-events` — if automl profile is enabled
 
-3. GitHub Actions (`.github/workflows/docker-build-push.yml`) builds and pushes:
+## Releasing a new `autodw` image (maintainers)
 
-   - `gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:1.0.0`
-   - `gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:latest`
+1. GitHub: set `DOCKER_REGISTRY_USERNAME` (variable) and `DOCKER_REGISTRY_PASSWORD` (secret).
+2. Tag: `git tag v1.0.0 && git push origin v1.0.0`
+3. CI pushes `autodw:1.0.0` and `autodw:latest`.
+4. Testers set `AUTODW_VERSION=1.0.0` in `autodw/.env` and run `docker compose pull && up`.
 
-The `v` prefix is stripped for registry tags (`v1.0.0` → `1.0.0`).
+## alfie.iti.gr vs this bundle
 
-4. Update `AUTODW_VERSION` in deployment `.env` to the new semver.
+| | `autodw/` (this folder) | ITI server (`docker-compose.deployment.yml`) |
+|--|-------------------------|-----------------------------------------------|
+| Purpose | Local / partner integration | Production deployment |
+| Kafka advertised | `localhost` | `alfie.iti.gr` |
+| API path | `/` (direct :8000) | `/autodw` behind reverse proxy |
 
-## Files in this folder
-
-| File | Purpose |
-|------|---------|
-| `.env.example` | Tunable ports, hosts, credentials for integration |
-| `docker-compose.yaml` | Full stack using registry image (no local `build`) |
-| `README.md` | This guide |
-
-Source development still uses the repository root `docker-compose.yml` with `build: .`.
+Do not mix the two `.env` files.
