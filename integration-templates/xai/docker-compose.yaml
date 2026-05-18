@@ -1,0 +1,79 @@
+# XAI module — registry image only (no local build).
+# Requires a running AutoDW stack for API + Kafka (separate compose).
+#
+#   cp .env.example .env
+#   docker login gitlab.catalink.eu:5050
+#   docker compose -f docker-compose.yaml --env-file .env up -d
+
+services:
+  universal-model-explainability:
+    image: ${XAI_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/xai}:${XAI_VERSION:-1.0.0}
+    container_name: xai-universal-model-explainability
+    restart: unless-stopped
+    ports:
+      - "${UNIVERSAL_EXPLAINABILITY_PORT:-5010}:5010"
+    command: ["python", "flexible-scripts/universal_model_explainability.py"]
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND: Agg
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5010/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - xai-network
+
+  flexible-data-interpretability:
+    image: ${XAI_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/xai}:${XAI_VERSION:-1.0.0}
+    container_name: xai-flexible-data-interpretability
+    restart: unless-stopped
+    ports:
+      - "${FLEXIBLE_INTERPRETABILITY_PORT:-5001}:5001"
+    command: ["python", "flexible-scripts/flexible-data-interpretability.py"]
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND: Agg
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - xai-network
+
+  kafka-xai-consumer:
+    image: ${XAI_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/xai}:${XAI_VERSION:-1.0.0}
+    container_name: xai-kafka-consumer
+    restart: unless-stopped
+    command: ["python", "scripts/kafka_call.py"]
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND: Agg
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-host.docker.internal:9092}
+      KAFKA_XAI_TRIGGER_TOPIC: ${KAFKA_XAI_TRIGGER_TOPIC:-xai-trigger-events}
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-xai-consumer}
+      API_BASE: ${API_BASE:-http://host.docker.internal:8000}
+      UNIVERSAL_MODEL_EXPLAINABILITY_URL: ${UNIVERSAL_MODEL_EXPLAINABILITY_URL:-http://universal-model-explainability:5010/explain-model}
+      FLEXIBLE_DATA_INTERPRETABILITY_URL: ${FLEXIBLE_DATA_INTERPRETABILITY_URL:-http://flexible-data-interpretability:5001/analyze-data}
+      XAI_REPORTS_DIR: /app/reports-output
+    volumes:
+      - ${XAI_REPORTS_HOST_DIR:-./reports}:/app/reports-output
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      universal-model-explainability:
+        condition: service_healthy
+      flexible-data-interpretability:
+        condition: service_healthy
+    networks:
+      - xai-network
+
+networks:
+  xai-network:
+    driver: bridge
