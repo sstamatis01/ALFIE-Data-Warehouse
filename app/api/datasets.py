@@ -772,7 +772,8 @@ async def download_dataset(
     Download latest dataset file or folder.
 
     - For single files: downloads the file
-    - For folders without filename: downloads all files as ZIP (optionally only train/test/drift if split= is set)
+    - For folders without filename: downloads all files as ZIP, or a single raw file when the
+      folder (or split subfolder) contains exactly one file (typical for tabular v2 splits)
     - For folders with filename: downloads specific file from folder
     - split=train|test|drift: when dataset has train/test/drift split, download only that subset (does not affect non-split datasets)
     """
@@ -795,12 +796,15 @@ async def download_dataset(
         subfolder = None
         if split and split in ("train", "test", "drift") and (dataset.custom_metadata or {}).get("split"):
             subfolder = split
-        zip_data = await file_service.download_folder_as_zip(dataset.file_path, subfolder_prefix=subfolder)
-        zip_name = f"{dataset_id}_{dataset.version}" + (f"_{split}" if subfolder else "") + ".zip"
+        file_data, download_name, media_type = await file_service.download_folder_subset(
+            dataset.file_path,
+            subfolder_prefix=subfolder,
+            archive_basename=f"{dataset_id}_{dataset.version}",
+        )
         return StreamingResponse(
-            BytesIO(zip_data),
-            media_type='application/zip',
-            headers={"Content-Disposition": f"attachment; filename={zip_name}"}
+            BytesIO(file_data),
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={download_name}"},
         )
     file_data = await file_service.download_file(dataset.file_path)
     return StreamingResponse(
@@ -821,6 +825,7 @@ async def download_dataset_by_version(
     """
     Download a specific version of a dataset file or folder.
     Use split=train|test|drift to download only that subset when the dataset has a split.
+    Tabular split subsets with one CSV return raw CSV bytes (not a ZIP).
     """
     dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
     if not dataset:
@@ -841,12 +846,15 @@ async def download_dataset_by_version(
         subfolder = None
         if split and split in ("train", "test", "drift") and (dataset.custom_metadata or {}).get("split"):
             subfolder = split
-        zip_data = await file_service.download_folder_as_zip(dataset.file_path, subfolder_prefix=subfolder)
-        zip_name = f"{dataset_id}_{version}" + (f"_{split}" if subfolder else "") + ".zip"
+        file_data, download_name, media_type = await file_service.download_folder_subset(
+            dataset.file_path,
+            subfolder_prefix=subfolder,
+            archive_basename=f"{dataset_id}_{version}",
+        )
         return StreamingResponse(
-            BytesIO(zip_data),
-            media_type='application/zip',
-            headers={"Content-Disposition": f"attachment; filename={zip_name}"}
+            BytesIO(file_data),
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={download_name}"},
         )
     file_data = await file_service.download_file(dataset.file_path)
     return StreamingResponse(

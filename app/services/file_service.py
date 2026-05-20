@@ -1350,6 +1350,72 @@ class FileService:
             logger.error(f"Unexpected error during folder deletion: {e}")
             return 0
     
+    @staticmethod
+    def _media_type_for_filename(filename: str) -> str:
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext == "csv":
+            return "text/csv"
+        if ext in ("xlsx", "xls"):
+            return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        return "application/octet-stream"
+
+    async def download_folder_subset(
+        self,
+        folder_path: str,
+        subfolder_prefix: Optional[str] = None,
+        *,
+        archive_basename: str = "dataset",
+    ) -> Tuple[bytes, str, str]:
+        """
+        Download objects under a folder prefix.
+
+        When exactly one file exists (typical for tabular train/test/drift splits),
+        return raw file bytes so clients can read CSV directly. Otherwise return a ZIP.
+
+        Returns:
+            (data, download_filename, media_type)
+        """
+        prefix = folder_path
+        if subfolder_prefix:
+            prefix = f"{folder_path.rstrip('/')}/{subfolder_prefix}/"
+
+        object_names: List[str] = []
+        try:
+            for obj in self.client.list_objects(
+                self.bucket_name, prefix=prefix, recursive=True
+            ):
+                if not obj.object_name or obj.object_name.endswith("/"):
+                    continue
+                rel = obj.object_name.replace(prefix, "", 1).lstrip("/")
+                if rel:
+                    object_names.append(obj.object_name)
+        except S3Error as e:
+            logger.error(f"MinIO error listing folder {prefix}: {e}")
+            raise HTTPException(status_code=404, detail="Folder not found") from e
+
+        if not object_names:
+            raise HTTPException(status_code=404, detail="No files found in folder")
+
+        if len(object_names) == 1:
+            object_name = object_names[0]
+            try:
+                response = self.client.get_object(self.bucket_name, object_name)
+                data = response.read()
+            except S3Error as e:
+                logger.error(f"MinIO error downloading {object_name}: {e}")
+                raise HTTPException(status_code=404, detail="File not found") from e
+            download_name = os.path.basename(object_name)
+            media_type = self._media_type_for_filename(download_name)
+            return data, download_name, media_type
+
+        zip_data = await self.download_folder_as_zip(
+            folder_path, subfolder_prefix=subfolder_prefix
+        )
+        zip_name = archive_basename + (
+            f"_{subfolder_prefix}" if subfolder_prefix else ""
+        ) + ".zip"
+        return zip_data, zip_name, "application/zip"
+
     async def download_folder_as_zip(
         self, folder_path: str, subfolder_prefix: Optional[str] = None
     ) -> bytes:

@@ -76,8 +76,8 @@ Optional:
 # Kafka UI
 docker compose -f autodw/docker-compose.yaml --env-file autodw/.env --profile debug up -d
 
-# AutoML consumer (needs tabular/vision services on host ports 8001/8002)
-docker compose -f autodw/docker-compose.yaml --env-file autodw/.env --profile automl up -d
+# AutoML consumer
+# (Enabled by default in autodw/docker-compose.yaml; it needs tabular/vision services on host ports 8001/8002)
 ```
 
 ## Connect another component (e.g. Agentic Core orchestrator)
