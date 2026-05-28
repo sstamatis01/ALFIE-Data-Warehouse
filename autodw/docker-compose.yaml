@@ -3,10 +3,13 @@
 # What gets pulled from GitLab: only the `autodw` app image (api + kafka workers).
 # MongoDB, MinIO, Kafka, GraphDB, Zookeeper: public images from Docker Hub.
 #
-# Setup:
+# Setup (from repo root):
 #   cp autodw/.env.example autodw/.env
+#   Put graphdb_backup_*.tar.gz in graphdb_init/ (first GraphDB start)
 #   docker login gitlab.catalink.eu:5050
-#   docker compose -f autodw/docker-compose.yaml --env-file autodw/.env up -d
+#   docker compose -f autodw/docker-compose.yaml --env-file autodw/.env pull
+#   docker compose -f autodw/docker-compose.yaml --env-file autodw/.env up -d --no-build
+#   Use --build only when developing API code locally (see autodw/README.md)
 #
 # Exposed on the host:
 #   API:    http://localhost:8000
@@ -28,6 +31,12 @@ services:
       MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE:-data_warehouse}
     volumes:
       - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
     networks:
       - autodw-network
 
@@ -44,6 +53,12 @@ services:
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
     networks:
       - autodw-network
 
@@ -113,9 +128,19 @@ services:
       GDB_MIN_MEM: ${GDB_MIN_MEM:-1g}
       GDB_MAX_MEM: ${GDB_MAX_MEM:-1g}
       GDB_MASTER_PASSWORD: ${GDB_MASTER_PASSWORD:-admin}
+      INIT_BACKUP_DIR: /init-backup
     volumes:
       - graphdb_data:/opt/graphdb/home/data
       - graphdb_logs:/opt/graphdb/home/logs
+      # Repo-root graphdb_init/ (paths relative to this compose file in autodw/)
+      - ../graphdb_init:/init-backup:ro
+      - ../graphdb_init/entrypoint.sh:/entrypoint.sh:ro
+    # On Windows checkouts entrypoint.sh may have CRLF; normalize before running init.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "tr -d '\\r' < /entrypoint.sh > /tmp/entrypoint.sh && chmod +x /tmp/entrypoint.sh && exec /bin/sh /tmp/entrypoint.sh \"$@\""
+      - --
     command:
       - /opt/graphdb/dist/bin/graphdb
       - -Dgraphdb.home=/opt/graphdb/home
@@ -130,11 +155,17 @@ services:
       start_period: 60s
 
   api:
-    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw}:${AUTODW_VERSION:-1.0.0}
+    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw}:${AUTODW_VERSION:-1.0.3}
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: autodw-api
     restart: unless-stopped
     ports:
       - "${API_PORT:-8000}:8000"
+    volumes:
+      # Seed Excel (same pattern as graphdb_init backup mount); also baked into image on build
+      - ../etd_hub_init:/app/etd_hub_init:ro
     environment:
       ROOT_PATH: ${ROOT_PATH:-}
       MONGODB_URL: mongodb://${MONGO_INITDB_ROOT_USERNAME:-admin}:${MONGO_INITDB_ROOT_PASSWORD:-password}@mongodb:27017/${MONGO_INITDB_DATABASE:-data_warehouse}?authSource=admin
@@ -147,20 +178,46 @@ services:
       KAFKA_DATASET_TOPIC: dataset-events
       KAFKA_GROUP_ID: data-warehouse-group
       KAFKA_AUTO_OFFSET_RESET: earliest
+      # Seed ETD-Hub from /app/etd_hub_init/etd_hub_seed.xlsx when etd_themes is empty (image build)
+      ETD_HUB_AUTO_SEED: ${ETD_HUB_AUTO_SEED:-true}
+      ETD_HUB_SEED_PATH: ${ETD_HUB_SEED_PATH:-/app/etd_hub_init/etd_hub_seed.xlsx}
+      # Seed GraphDB Mongo config when graphdb_configs is empty (after graphdb backup restore)
+      GRAPHDB_AUTO_SEED: ${GRAPHDB_AUTO_SEED:-true}
+      GRAPHDB_REST_URL: ${GRAPHDB_REST_URL:-http://graphdb:7200}
+      GRAPHDB_INTERNAL_HOST: ${GRAPHDB_INTERNAL_HOST:-graphdb}
+      GRAPHDB_PORT: ${GRAPHDB_PORT:-7200}
+      GRAPHDB_REPOSITORY: ${GRAPHDB_REPOSITORY:-etd-hub-kg-test}
+      GDB_USER: ${GDB_USER:-admin}
+      GDB_PASS: ${GDB_MASTER_PASSWORD:-admin}
+      GRAPHDB_CONFIG_CREATED_BY: ${GRAPHDB_CONFIG_CREATED_BY:-autodw}
     depends_on:
       mongodb:
-        condition: service_started
+        condition: service_healthy
       minio:
-        condition: service_started
+        condition: service_healthy
       kafka:
+        condition: service_healthy
+      graphdb:
         condition: service_healthy
     networks:
       - autodw-network
-    command: >
-      sh -c "sleep 10 && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)\"",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 90s
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
   bias-detector:
-    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw}:${AUTODW_VERSION:-1.0.0}
+    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw}:${AUTODW_VERSION:-1.0.3}
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: autodw-bias-detector
     restart: unless-stopped
     environment:
@@ -170,16 +227,19 @@ services:
       API_BASE: http://api:8000
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
       kafka:
         condition: service_healthy
     networks:
       - autodw-network
     command: >
-      sh -c "sleep 15 && python kafka_bias_detector_consumer_example.py"
+      sh -c "sleep 5 && python kafka_bias_detector_consumer_example.py"
 
   automl-consumer:
-    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw}:${AUTODW_VERSION:-1.0.0}
+    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw}:${AUTODW_VERSION:-1.0.3}
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: autodw-automl-consumer
     restart: unless-stopped
     environment:
@@ -197,13 +257,13 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
       kafka:
         condition: service_healthy
     networks:
       - autodw-network
     command: >
-      sh -c "sleep 20 && python kafka_automl_consumer_example_v3.py"
+      sh -c "sleep 10 && python kafka_automl_consumer_example_v3.py"
 
 volumes:
   mongodb_data:

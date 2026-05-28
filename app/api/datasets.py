@@ -825,7 +825,7 @@ async def download_dataset_by_version(
     """
     Download a specific version of a dataset file or folder.
     Use split=train|test|drift to download only that subset when the dataset has a split.
-    Tabular split subsets with one CSV return raw CSV bytes (not a ZIP).
+    Tabular split subsets with one file return a ZIP containing that file (AutoML Tabular expects one file per archive).
     """
     dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
     if not dataset:

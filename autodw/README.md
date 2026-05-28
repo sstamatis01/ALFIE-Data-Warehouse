@@ -1,95 +1,148 @@
 # AutoDW — localized stack (localhost)
 
-This folder runs a **self-contained AutoDW system** for integration testing. It does **not** use `alfie.iti.gr` (that host is only for the separate ITI deployment via `docker-compose.deployment.yml` in the repo root).
+Self-contained AutoDW for **partner / local integration**. Not for `alfie.iti.gr` production (use repo-root `docker-compose.deployment.yml` there).
 
-## How images work (important)
+## Folder contents
 
-This is **not** one giant container with everything inside. Docker Compose starts **several containers** on one private network:
+| File | Purpose |
+|------|---------|
+| `docker-compose.yaml` | Full stack: MongoDB, MinIO, Kafka, GraphDB, API, bias-detector, automl-consumer |
+| `.env.example` | Template — copy to `.env` and set passwords |
+| `.env` | Your local config (create from example; do not commit) |
+| `README.md` | This guide |
+
+**Repo-root dependencies** (paths relative to `autodw/` in compose):
+
+| Path | Required for | In registry image? |
+|------|----------------|-------------------|
+| `../graphdb_init/graphdb_backup_*.tar.gz` | GraphDB triple-store on first start | No — mount from host |
+| `../graphdb_init/entrypoint.sh` | Backup restore entrypoint | No — mount from host |
+| `../etd_hub_init/etd_hub_seed.xlsx` | ETD-Hub forum data (optional mount) | Yes in `autodw` **≥ 1.0.3** |
+
+Clone the **full repository** (not only `autodw/`) so GraphDB backup restore works.
+
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  docker network: autodw-network                                  │
-│                                                                  │
 │  mongodb   minio   zookeeper → kafka   graphdb                   │
 │                              ↑                                   │
 │                    api (autodw image)                            │
-│                    bias-detector (same autodw image, diff command)│
-│                    [automl-consumer] (optional profile)          │
+│                    bias-detector / automl-consumer               │
 └─────────────────────────────────────────────────────────────────┘
-         │ ports published to your machine
+         │ localhost
          ▼
-   localhost:8000  → API
-   localhost:9092  → Kafka (for other stacks on the same host)
-   localhost:9000  → MinIO
-   localhost:7200  → GraphDB
+   :8000 API   :9092 Kafka   :9000 MinIO   :7200 GraphDB
 ```
 
-### What is pushed to GitLab?
+| Image | Source |
+|-------|--------|
+| `autodw` (API + workers) | GitLab `gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw` |
+| MongoDB, MinIO, Kafka, GraphDB, Zookeeper | Docker Hub |
 
-| Image | Registry | When |
-|-------|----------|------|
-| **`autodw`** (API + Python workers) | `gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:1.0.0` | Git tag `v1.0.0` → CI build |
-| MongoDB, MinIO, Kafka, GraphDB, Zookeeper | **Not** in GitLab — pulled from Docker Hub on `docker compose up` | Always |
+Same `autodw` image runs as `api`, `bias-detector`, and `automl-consumer` with different commands.
 
-So you **do not** get seven separate GitLab images. You get **one application image** plus a **compose file** that pulls standard infrastructure images and wires them together.
+## Quick start (registry `1.0.3` or `latest`)
 
-The same `autodw` image is used three times with different commands:
-
-| Container | Command |
-|-----------|---------|
-| `api` | `uvicorn app.main:app` |
-| `bias-detector` | `python kafka_bias_detector_consumer_example.py` |
-| `automl-consumer` (optional) | `python kafka_automl_consumer_example_v3.py` |
-
-### Inside the stack vs from outside
-
-| Client | API | Kafka |
-|--------|-----|-------|
-| Containers **in** this compose file | `http://api:8000` | `kafka:29092` |
-| Your browser / curl on the host | `http://localhost:8000` | `localhost:9092` |
-| **Another** Docker Compose project on the same machine | `http://host.docker.internal:8000` | `host.docker.internal:9092` |
-
-`KAFKA_ADVERTISED_HOST=localhost` in `.env` ensures Kafka metadata tells clients to use **localhost:9092**, not a remote hostname.
-
-## Quick start (test after CI published `1.0.0`)
+From **repo root**:
 
 ```bash
-# 1) Config
 cp autodw/.env.example autodw/.env
-# Edit passwords if needed; keep KAFKA_ADVERTISED_HOST=localhost
+# Edit passwords; ensure graphdb_init/graphdb_backup_*.tar.gz exists
 
-# 2) Registry login (read access to alfie project)
 docker login gitlab.catalink.eu:5050
 
-# 3) Pull app image + start full stack (core: api + bias-detector + infra)
-docker compose -f autodw/docker-compose.yaml --env-file autodw/.env pull api bias-detector
-docker compose -f autodw/docker-compose.yaml --env-file autodw/.env up -d
-
-# 4) Verify
-docker compose -f autodw/docker-compose.yaml ps
-curl -s http://localhost:8000/docs | head
+docker compose -f autodw/docker-compose.yaml --env-file autodw/.env pull
+docker compose -f autodw/docker-compose.yaml --env-file autodw/.env up -d --no-build
 ```
 
-Optional:
+`--no-build` uses the pulled registry image. Omit it and use `up -d --build` only when developing API code in this repo.
+
+### Verify (fresh volumes)
 
 ```bash
-# Kafka UI
-docker compose -f autodw/docker-compose.yaml --env-file autodw/.env --profile debug up -d
+docker compose -f autodw/docker-compose.yaml --env-file autodw/.env ps
+docker logs autodw-api 2>&1 | grep -iE "ETD-Hub|GraphDB|seed"
 
-# AutoML consumer
-# (Enabled by default in autodw/docker-compose.yaml; it needs tabular/vision services on host ports 8001/8002)
+curl -s http://localhost:8000/health
+curl -s http://localhost:8000/etd-hub/stats/overview
+curl -s http://localhost:8000/graphdb/configs
+curl -s -u admin:YOUR_GDB_PASSWORD http://localhost:7200/rest/repositories
 ```
 
-## Connect another component (e.g. Agentic Core orchestrator)
+Expected on first start:
 
-If orchestrator runs **on the host** (not in this compose file):
+- **ETD-Hub:** non-zero themes/questions (Excel auto-seed when `etd_themes` was empty)
+- **GraphDB configs:** one entry with `"status":"active"` — use its `"id"` in your app
+- **GraphDB repos:** e.g. `etd-hub-kg-test` after backup restore
+
+API docs: http://localhost:8000/docs
+
+### Reset and re-test
+
+```bash
+docker compose -f autodw/docker-compose.yaml --env-file autodw/.env down -v
+docker compose -f autodw/docker-compose.yaml --env-file autodw/.env up -d --no-build
+```
+
+## First-time initialization (automatic)
+
+| Layer | When it runs | Skip when |
+|-------|----------------|-----------|
+| GraphDB backup → volume | First GraphDB start, empty data dir | Repositories already exist |
+| ETD-Hub Excel → Mongo | API start, `ETD_HUB_AUTO_SEED=true`, empty `etd_themes` | Themes already in Mongo |
+| GraphDB config → Mongo | API start, `GRAPHDB_AUTO_SEED=true`, empty `graphdb_configs` | Config already in Mongo |
+
+Set `ETD_HUB_AUTO_SEED=false` or `GRAPHDB_AUTO_SEED=false` in `autodw/.env` to disable.
+
+**Get GraphDB `config_id` after deploy:**
+
+```bash
+curl -s http://localhost:8000/graphdb/configs
+```
+
+Do not reuse config IDs from other environments.
+
+## Environment variables
+
+All variables below can be set in `autodw/.env`. Compose passes defaults for seed-related keys even if omitted from `.env` (see `docker-compose.yaml` `api.environment`).
+
+| Variable | Default | Role |
+|----------|---------|------|
+| `AUTODW_IMAGE` / `AUTODW_VERSION` | `…/autodw` / `1.0.3` | Registry image |
+| `KAFKA_ADVERTISED_HOST` | `localhost` | External Kafka clients |
+| `ROOT_PATH` | empty | Set `/autodw` only behind reverse proxy |
+| `ETD_HUB_AUTO_SEED` | `true` | Import bundled Excel when forum DB empty |
+| `ETD_HUB_SEED_PATH` | `/app/etd_hub_init/etd_hub_seed.xlsx` | Seed file path in container |
+| `GRAPHDB_AUTO_SEED` | `true` | Create Mongo GraphDB config when empty |
+| `GRAPHDB_REPOSITORY` | `etd-hub-kg-test` | Target repository ID |
+| `GDB_MASTER_PASSWORD` | — | GraphDB admin password (graphdb + API `GDB_PASS`) |
+| `GRAPHDB_REST_URL` | `http://graphdb:7200` | API lists repos at startup |
+
+Full list: `autodw/.env.example`.
+
+## ETD-Hub (forum data)
+
+- Seed file: `etd_hub_init/etd_hub_seed.xlsx` (production export format)
+- Update for next release: replace file, rebuild/push `autodw` — see [etd_hub_init/README.md](../etd_hub_init/README.md)
+- Manual re-import: `POST /etd-hub/import/upload-excel`
+
+## GraphDB
+
+- **Triple store:** place `graphdb_backup_*.tar.gz` in `graphdb_init/` — see [graphdb_init/README.md](../graphdb_init/README.md)
+- **API config:** auto-created; optional script `python scripts/init_graphdb_config.py` for debugging
+
+## Connect other components
+
+**On host:**
 
 ```bash
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 API_BASE=http://localhost:8000
 ```
 
-If orchestrator runs in **another Docker Compose** project, add to that compose file:
+**Another Docker Compose project:**
 
 ```yaml
 extra_hosts:
@@ -99,28 +152,47 @@ environment:
   API_BASE: http://host.docker.internal:8000
 ```
 
-Or attach both stacks to the same external network (advanced).
+## Kafka topics
 
-## Kafka topics (in-stack)
+- `dataset-events` — API uploads
+- `bias-detection-trigger-events` / `bias-detection-complete-events`
+- `automl-trigger-events` / `automl-complete-events` (automl-consumer)
 
-- `dataset-events` — produced by API on upload
-- `bias-detection-trigger-events` — consumed by `bias-detector`
-- `bias-detection-complete-events` — produced by bias worker
-- `automl-trigger-events` / `automl-complete-events` — if automl profile is enabled
+Optional: `docker compose ... --profile debug up -d` for Kafka UI on port `8081`.
 
-## Releasing a new `autodw` image (maintainers)
+## Releasing `autodw` (maintainers)
 
-1. GitHub: set `DOCKER_REGISTRY_USERNAME` (variable) and `DOCKER_REGISTRY_PASSWORD` (secret).
-2. Tag: `git tag v1.0.0 && git push origin v1.0.0`
-3. CI pushes `autodw:1.0.0` and `autodw:latest`.
-4. Testers set `AUTODW_VERSION=1.0.0` in `autodw/.env` and run `docker compose pull && up`.
+**CI (tag → GitLab):**
 
-## alfie.iti.gr vs this bundle
+```bash
+git tag v1.0.3 && git push origin v1.0.3
+```
 
-| | `autodw/` (this folder) | ITI server (`docker-compose.deployment.yml`) |
-|--|-------------------------|-----------------------------------------------|
-| Purpose | Local / partner integration | Production deployment |
+Pushes `…/autodw:1.0.3` and `…/autodw:latest` via `.github/workflows/docker-build-push.yml`.
+
+**Manual push** (if that is your process):
+
+```bash
+docker build -t gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:1.0.3 \
+             -t gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:latest .
+docker push gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:1.0.3
+docker push gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:latest
+```
+
+## Production redeploy (alfie.iti.gr)
+
+Auto-seed is idempotent. Redeploying a new API image against **existing** Mongo/GraphDB volumes does not overwrite ETD-Hub or GraphDB configs.
+
+`docker-compose.deployment.yml` sets `ETD_HUB_AUTO_SEED=false` and `GRAPHDB_AUTO_SEED=false` on the ITI API as an extra safeguard.
+
+| | `autodw/` (this folder) | ITI (`docker-compose.deployment.yml`) |
+|--|-------------------------|----------------------------------------|
+| Purpose | Local / partner | Production |
 | Kafka advertised | `localhost` | `alfie.iti.gr` |
-| API path | `/` (direct :8000) | `/autodw` behind reverse proxy |
+| API URL | `http://localhost:8000` | `https://alfie.iti.gr/autodw` |
 
-Do not mix the two `.env` files.
+Do not copy production `.env` into `autodw/.env`.
+
+## Older registry tags
+
+Tags **before 1.0.3** lack bundled ETD-Hub seed and auto-config code. Use `AUTODW_VERSION=1.0.3` (or `latest`) or `docker compose ... up -d --build` from a full repo clone.

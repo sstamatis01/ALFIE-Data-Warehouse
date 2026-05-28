@@ -25,6 +25,8 @@ RUN python -c "import aiohttp; print('aiohttp version:', aiohttp.__version__)" &
 
 # Copy application code
 COPY app/ ./app/
+COPY etd_hub_init/ ./etd_hub_init/
+COPY scripts/init_graphdb_config.py scripts/init_etd_hub_from_excel.py ./scripts/
 COPY kafka_bias_detector_consumer_example.py ./
 COPY kafka_automl_consumer_example_v3.py ./
 

@@ -44,9 +44,23 @@ curl -s -u admin:admin "http://localhost:7200/rest/repositories" | head -100
 
 Or open http://localhost:7200 in a browser, go to **Setup** → **Repositories**, and note the **repository ID** (e.g. `etd-hub-kg`, `repo1`).
 
-### 2. Create a GraphDB config in the Data Warehouse API
+### 2. GraphDB config in the Data Warehouse API
 
-**Option A – helper script (from repo root)**
+**Default (Docker / registry image):** the API auto-creates a config on startup when MongoDB is empty (`GRAPHDB_AUTO_SEED=true`). After `docker compose up`:
+
+```bash
+curl -s http://localhost:8000/graphdb/configs
+```
+
+Use the returned `"id"` in your app. Set `GRAPHDB_REPOSITORY=YOUR_REPO_ID` in `autodw/.env` if you do not want the default `etd-hub-kg-test`.
+
+**Option A – Python init script (optional, from repo root)**
+
+```bash
+python scripts/init_graphdb_config.py --repository YOUR_REPO_ID --test
+```
+
+**Option B – shell helper**
 
 ```bash
 cd graphdb_init
@@ -55,7 +69,7 @@ sh create_graphdb_config.sh YOUR_REPO_ID your-user-id
 
 If you omit `YOUR_REPO_ID`, the script tries to list repositories from GraphDB and use the first one. Example: `sh create_graphdb_config.sh etd-hub-kg default`.
 
-**Option B – curl**
+**Option C – curl**
 
 From the host (API on port 8000). Use **`http://graphdb:7200`** in the endpoints so that the API container can reach GraphDB on the Docker network. Replace `YOUR_REPO_ID` with the repository ID from step 1, and `your-user-id` with any string (e.g. `default`).
 

@@ -24,8 +24,10 @@ from .services.ai_model_service import ai_model_service
 from .services.xai_report_service import xai_report_service
 from .api import xai_reports
 from .services.etd_hub_service import etd_hub_service
+from .services.etd_hub_seed_service import maybe_seed_etd_hub_from_excel
 from .api import etd_hub, etd_hub_import
 from .services.graphdb_service import graphdb_service
+from .services.graphdb_seed_service import maybe_seed_graphdb_config
 from .api import graphdb
 from .api import user_files
 from .services.user_file_service import user_file_service
@@ -56,7 +58,23 @@ async def lifespan(app: FastAPI):
         await ai_model_service.initialize()
         await xai_report_service.initialize()
         await etd_hub_service.initialize()
+        try:
+            seed_results = await maybe_seed_etd_hub_from_excel()
+            if seed_results:
+                logger.info("ETD-Hub seeded on startup: %s", seed_results)
+        except Exception as seed_error:
+            logger.warning("ETD-Hub auto-seed skipped due to error: %s", seed_error)
         await graphdb_service.initialize()
+        try:
+            graphdb_config = await maybe_seed_graphdb_config()
+            if graphdb_config:
+                logger.info(
+                    "GraphDB config seeded on startup: id=%s repository=%s",
+                    graphdb_config.id,
+                    graphdb_config.repository_name,
+                )
+        except Exception as seed_error:
+            logger.warning("GraphDB auto-seed skipped due to error: %s", seed_error)
         await user_file_service.initialize()
         await gdpr_service.initialize()
         

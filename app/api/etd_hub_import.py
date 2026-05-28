@@ -10,6 +10,7 @@ from ..models.etd_hub import (
     ProblemCategory, ModelCategory, DomainCategory, AreaOfExpertise
 )
 from ..services.etd_hub_service import etd_hub_service
+from ..services.etd_hub_excel_import_service import load_excel_to_import_dict
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/etd-hub/import", tags=["ETD-Hub Import"])
@@ -110,10 +111,10 @@ class ETDHubDataImporter:
                 # Create a copy and map fields
                 mapped_data = theme_data.copy()
                 
-                # Map 'id' to 'theme_id' and remove 'id' completely
-                if 'id' in mapped_data:
-                    mapped_data['theme_id'] = mapped_data['id']
-                    del mapped_data['id']
+                # Map 'id' to 'theme_id' when present (JSON bulk); Excel uses theme_id directly
+                if "id" in mapped_data and "theme_id" not in mapped_data:
+                    mapped_data["theme_id"] = mapped_data["id"]
+                    del mapped_data["id"]
                 
                 # Ensure required fields are present
                 if 'views' not in mapped_data:
@@ -123,9 +124,15 @@ class ETDHubDataImporter:
                 else:
                     mapped_data['created_at'] = datetime.now(tz=timezone.utc)
                 
-                mapped_data['problem_category'] = self.map_problem_category(mapped_data.get('problem_category', 'OTHER'))
-                mapped_data['model_category'] = self.map_model_category(mapped_data.get('model_category', 'OTHER'))
-                mapped_data['domain_category'] = self.map_domain_category(mapped_data.get('domain_category', 'OTHER'))
+                mapped_data["problem_category"] = self.map_problem_category(
+                    mapped_data.get("problem_category", "OTHER")
+                ).value
+                mapped_data["model_category"] = self.map_model_category(
+                    mapped_data.get("model_category", "OTHER")
+                ).value
+                mapped_data["domain_category"] = self.map_domain_category(
+                    mapped_data.get("domain_category", "OTHER")
+                ).value
                 
                 logger.info(f"Mapped data: {mapped_data}")
                 
@@ -293,7 +300,9 @@ class ETDHubDataImporter:
                 else:
                     mapped_data['date_joined'] = datetime.now(tz=timezone.utc)
                 
-                mapped_data['area_of_expertise'] = self.map_area_of_expertise(mapped_data.get('area_of_expertise', 'OTHER'))
+                mapped_data["area_of_expertise"] = self.map_area_of_expertise(
+                    mapped_data.get("area_of_expertise", "OTHER")
+                ).value
                 
                 # Insert the complete data directly
                 await self.experts_collection.insert_one(mapped_data)
@@ -326,24 +335,19 @@ class ETDHubDataImporter:
             
             results = {}
             
-            # Import each entity type
-            if 'Theme' in data and data['Theme']:
-                results['themes'] = await self.import_themes(data['Theme'])
-            
-            if 'Document' in data and data['Document']:
-                results['documents'] = await self.import_documents(data['Document'])
-            
-            if 'Question' in data and data['Question']:
-                results['questions'] = await self.import_questions(data['Question'])
-            
-            if 'Answer' in data and data['Answer']:
-                results['answers'] = await self.import_answers(data['Answer'])
-            
-            if 'Vote' in data and data['Vote']:
-                results['votes'] = await self.import_votes(data['Vote'])
-            
-            if 'Expert' in data and data['Expert']:
-                results['experts'] = await self.import_experts(data['Expert'])
+            # Import experts first (referenced by themes/questions), then themes, etc.
+            if "Expert" in data and data["Expert"]:
+                results["experts"] = await self.import_experts(data["Expert"])
+            if "Theme" in data and data["Theme"]:
+                results["themes"] = await self.import_themes(data["Theme"])
+            if "Document" in data and data["Document"]:
+                results["documents"] = await self.import_documents(data["Document"])
+            if "Question" in data and data["Question"]:
+                results["questions"] = await self.import_questions(data["Question"])
+            if "Answer" in data and data["Answer"]:
+                results["answers"] = await self.import_answers(data["Answer"])
+            if "Vote" in data and data["Vote"]:
+                results["votes"] = await self.import_votes(data["Vote"])
             
             total_imported = sum(results.values())
             logger.info(f"Import completed! Total records imported: {total_imported}")
@@ -354,9 +358,63 @@ class ETDHubDataImporter:
             logger.error(f"Import failed: {e}")
             raise
 
+    async def import_from_excel_path(
+        self, path: str, clear_existing: bool = True
+    ) -> Dict[str, int]:
+        """Import ETD-Hub data from an export-format Excel file."""
+        data = load_excel_to_import_dict(path)
+        if not data:
+            raise ValueError(f"No importable ETD-Hub sheets in {path}")
+        return await self.import_data(data, clear_existing=clear_existing)
+
 
 # Global importer instance
 importer = ETDHubDataImporter()
+
+
+@router.post("/upload-excel")
+async def import_from_excel_file(
+    file: UploadFile = File(...), clear_existing: bool = True
+):
+    """Import ETD-Hub data from an Excel file (same format as GET /etd-hub/export/excel)."""
+    import tempfile
+    import os
+
+    try:
+        name = (file.filename or "").lower()
+        if not name.endswith((".xlsx", ".xls")):
+            raise HTTPException(
+                status_code=400,
+                detail="File must be an Excel file (.xlsx or .xls)",
+            )
+
+        suffix = ".xlsx" if name.endswith(".xlsx") else ".xls"
+        content = await file.read()
+        await importer.initialize()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        try:
+            results = await importer.import_from_excel_path(
+                tmp_path, clear_existing=clear_existing
+            )
+        finally:
+            os.unlink(tmp_path)
+
+        return {
+            "message": "Data imported successfully from Excel",
+            "results": results,
+            "total_imported": sum(results.values()),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Excel import failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")
 
 
 @router.post("/upload-json")

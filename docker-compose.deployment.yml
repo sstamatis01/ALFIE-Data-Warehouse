@@ -9,6 +9,10 @@ services:
   api:
     environment:
       ROOT_PATH: /autodw
+      # Production Mongo/GraphDB already populated — auto-seed skips when data exists;
+      # disable anyway so an empty collection never imports the partner seed snapshot.
+      ETD_HUB_AUTO_SEED: "false"
+      GRAPHDB_AUTO_SEED: "false"
 
   # Consumers use in-stack Kafka + talk to DW API over the docker network.
   bias-detector:

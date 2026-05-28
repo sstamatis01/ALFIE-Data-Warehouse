@@ -48,6 +48,9 @@ MANIFEST
 
 # Virtual environments
 .env
+.env.bak
+autodw/.env
+autodw/.env.bak
 .venv
 env/
 venv/
@@ -87,6 +90,11 @@ logs/
 # GraphDB init backup (large export; keep out of git)
 graphdb_init/*.tar.gz
 graphdb_backup*.tar.gz
+
+# ETD-Hub seed: keep bundled etd_hub_seed.xlsx; ignore ad-hoc exports at repo root
+etd_hub_export_*.xlsx
+etd_hub_init/*.xlsx
+!etd_hub_init/etd_hub_seed.xlsx
 
 # Backup files
 *.bak

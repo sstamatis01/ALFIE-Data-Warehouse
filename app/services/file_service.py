@@ -1370,7 +1370,8 @@ class FileService:
         Download objects under a folder prefix.
 
         When exactly one file exists (typical for tabular train/test/drift splits),
-        return raw file bytes so clients can read CSV directly. Otherwise return a ZIP.
+        return a ZIP containing that single file so AutoML Tabular (expects one file per
+        archive) and multi-file folder downloads stay consistent. Otherwise return a ZIP.
 
         Returns:
             (data, download_filename, media_type)
@@ -1400,13 +1401,18 @@ class FileService:
             object_name = object_names[0]
             try:
                 response = self.client.get_object(self.bucket_name, object_name)
-                data = response.read()
+                file_data = response.read()
             except S3Error as e:
                 logger.error(f"MinIO error downloading {object_name}: {e}")
                 raise HTTPException(status_code=404, detail="File not found") from e
-            download_name = os.path.basename(object_name)
-            media_type = self._media_type_for_filename(download_name)
-            return data, download_name, media_type
+            entry_name = os.path.basename(object_name)
+            zip_buffer = BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                zip_file.writestr(entry_name, file_data)
+            zip_name = archive_basename + (
+                f"_{subfolder_prefix}" if subfolder_prefix else ""
+            ) + ".zip"
+            return zip_buffer.getvalue(), zip_name, "application/zip"
 
         zip_data = await self.download_folder_as_zip(
             folder_path, subfolder_prefix=subfolder_prefix

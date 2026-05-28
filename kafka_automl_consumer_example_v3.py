@@ -24,10 +24,12 @@ Usage:
 """
 
 import os
+import re
 import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from io import StringIO
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 import requests
 import pandas as pd
@@ -416,37 +418,115 @@ def get_latest_model_for_user(user_id: str) -> dict | None:
     return models[0] if models else None
 
 
+def _coerce_metric_float(value) -> float | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _column_lookup(columns: list[str], *needles: str) -> str | None:
+    """Find first column whose normalized name contains any needle."""
+    for col in columns:
+        norm = re.sub(r"\s+", "_", str(col).strip().lower())
+        if not norm or norm.startswith("unnamed"):
+            continue
+        if any(n in norm for n in needles):
+            return col
+    return None
+
+
+def _extract_scores_from_leaderboard(leaderboard: str) -> dict[str, float | None]:
+    """
+    Parse AutoGluon markdown leaderboard (pipe table) and return scores for the best row.
+    Maps score_test -> test_accuracy, score_val -> validation_accuracy when present.
+    """
+    scores: dict[str, float | None] = {
+        "test_accuracy": None,
+        "validation_accuracy": None,
+        "training_accuracy": None,
+    }
+    if not leaderboard or not isinstance(leaderboard, str):
+        return scores
+
+    table_lines: list[str] = []
+    for line in leaderboard.strip().splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        if re.match(r"^\|[\s\-:|]+\|$", line):
+            continue
+        table_lines.append(line)
+
+    if len(table_lines) < 2:
+        return scores
+
+    try:
+        df = pd.read_csv(StringIO("\n".join(table_lines)), sep="|", engine="python")
+        df = df.dropna(axis=1, how="all")
+        df.columns = [str(c).strip() for c in df.columns]
+        if df.empty:
+            return scores
+
+        col_test = _column_lookup(list(df.columns), "score_test", "test_score", "test_accuracy")
+        col_val = _column_lookup(list(df.columns), "score_val", "val_score", "validation_accuracy")
+        col_train = _column_lookup(list(df.columns), "score_train", "train_score", "training_accuracy")
+
+        best = df.iloc[0]
+        if col_test:
+            scores["test_accuracy"] = _coerce_metric_float(best[col_test])
+        if col_val:
+            scores["validation_accuracy"] = _coerce_metric_float(best[col_val])
+        if col_train:
+            scores["training_accuracy"] = _coerce_metric_float(best[col_train])
+    except Exception as e:
+        logger.warning("Could not parse leaderboard table for metrics: %s", e)
+
+    return scores
+
+
 def _parse_automl_response_metrics(response_data: dict) -> dict:
     """
     Extract metrics from AutoML tabular response for DW metadata update.
-    Returns dict with: leaderboard, test_accuracy, validation_accuracy, custom_metadata.
+    Returns dict with: leaderboard, test_accuracy, validation_accuracy, training_accuracy, custom_metadata.
     """
-    out = {"leaderboard": None, "test_accuracy": None, "validation_accuracy": None, "custom_metadata": {}}
+    out = {
+        "leaderboard": None,
+        "test_accuracy": None,
+        "validation_accuracy": None,
+        "training_accuracy": None,
+        "custom_metadata": {},
+    }
     if not response_data:
         return out
     out["leaderboard"] = response_data.get("leaderboard")
-    out["test_accuracy"] = response_data.get("test_accuracy")
-    if out["test_accuracy"] is not None and not isinstance(out["test_accuracy"], (int, float)):
-        try:
-            out["test_accuracy"] = float(out["test_accuracy"])
-        except (TypeError, ValueError):
-            out["test_accuracy"] = None
-    out["validation_accuracy"] = response_data.get("validation_accuracy")
-    if out["validation_accuracy"] is not None and not isinstance(out["validation_accuracy"], (int, float)):
-        try:
-            out["validation_accuracy"] = float(out["validation_accuracy"])
-        except (TypeError, ValueError):
-            out["validation_accuracy"] = None
+    out["test_accuracy"] = _coerce_metric_float(response_data.get("test_accuracy"))
+    out["validation_accuracy"] = _coerce_metric_float(response_data.get("validation_accuracy"))
+    out["training_accuracy"] = _coerce_metric_float(response_data.get("training_accuracy"))
+
     best_score = response_data.get("best_score") or response_data.get("score_test")
     if best_score is not None and out["test_accuracy"] is None:
-        try:
-            s = float(best_score)
-            if 0 <= s <= 1:
-                out["test_accuracy"] = s
-            else:
-                out["custom_metadata"]["best_score"] = s
-        except (TypeError, ValueError):
+        s = _coerce_metric_float(best_score)
+        if s is not None:
+            out["test_accuracy"] = s
+        else:
             out["custom_metadata"]["best_score"] = best_score
+
+    if out["leaderboard"] and (
+        out["test_accuracy"] is None
+        or out["validation_accuracy"] is None
+        or out["training_accuracy"] is None
+    ):
+        from_lb = _extract_scores_from_leaderboard(out["leaderboard"])
+        if out["test_accuracy"] is None:
+            out["test_accuracy"] = from_lb["test_accuracy"]
+        if out["validation_accuracy"] is None:
+            out["validation_accuracy"] = from_lb["validation_accuracy"]
+        if out["training_accuracy"] is None:
+            out["training_accuracy"] = from_lb["training_accuracy"]
+
     for key in ("message", "model_id", "version"):
         if key in response_data and response_data[key] is not None:
             out["custom_metadata"][key] = response_data[key]
@@ -711,7 +791,13 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                         model_id_to_update = latest.get("model_id")
                         version_to_update = latest.get("version", "v1")
                         logger.info(f"   Using latest model for user as target for metrics: {model_id_to_update} {version_to_update}")
-                if model_id_to_update and version_to_update and (metrics["leaderboard"] or metrics["test_accuracy"] is not None or metrics["validation_accuracy"] is not None or metrics["custom_metadata"]):
+                if model_id_to_update and version_to_update and (
+                    metrics["leaderboard"]
+                    or metrics["test_accuracy"] is not None
+                    or metrics["validation_accuracy"] is not None
+                    or metrics["training_accuracy"] is not None
+                    or metrics["custom_metadata"]
+                ):
                     update_model_metadata_in_dw(
                         user_id,
                         model_id_to_update,
@@ -719,9 +805,17 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                         leaderboard=metrics["leaderboard"],
                         test_accuracy=metrics["test_accuracy"],
                         validation_accuracy=metrics["validation_accuracy"],
+                        training_accuracy=metrics["training_accuracy"],
                         custom_metadata=metrics["custom_metadata"] or None,
                     )
-                    logger.info(f"   Updated model metadata in DW with leaderboard/metrics for {model_id_to_update} {version_to_update}")
+                    logger.info(
+                        "   Updated model metadata in DW for %s %s (test=%s, val=%s, train=%s)",
+                        model_id_to_update,
+                        version_to_update,
+                        metrics["test_accuracy"],
+                        metrics["validation_accuracy"],
+                        metrics["training_accuracy"],
+                    )
             except Exception as meta_e:
                 logger.warning(f"   Could not update model metadata with AutoML metrics: {meta_e}")
             
@@ -828,9 +922,17 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                         leaderboard=metrics["leaderboard"],
                         test_accuracy=metrics["test_accuracy"],
                         validation_accuracy=metrics["validation_accuracy"],
+                        training_accuracy=metrics["training_accuracy"],
                         custom_metadata=metrics["custom_metadata"] or None,
                     )
-                    logger.info(f"   Updated model metadata in DW for {model_id_to_update} {version_to_update}")
+                    logger.info(
+                        "   Updated model metadata in DW for %s %s (test=%s, val=%s, train=%s)",
+                        model_id_to_update,
+                        version_to_update,
+                        metrics["test_accuracy"],
+                        metrics["validation_accuracy"],
+                        metrics["training_accuracy"],
+                    )
             except Exception as meta_e:
                 logger.warning(f"   Could not update model metadata with Vision AutoML metrics: {meta_e}")
         else:
