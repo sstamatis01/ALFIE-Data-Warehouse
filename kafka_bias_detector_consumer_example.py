@@ -13,6 +13,7 @@ import os
 import asyncio
 import json
 import logging
+from dataclasses import dataclass, field
 from importlib.metadata import distribution
 from datetime import datetime, timezone
 
@@ -97,32 +98,35 @@ def upload_mitigated_dataset_folder(
 ) -> dict:
     """
     Upload a mitigated dataset that has train/test/drift splits as a single new version (folder zip).
-    Aligns columns across all three splits so they have identical structure (required for ML and for
-    consumers that expect consistent train/test/drift CSVs). Missing columns in a split are filled with 0.
+    Aligns test/drift to the train column schema (drops split-only columns). Missing columns are
+    filled with 0 so all three splits share an identical structure for downstream ML/XAI.
     Returns the API response including the new version.
     """
     from io import BytesIO
     import zipfile
 
-    # Align columns: use union of all columns, same order as train; fill missing in test/drift with 0
+    # Align to train schema only (avoid unioning split-only ghost columns filled with zeros)
     all_cols = list(df_train.columns)
-    for df in (df_test, df_drift):
-        for c in df.columns:
-            if c not in all_cols:
-                all_cols.append(c)
-    # Ensure train has all cols (already does), then test and drift
+
     def align_to_columns(df: pd.DataFrame, columns: list) -> pd.DataFrame:
-        out = df.copy()
-        for c in columns:
-            if c not in out.columns:
-                out[c] = 0
-        return out[columns]
+        extra = [c for c in df.columns if c not in columns]
+        if extra:
+            logger.info("Dropping %d split-only column(s) not in train schema: %s", len(extra), extra[:10])
+        return df.reindex(columns=columns, fill_value=0)
 
     df_train_a = align_to_columns(df_train, all_cols)
     df_test_a = align_to_columns(df_test, all_cols)
     df_drift_a = align_to_columns(df_drift, all_cols)
-    if len(all_cols) != len(df_train.columns) or len(all_cols) != len(df_test.columns) or len(all_cols) != len(df_drift.columns):
-        logger.info(f"Aligned train/test/drift to common columns: {len(all_cols)} columns (train had {len(df_train.columns)}, test {len(df_test.columns)}, drift {len(df_drift.columns)})")
+    if (
+        len(df_test.columns) != len(all_cols)
+        or len(df_drift.columns) != len(all_cols)
+    ):
+        logger.info(
+            "Aligned test/drift to train columns: %d columns (test had %d, drift had %d)",
+            len(all_cols),
+            len(df_test.columns),
+            len(df_drift.columns),
+        )
 
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -413,61 +417,253 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
     return clean_for_json(report)
 
 
-def preprocess_data(df: pd.DataFrame, eda_results: dict):
+_BOOL_TRUE_TOKENS = frozenset({"true", "1", "yes", "t", "y"})
+_BOOL_FALSE_TOKENS = frozenset({"false", "0", "no", "f", "n"})
+
+
+@dataclass
+class MitigationState:
+    """Fitted preprocessing artifacts (train split); reused for test/drift transforms."""
+
+    target_column: str | None = None
+    fill_values: dict = field(default_factory=dict)
+    one_hot_categories: dict = field(default_factory=dict)
+    label_encoders: dict = field(default_factory=dict)
+    skew_transformers: dict = field(default_factory=dict)
+    drift_scalers: dict = field(default_factory=dict)
+
+
+def _normalize_to_bool_token(val):
+    if pd.isna(val):
+        return np.nan
+    if isinstance(val, (bool, np.bool_)):
+        return bool(val)
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        if val == 1 or val == 1.0:
+            return True
+        if val == 0 or val == 0.0:
+            return False
+        return np.nan
+    token = str(val).strip().lower()
+    if token in _BOOL_TRUE_TOKENS:
+        return True
+    if token in _BOOL_FALSE_TOKENS:
+        return False
+    return np.nan
+
+
+def _is_boolean_like(series: pd.Series) -> bool:
+    if pd.api.types.is_bool_dtype(series):
+        return True
+    if not (
+        pd.api.types.is_object_dtype(series)
+        or pd.api.types.is_string_dtype(series)
+    ):
+        return False
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    normalized = non_null.map(_normalize_to_bool_token)
+    valid_ratio = float(normalized.notna().mean())
+    return valid_ratio >= 0.95 and int(non_null.nunique()) <= 3
+
+
+def _coerce_boolean_series(series: pd.Series) -> tuple[pd.Series, int]:
+    normalized = series.map(_normalize_to_bool_token)
+    invalid_count = int(normalized.isna().sum())
+    mode_vals = normalized.mode(dropna=True)
+    fill = bool(mode_vals.iloc[0]) if not mode_vals.empty else False
+    coerced = normalized.fillna(fill).astype(bool)
+    return coerced, invalid_count
+
+
+def _is_text_like_column(s: pd.Series) -> bool:
+    if not (pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s)):
+        return False
+    non_null = s.dropna()
+    if non_null.empty:
+        return False
+    sample = non_null.astype(str).head(2000)
+    avg_len = float(sample.str.len().mean())
+    uniq = int(sample.nunique(dropna=True))
+    return avg_len >= 20 or uniq >= 50
+
+
+def _one_hot_dummy_name(prefix: str, category: str) -> str:
+    return f"{prefix}_{category}"
+
+
+def _apply_one_hot_columns(
+    df: pd.DataFrame, col: str, categories: list[str]
+) -> pd.DataFrame:
+    series_str = df[col].astype(str)
+    dummy_frames = {
+        _one_hot_dummy_name(col, cat): (series_str == cat).astype(bool)
+        for cat in categories
+    }
+    return pd.concat([df.drop(columns=col), pd.DataFrame(dummy_frames)], axis=1)
+
+
+def _encode_categorical_features(
+    df: pd.DataFrame,
+    target_column: str | None,
+    state: MitigationState,
+    fitting: bool,
+    transformation_log: list,
+) -> pd.DataFrame:
+    candidate_cols = [
+        c
+        for c in df.columns
+        if c != target_column
+        and (
+            pd.api.types.is_object_dtype(df[c])
+            or pd.api.types.is_string_dtype(df[c])
+            or pd.api.types.is_bool_dtype(df[c])
+        )
+    ]
+
+    for col in candidate_cols:
+        if _is_text_like_column(df[col]):
+            if fitting:
+                transformation_log.append(
+                    {
+                        "column": col,
+                        "transformation": "encoding_skipped",
+                        "method": "keep_text",
+                        "original_value": int(df[col].nunique(dropna=True)),
+                        "modified_value": "kept as raw text",
+                    }
+                )
+            continue
+
+        if _is_boolean_like(df[col]):
+            coerced, invalid_count = _coerce_boolean_series(df[col])
+            df[col] = coerced
+            if fitting and invalid_count > 0:
+                transformation_log.append(
+                    {
+                        "column": col,
+                        "transformation": "invalid_boolean_cleaned",
+                        "method": "coerce_to_bool",
+                        "original_value": f"{invalid_count} invalid value(s)",
+                        "modified_value": "replaced with column mode then bool",
+                    }
+                )
+            if fitting:
+                transformation_log.append(
+                    {
+                        "column": col,
+                        "transformation": "encoding_skipped",
+                        "method": "keep_boolean",
+                        "original_value": "boolean-like",
+                        "modified_value": "kept as bool",
+                    }
+                )
+            continue
+
+        if fitting:
+            unique_vals = int(df[col].nunique(dropna=True))
+            if unique_vals <= 10:
+                categories = sorted(df[col].dropna().astype(str).unique(), key=str)
+                state.one_hot_categories[col] = categories
+                df = _apply_one_hot_columns(df, col, categories)
+                transformation_log.append(
+                    {
+                        "column": col,
+                        "transformation": "encoding",
+                        "method": "one-hot",
+                        "original_value": unique_vals,
+                        "modified_value": f"{len(categories)} binary columns",
+                    }
+                )
+            else:
+                le = LabelEncoder()
+                df[col] = le.fit_transform(df[col].astype(str))
+                state.label_encoders[col] = le
+                transformation_log.append(
+                    {
+                        "column": col,
+                        "transformation": "encoding",
+                        "method": "label_encoding",
+                        "original_value": unique_vals,
+                        "modified_value": f"integers from 0 to {unique_vals - 1}",
+                    }
+                )
+        elif col in state.one_hot_categories:
+            categories = state.one_hot_categories[col]
+            df = _apply_one_hot_columns(df, col, categories)
+        elif col in state.label_encoders:
+            le = state.label_encoders[col]
+            mapping = {cls: idx for idx, cls in enumerate(le.classes_)}
+            df[col] = (
+                df[col]
+                .astype(str)
+                .map(mapping)
+                .fillna(-1)
+                .astype(int)
+            )
+        else:
+            logger.warning(
+                "Column %s not in fitted mitigation state; left unchanged", col
+            )
+
+    return df
+
+
+def preprocess_data(
+    df: pd.DataFrame,
+    eda_results: dict,
+    state: MitigationState | None = None,
+):
     """
-    Mitigation pipeline (aligned with v4 script):
-    - Fill missing values
+    Mitigation pipeline:
+    - Fill missing values (train-fitted fill values applied on other splits)
     - Drop duplicates
-    - Encode categoricals (skip target)
-    - Task inference + target encoding
-    - Skew correction
-    - Classification-only SMOTE with safety guards
-    - Drift mitigation
-    Returns (transformed_dataframe, transformation_log).
+    - Encode categoricals (boolean-like kept as bool; one-hot fit on train only)
+    - Skew correction and drift mitigation (train-fitted, applied on other splits)
+    - SMOTE on train split only
+
+    Returns (transformed_dataframe, transformation_log, state).
     """
     df_cleaned = df.copy()
+    fitting = state is None
+    if fitting:
+        state = MitigationState()
     target_column = eda_results.get("target_column")
+    state.target_column = target_column
     transformation_log = []
     try:
-        # Heuristic: keep free-form text features as raw strings.
-        # AutoGluon can natively consume text columns; encoding them to integers destroys meaning.
-        def _is_text_like(s: pd.Series) -> bool:
-            if not (pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s)):
-                return False
-            non_null = s.dropna()
-            if non_null.empty:
-                return False
-            # sample for speed
-            sample = non_null.astype(str).head(2000)
-            avg_len = float(sample.str.len().mean())
-            uniq = int(sample.nunique(dropna=True))
-            # "text-like" = longer strings and/or high cardinality
-            return avg_len >= 20 or uniq >= 50
-
         # 1. Fill missing values
         for col in eda_results.get("columns", df_cleaned.columns):
             if col not in df_cleaned.columns:
                 continue
             nulls = int(df_cleaned[col].isnull().sum())
             if nulls > 0:
-                is_numeric = pd.api.types.is_numeric_dtype(df_cleaned[col])
-                method = "median" if is_numeric else "mode"
-                fill_value = (
-                    df_cleaned[col].median()
-                    if method == "median"
-                    else df_cleaned[col].mode().iloc[0]
-                )
+                if not fitting and col in state.fill_values:
+                    fill_value = state.fill_values[col]
+                    method = "train_fill"
+                else:
+                    is_numeric = pd.api.types.is_numeric_dtype(df_cleaned[col])
+                    method = "median" if is_numeric else "mode"
+                    fill_value = (
+                        df_cleaned[col].median()
+                        if method == "median"
+                        else df_cleaned[col].mode().iloc[0]
+                    )
+                    if fitting:
+                        state.fill_values[col] = fill_value
                 df_cleaned[col] = df_cleaned[col].fillna(fill_value)
 
-                transformation_log.append(
-                    {
-                        "column": col,
-                        "transformation": "missing_value_fill",
-                        "method": method,
-                        "original_missing_values": f"{nulls} missing",
-                        "modified_value": fill_value,
-                    }
-                )
+                if fitting:
+                    transformation_log.append(
+                        {
+                            "column": col,
+                            "transformation": "missing_value_fill",
+                            "method": method,
+                            "original_missing_values": f"{nulls} missing",
+                            "modified_value": fill_value,
+                        }
+                    )
 
         # 2. Remove duplicates
         dup_count = int(
@@ -475,62 +671,25 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
         )
         if dup_count > 0:
             df_cleaned = df_cleaned.drop_duplicates()
-            transformation_log.append(
-                {
-                    "column": "all",
-                    "transformation": "duplicate_removal",
-                    "method": "drop_duplicates",
-                    "original_value": f"{dup_count} duplicates",
-                    "modified_value": "duplicates removed",
-                }
-            )
+            if fitting:
+                transformation_log.append(
+                    {
+                        "column": "all",
+                        "transformation": "duplicate_removal",
+                        "method": "drop_duplicates",
+                        "original_value": f"{dup_count} duplicates",
+                        "modified_value": "duplicates removed",
+                    }
+                )
 
-        # 3. Encode categorical features
-        cat_cols = df_cleaned.select_dtypes(include="object").columns
-        for col in cat_cols:
-            if col == target_column:
-                # Keep classification labels as-is for now; optionally label-encode below after task inference
-                continue
-            # Keep free-form text columns as raw text (do not encode)
-            if _is_text_like(df_cleaned[col]):
-                transformation_log.append(
-                    {
-                        "column": col,
-                        "transformation": "encoding_skipped",
-                        "method": "keep_text",
-                        "original_value": int(df_cleaned[col].nunique(dropna=True)),
-                        "modified_value": "kept as raw text",
-                    }
-                )
-                continue
-            unique_vals = df_cleaned[col].nunique(dropna=True)
-            if unique_vals <= 10:
-                dummies = pd.get_dummies(df_cleaned[col], prefix=col)
-                df_cleaned = pd.concat(
-                    [df_cleaned.drop(columns=col), dummies],
-                    axis=1,
-                )
-                transformation_log.append(
-                    {
-                        "column": col,
-                        "transformation": "encoding",
-                        "method": "one-hot",
-                        "original_value": unique_vals,
-                        "modified_value": f"{dummies.shape[1]} binary columns",
-                    }
-                )
-            else:
-                le = LabelEncoder()
-                df_cleaned[col] = le.fit_transform(df_cleaned[col].astype(str))
-                transformation_log.append(
-                    {
-                        "column": col,
-                        "transformation": "encoding",
-                        "method": "label_encoding",
-                        "original_value": int(unique_vals),
-                        "modified_value": f"integers from 0 to {unique_vals - 1}",
-                    }
-                )
+        # 3. Encode categorical features (train-fit schema for splits)
+        df_cleaned = _encode_categorical_features(
+            df_cleaned,
+            target_column,
+            state,
+            fitting,
+            transformation_log,
+        )
 
         # Infer task type (classification vs regression) if target exists
         task_type = "unknown"
@@ -539,8 +698,10 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
 
         if target_column is not None and target_column in df_cleaned.columns:
             y = df_cleaned[target_column]
-            # Keep target labels discrete (strings/ints). Do NOT scale/transform them.
-            if pd.api.types.is_object_dtype(y) or pd.api.types.is_categorical_dtype(y):
+            if fitting and (
+                pd.api.types.is_object_dtype(y)
+                or pd.api.types.is_categorical_dtype(y)
+            ):
                 transformation_log.append(
                     {
                         "column": target_column,
@@ -558,18 +719,18 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
             elif y_type == "continuous":
                 task_type = "regression"
             else:
-                # multilabel, continuous-multioutput, etc.
                 task_type = "other"
 
-        transformation_log.append(
-            {
-                "column": target_column if target_column else "unknown",
-                "transformation": "task_inference",
-                "method": "type_of_target",
-                "original_value": str(y_type),
-                "modified_value": task_type,
-            }
-        )
+        if fitting:
+            transformation_log.append(
+                {
+                    "column": target_column if target_column else "unknown",
+                    "transformation": "task_inference",
+                    "method": "type_of_target",
+                    "original_value": str(y_type),
+                    "modified_value": task_type,
+                }
+            )
 
         # 4. Handle skewed features (EXCLUDE target)
         numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns.tolist()
@@ -578,17 +739,21 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
             series = df_cleaned[col].dropna()
             if series.empty:
                 continue
-            col_skew = skew(df_cleaned[col].dropna())
-            if abs(col_skew) > 0.75:
+
+            if fitting:
+                col_skew = skew(series)
+                if abs(col_skew) <= 0.75:
+                    continue
                 original_skew = float(col_skew)
                 if (df_cleaned[col] > 0).all():
                     transformer = PowerTransformer(method="yeo-johnson")
                     df_cleaned[col] = transformer.fit_transform(df_cleaned[[col]])
                     method = "yeo-johnson"
                 else:
-                    scaler = StandardScaler()
-                    df_cleaned[col] = scaler.fit_transform(df_cleaned[[col]])
+                    transformer = StandardScaler()
+                    df_cleaned[col] = transformer.fit_transform(df_cleaned[[col]])
                     method = "standard_scaler"
+                state.skew_transformers[col] = (method, transformer)
                 new_skew = float(skew(df_cleaned[col].dropna()))
                 transformation_log.append(
                     {
@@ -599,16 +764,19 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
                         "modified_value": round(new_skew, 3),
                     }
                 )
+            elif col in state.skew_transformers:
+                method, transformer = state.skew_transformers[col]
+                df_cleaned[col] = transformer.transform(df_cleaned[[col]])
 
-        # 5. Classification-only: Oversampling (SMOTE) ONLY when compatible
-        if task_type == "classification" and target_column is not None:
+        # 5. Classification-only SMOTE — train split only
+        if fitting and task_type == "classification" and target_column is not None:
             X = df_cleaned.drop(columns=[target_column])
             y = df_cleaned[target_column]
 
-            # Only apply SMOTE for discrete class targets
             if type_of_target(y) in {"binary", "multiclass"}:
-                # SMOTE requires numeric features; skip if any non-numeric (e.g., raw text) exists.
-                non_numeric = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
+                non_numeric = [
+                    c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])
+                ]
                 if non_numeric:
                     transformation_log.append(
                         {
@@ -619,8 +787,6 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
                             "modified_value": f"Skipped (non-numeric features present: {non_numeric[:5]}{'...' if len(non_numeric) > 5 else ''})",
                         }
                     )
-                    # Do not attempt SMOTE on mixed/text data
-                    pass
                 else:
                     vc = y.value_counts()
                     n_classes = y.nunique()
@@ -638,13 +804,9 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
                         imbalance_ratio = vc.min() / vc.max() if vc.max() > 0 else 1.0
                         minority_count = int(vc.min())
 
-                        # Extra guard: SMOTE is fragile when rare classes are tiny
-                        # Require at least 6 samples in the smallest class for default-like behavior
                         if imbalance_ratio < 0.5 and minority_count >= 2:
-                            # dynamically choose k_neighbors so it is always valid
                             k_neighbors = min(5, minority_count - 1)
 
-                            # If the class is too tiny, skip SMOTE rather than creating unstable synthetic points
                             if k_neighbors < 1:
                                 transformation_log.append(
                                     {
@@ -657,7 +819,9 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
                                 )
                             else:
                                 try:
-                                    smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+                                    smote = SMOTE(
+                                        random_state=42, k_neighbors=k_neighbors
+                                    )
                                     X_resampled, y_resampled = smote.fit_resample(X, y)
 
                                     transformation_log.append(
@@ -674,8 +838,12 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
 
                                     df_cleaned = pd.concat(
                                         [
-                                            pd.DataFrame(X_resampled, columns=X.columns),
-                                            pd.Series(y_resampled, name=target_column),
+                                            pd.DataFrame(
+                                                X_resampled, columns=X.columns
+                                            ),
+                                            pd.Series(
+                                                y_resampled, name=target_column
+                                            ),
                                         ],
                                         axis=1,
                                     )
@@ -711,40 +879,46 @@ def preprocess_data(df: pd.DataFrame, eda_results: dict):
                     }
                 )
 
-        # 6. Data drift detection & mitigation (features only)
+        # 6. Drift mitigation — detect on train, apply same scaler on other splits
         for col in feature_numeric_cols:
+            if col not in df_cleaned.columns:
+                continue
             series = df_cleaned[col].dropna()
             if series.empty:
                 continue
 
-            # Guard against std=0
-            std = float(series.std())
-            if std == 0 or np.isnan(std):
-                continue
+            if fitting:
+                std = float(series.std())
+                if std == 0 or np.isnan(std):
+                    continue
 
-            reference = np.random.normal(
-                loc=float(series.mean()), scale=std, size=series.shape[0]
-            )
-            ks_stat, p_value = ks_2samp(series, reference)
+                reference = np.random.normal(
+                    loc=float(series.mean()), scale=std, size=series.shape[0]
+                )
+                _, p_value = ks_2samp(series, reference)
 
-            if p_value < 0.01:
-                original_mean = float(series.mean())
-                scaler = StandardScaler()
-                df_cleaned[col] = scaler.fit_transform(df_cleaned[[col]])
-                modified_mean = float(df_cleaned[col].mean())
-
-                transformation_log.append(
-                    {
-                        "column": col,
-                        "transformation": "drift_mitigation",
-                        "method": "standard_scaler",
-                        "original_value": round(original_mean, 3),
-                        "modified_value": round(modified_mean, 3),
-                    }
+                if p_value < 0.01:
+                    original_mean = float(series.mean())
+                    scaler = StandardScaler()
+                    df_cleaned[col] = scaler.fit_transform(df_cleaned[[col]])
+                    state.drift_scalers[col] = scaler
+                    modified_mean = float(df_cleaned[col].mean())
+                    transformation_log.append(
+                        {
+                            "column": col,
+                            "transformation": "drift_mitigation",
+                            "method": "standard_scaler",
+                            "original_value": round(original_mean, 3),
+                            "modified_value": round(modified_mean, 3),
+                        }
+                    )
+            elif col in state.drift_scalers:
+                df_cleaned[col] = state.drift_scalers[col].transform(
+                    df_cleaned[[col]]
                 )
     except Exception as e:
-        logger.warning(f"Failed to build bias report: {e}")
-    return df_cleaned, transformation_log
+        logger.warning(f"Mitigation preprocessing failed: {e}", exc_info=True)
+    return df_cleaned, transformation_log, state
 
 
 def upload_mitigated_dataset(user_id: str, original_dataset_id: str, original_version: str,
@@ -950,14 +1124,16 @@ async def run_consumer() -> None:
                     
                     try:
                         if has_split and df_train is not None and df_test is not None and df_drift is not None:
-                            # Mitigate each split separately, then upload as one folder (train/test/drift)
-                            log_train, log_test, log_drift = [], [], []
-                            df_t, log_train = preprocess_data(df_train, bias_report)
-                            df_train_transformed = df_t
-                            df_t, log_test = preprocess_data(df_test, bias_report)
-                            df_test_transformed = df_t
-                            df_t, log_drift = preprocess_data(df_drift, bias_report)
-                            df_drift_transformed = df_t
+                            # Fit mitigation on train; apply same schema/transforms to test/drift
+                            df_train_transformed, log_train, mit_state = preprocess_data(
+                                df_train, bias_report
+                            )
+                            df_test_transformed, log_test, _ = preprocess_data(
+                                df_test, bias_report, state=mit_state
+                            )
+                            df_drift_transformed, log_drift, _ = preprocess_data(
+                                df_drift, bias_report, state=mit_state
+                            )
                             transformation_log = log_train + log_test + log_drift
                             if transformation_log:
                                 logger.info(f"Applied {len(transformation_log)} transformations across train/test/drift")
@@ -974,7 +1150,9 @@ async def run_consumer() -> None:
                             else:
                                 mitigated_result = None
                         else:
-                            df_transformed, transformation_log = preprocess_data(df, bias_report)
+                            df_transformed, transformation_log, _ = preprocess_data(
+                                df, bias_report
+                            )
                             if transformation_log:
                                 logger.info(f"Applied {len(transformation_log)} transformations")
                                 logger.info("Uploading mitigated dataset...")
