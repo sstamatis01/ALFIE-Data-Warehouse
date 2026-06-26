@@ -4,11 +4,12 @@ from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, Query, 
 from fastapi import status
 from fastapi.responses import StreamingResponse
 from io import BytesIO
-from ..models.dataset import DatasetCreate, DatasetUpdate, DatasetResponse, DatasetMetadata, DatasetFile
+from ..models.dataset import DatasetCreate, DatasetUpdate, DatasetResponse, DatasetMetadata, DatasetFile, PublicDatasetLink
 from ..models.upload_job import UploadJobResponse
 from ..services.file_service import file_service
 from ..services.metadata_service import metadata_service
 from ..services.kafka_service import kafka_producer_service
+from ..utils.public_dataset_link import is_linked_public_copy, resolve_storage_path
 import logging
 import uuid
 import asyncio
@@ -18,6 +19,107 @@ import os
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
+
+# Public dataset catalog (summer school)
+PUBLIC_USER_ID = "public"
+
+
+def _to_dataset_response(dataset: DatasetMetadata) -> DatasetResponse:
+    return DatasetResponse(
+        dataset_id=dataset.dataset_id,
+        user_id=dataset.user_id,
+        name=dataset.name,
+        description=dataset.description,
+        version=dataset.version,
+        file_type=dataset.file_type,
+        file_size=dataset.file_size,
+        original_filename=dataset.original_filename,
+        files=dataset.files,
+        is_folder=dataset.is_folder,
+        columns=dataset.columns,
+        row_count=dataset.row_count,
+        data_types=dataset.data_types,
+        tags=dataset.tags,
+        custom_metadata=dataset.custom_metadata,
+        is_public=dataset.is_public,
+        public_source=dataset.public_source,
+        public_link=dataset.public_link,
+        created_at=dataset.created_at,
+        updated_at=dataset.updated_at,
+        file_hash=dataset.file_hash,
+    )
+
+
+def _rewrite_files_for_user_namespace(
+    files: Optional[List[DatasetFile]], *, src_prefix: str, dst_prefix: str
+) -> Optional[List[DatasetFile]]:
+    if not files:
+        return files
+    out: List[DatasetFile] = []
+    for f in files:
+        fp = f.file_path
+        if fp.startswith(src_prefix):
+            fp = dst_prefix + fp[len(src_prefix) :]
+        out.append(
+            DatasetFile(
+                filename=f.filename,
+                file_path=fp,
+                file_size=f.file_size,
+                file_type=f.file_type,
+                file_hash=f.file_hash,
+                content_type=f.content_type,
+            )
+        )
+    return out
+
+
+def _build_linked_user_file_metadata(
+    src: DatasetMetadata,
+    *,
+    user_id: str,
+    dataset_id: str,
+    version: str,
+    public_dataset_id: str,
+    public_version: str,
+) -> dict:
+    """Build storage metadata for a user import that references public MinIO objects."""
+    src_prefix = f"datasets/{src.user_id}/{src.dataset_id}/{src.version}/"
+    dst_prefix = f"datasets/{user_id}/{dataset_id}/{version}/"
+    tags = [t for t in (src.tags or []) if str(t).lower() != "public"]
+
+    if src.is_folder:
+        file_path = dst_prefix
+    else:
+        file_path = f"{dst_prefix}{src.original_filename}"
+
+    meta = src.dict()
+    meta.update(
+        {
+            "user_id": user_id,
+            "dataset_id": dataset_id,
+            "version": version,
+            "is_public": False,
+            "public_source": None,
+            "public_link": PublicDatasetLink(
+                dataset_id=public_dataset_id,
+                version=public_version,
+            ),
+            "file_path": file_path,
+            "files": _rewrite_files_for_user_namespace(
+                src.files,
+                src_prefix=src_prefix,
+                dst_prefix=dst_prefix,
+            ),
+            "tags": tags,
+        }
+    )
+    return meta
+
+
+def _parse_csv_list(val: str | None) -> list[str]:
+    if not val:
+        return []
+    return [t.strip() for t in val.split(",") if t.strip()]
 
 
 async def _update_upload_job(job_id: str, patch: dict) -> None:
@@ -412,6 +514,264 @@ async def upload_dataset(
         raise HTTPException(status_code=500, detail="Failed to upload dataset")
 
 
+@router.get("/public", response_model=List[DatasetResponse])
+async def list_public_datasets(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    q: Optional[str] = Query(None, description="Search query (dataset_id, name, description)"),
+    tags: Optional[str] = Query(None, description="Comma-separated required tags"),
+):
+    """List datasets in the public catalog."""
+    rows = await metadata_service.get_public_datasets(
+        skip=skip,
+        limit=limit,
+        query=q,
+        tags=_parse_csv_list(tags),
+    )
+    return [DatasetResponse(**r.dict()) for r in rows]
+
+
+@router.get("/public/{dataset_id}", response_model=DatasetResponse)
+async def get_public_dataset_latest(dataset_id: str):
+    """Get the latest version of a public dataset."""
+    row = await metadata_service.get_public_dataset_latest(dataset_id=dataset_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Public dataset not found")
+    return DatasetResponse(**row.dict())
+
+
+@router.get("/public/{dataset_id}/version/{version}", response_model=DatasetResponse)
+async def get_public_dataset_version(dataset_id: str, version: str):
+    """Get a specific version of a public dataset."""
+    row = await metadata_service.get_public_dataset_by_version(
+        dataset_id=dataset_id, version=version
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Public dataset version not found")
+    return DatasetResponse(**row.dict())
+
+
+@router.post("/public/upload", response_model=DatasetResponse)
+async def upload_public_dataset(
+    file: UploadFile = File(...),
+    dataset_id: Optional[str] = Form(None),
+    name: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    tags: Optional[str] = Form(None),
+    public_source: Optional[str] = Form(None),
+):
+    """
+    Upload a dataset into the public catalog.
+
+    Important: This does NOT emit `dataset-events` to Kafka. The pipeline should only start
+    after a user imports a public dataset into their own workspace.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    if not dataset_id:
+        dataset_id = str(uuid.uuid4())
+        logger.info(f"Generated new public dataset_id: {dataset_id}")
+
+    if not name:
+        name = f"public_dataset_{dataset_id[:8]}"
+
+    tag_list = _parse_csv_list(tags)
+    if "public" not in [t.lower() for t in tag_list]:
+        tag_list.append("public")
+
+    v1, v2 = await _get_next_dataset_versions(PUBLIC_USER_ID, dataset_id, count=2)
+    file_path, v1_metadata, v2_metadata = await file_service.upload_file(
+        file=file,
+        user_id=PUBLIC_USER_ID,
+        dataset_id=dataset_id,
+        version=v1,
+        version_split=v2,
+    )
+    v1_metadata["file_path"] = file_path
+
+    dataset_create_v1 = DatasetCreate(
+        dataset_id=dataset_id,
+        user_id=PUBLIC_USER_ID,
+        name=name,
+        description=description,
+        version=v1,
+        tags=tag_list,
+    )
+    v1_metadata = dict(v1_metadata)
+    v1_metadata["is_public"] = True
+    v1_metadata["public_source"] = public_source
+    dataset_metadata_v1 = await metadata_service.create_dataset_metadata(
+        dataset_data=dataset_create_v1,
+        file_metadata=v1_metadata,
+    )
+
+    dataset_metadata_v2 = None
+    if v2_metadata is not None:
+        dataset_create_v2 = DatasetCreate(
+            dataset_id=dataset_id,
+            user_id=PUBLIC_USER_ID,
+            name=name,
+            description=description,
+            version=v2,
+            tags=tag_list,
+        )
+        v2_metadata = dict(v2_metadata)
+        v2_metadata["is_public"] = True
+        v2_metadata["public_source"] = public_source
+        dataset_metadata_v2 = await metadata_service.create_dataset_metadata(
+            dataset_data=dataset_create_v2,
+            file_metadata=v2_metadata,
+        )
+
+    return (
+        DatasetResponse(**dataset_metadata_v2.dict())
+        if dataset_metadata_v2
+        else DatasetResponse(**dataset_metadata_v1.dict())
+    )
+
+
+@router.post("/public/{public_dataset_id}/import/{user_id}", response_model=DatasetResponse)
+async def import_public_dataset_to_user(
+    public_dataset_id: str,
+    user_id: str,
+    public_version: Optional[str] = Query(
+        None, description="Public dataset version to import (defaults to latest)"
+    ),
+    dataset_id: Optional[str] = Query(
+        None, description="Optional dataset_id to use in the user's workspace (defaults to public id, with collision handling)"
+    ),
+):
+    """
+    Import a public dataset into a user's dataset namespace.
+
+    Creates user-scoped metadata that references the public MinIO prefix (no data copy).
+    Emits `dataset-events` for the imported version (v2 when a split exists, else v1).
+    """
+    if public_version:
+        src = await metadata_service.get_public_dataset_by_version(
+            dataset_id=public_dataset_id, version=public_version
+        )
+    else:
+        src = await metadata_service.get_public_dataset_latest(dataset_id=public_dataset_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="Public dataset not found")
+
+    desired_id = dataset_id or public_dataset_id
+    existing = await metadata_service.get_dataset_by_id(desired_id, user_id)
+    if existing:
+        desired_id = f"{desired_id}_{uuid.uuid4().hex[:8]}"
+
+    dst_v1, dst_v2 = await _get_next_dataset_versions(user_id, desired_id, count=2)
+
+    src_versions = await metadata_service.get_dataset_versions(public_dataset_id, PUBLIC_USER_ID)
+    public_has_v2 = any(
+        (v.version == "v2" and (v.custom_metadata or {}).get("split"))
+        for v in src_versions
+        if getattr(v, "is_public", False)
+    )
+
+    src_v1 = await metadata_service.get_dataset_by_id_and_version(
+        public_dataset_id, PUBLIC_USER_ID, "v1"
+    )
+    if not src_v1 or not src_v1.is_public:
+        src_v1 = src
+
+    v1_meta = _build_linked_user_file_metadata(
+        src_v1,
+        user_id=user_id,
+        dataset_id=desired_id,
+        version=dst_v1,
+        public_dataset_id=public_dataset_id,
+        public_version=src_v1.version,
+    )
+    dataset_create_v1 = DatasetCreate(
+        dataset_id=desired_id,
+        user_id=user_id,
+        name=src_v1.name,
+        description=src_v1.description,
+        version=dst_v1,
+        tags=v1_meta.get("tags", []),
+        custom_metadata=v1_meta.get("custom_metadata", {}) or {},
+    )
+    v1_file_meta = {
+        k: v
+        for k, v in v1_meta.items()
+        if k
+        not in {
+            "id",
+            "_id",
+            "dataset_id",
+            "user_id",
+            "name",
+            "description",
+            "version",
+            "tags",
+            "custom_metadata",
+            "created_at",
+            "updated_at",
+        }
+    }
+    created_v1 = await metadata_service.create_dataset_metadata(
+        dataset_data=dataset_create_v1,
+        file_metadata=v1_file_meta,
+    )
+    result_metadata = created_v1
+
+    if public_has_v2:
+        src_v2 = await metadata_service.get_dataset_by_id_and_version(
+            public_dataset_id, PUBLIC_USER_ID, "v2"
+        )
+        if src_v2 and src_v2.is_public:
+            v2_meta = _build_linked_user_file_metadata(
+                src_v2,
+                user_id=user_id,
+                dataset_id=desired_id,
+                version=dst_v2,
+                public_dataset_id=public_dataset_id,
+                public_version=src_v2.version,
+            )
+            dataset_create_v2 = DatasetCreate(
+                dataset_id=desired_id,
+                user_id=user_id,
+                name=src_v2.name,
+                description=src_v2.description,
+                version=dst_v2,
+                tags=v2_meta.get("tags", []),
+                custom_metadata=v2_meta.get("custom_metadata", {}) or {},
+            )
+            v2_file_meta = {
+                k: v
+                for k, v in v2_meta.items()
+                if k
+                not in {
+                    "id",
+                    "_id",
+                    "dataset_id",
+                    "user_id",
+                    "name",
+                    "description",
+                    "version",
+                    "tags",
+                    "custom_metadata",
+                    "created_at",
+                    "updated_at",
+                }
+            }
+            created_v2 = await metadata_service.create_dataset_metadata(
+                dataset_data=dataset_create_v2,
+                file_metadata=v2_file_meta,
+            )
+            result_metadata = created_v2
+
+    try:
+        await kafka_producer_service.send_dataset_uploaded_event(result_metadata)
+    except Exception as kafka_error:
+        logger.warning(f"Failed to send Kafka event for imported public dataset: {kafka_error}")
+
+    return _to_dataset_response(result_metadata)
+
+
 @router.post(
     "/upload/folder/{user_id}",
     response_model=UploadJobResponse,
@@ -627,26 +987,7 @@ async def get_dataset(user_id: str, dataset_id: str):
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
     
-    return DatasetResponse(
-        dataset_id=dataset.dataset_id,
-        user_id=dataset.user_id,
-        name=dataset.name,
-        description=dataset.description,
-        version=dataset.version,
-        file_type=dataset.file_type,
-        file_size=dataset.file_size,
-        original_filename=dataset.original_filename,
-        files=dataset.files,
-        is_folder=dataset.is_folder,
-        columns=dataset.columns,
-        row_count=dataset.row_count,
-        data_types=dataset.data_types,
-        tags=dataset.tags,
-        custom_metadata=dataset.custom_metadata,
-        created_at=dataset.created_at,
-        updated_at=dataset.updated_at,
-        file_hash=dataset.file_hash
-    )
+    return _to_dataset_response(dataset)
 
 
 @router.get("/{user_id}", response_model=List[DatasetResponse])
@@ -658,29 +999,7 @@ async def get_user_datasets(
     """Get all datasets for a user with pagination"""
     datasets = await metadata_service.get_datasets_by_user(user_id, skip, limit)
     
-    return [
-        DatasetResponse(
-            dataset_id=dataset.dataset_id,
-            user_id=dataset.user_id,
-            name=dataset.name,
-            description=dataset.description,
-            version=dataset.version,
-            file_type=dataset.file_type,
-            file_size=dataset.file_size,
-            original_filename=dataset.original_filename,
-            files=dataset.files,
-            is_folder=dataset.is_folder,
-            columns=dataset.columns,
-            row_count=dataset.row_count,
-            data_types=dataset.data_types,
-            tags=dataset.tags,
-            custom_metadata=dataset.custom_metadata,
-            created_at=dataset.created_at,
-            updated_at=dataset.updated_at,
-            file_hash=dataset.file_hash
-        )
-        for dataset in datasets
-    ]
+    return [_to_dataset_response(dataset) for dataset in datasets]
 
 
 @router.put("/{user_id}/{dataset_id}", response_model=DatasetResponse)
@@ -697,26 +1016,7 @@ async def update_dataset(
     if not updated_dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
     
-    return DatasetResponse(
-        dataset_id=updated_dataset.dataset_id,
-        user_id=updated_dataset.user_id,
-        name=updated_dataset.name,
-        description=updated_dataset.description,
-        version=updated_dataset.version,
-        file_type=updated_dataset.file_type,
-        file_size=updated_dataset.file_size,
-        original_filename=updated_dataset.original_filename,
-        files=updated_dataset.files,
-        is_folder=updated_dataset.is_folder,
-        columns=updated_dataset.columns,
-        row_count=updated_dataset.row_count,
-        data_types=updated_dataset.data_types,
-        tags=updated_dataset.tags,
-        custom_metadata=updated_dataset.custom_metadata,
-        created_at=updated_dataset.created_at,
-        updated_at=updated_dataset.updated_at,
-        file_hash=updated_dataset.file_hash
-    )
+    return _to_dataset_response(updated_dataset)
 
 
 @router.delete("/{user_id}/{dataset_id}")
@@ -727,18 +1027,23 @@ async def delete_dataset(user_id: str, dataset_id: str):
     if not datasets:
         raise HTTPException(status_code=404, detail="Dataset not found")
     
-    # Delete all files from MinIO
+    # Delete owned MinIO objects only (linked public imports have no user copy).
     files_deleted = 0
     files_failed = 0
     for dataset in datasets:
+        if is_linked_public_copy(dataset):
+            logger.info(
+                "Skipping MinIO delete for linked public import %s version %s",
+                dataset.dataset_id,
+                dataset.version,
+            )
+            continue
         try:
             if dataset.is_folder:
-                # Delete all files in folder
                 deleted_count = await file_service.delete_folder_files(dataset.file_path)
                 files_deleted += deleted_count
                 logger.info(f"Deleted {deleted_count} files from folder: {dataset.file_path}")
             else:
-                # Delete single file
                 if await file_service.delete_file(dataset.file_path):
                     files_deleted += 1
                 else:
@@ -787,7 +1092,9 @@ async def download_dataset(
             target_file = next((f for f in dataset_files if f.filename == filename), None)
             if not target_file:
                 raise HTTPException(status_code=404, detail=f"File '{filename}' not found in dataset")
-            file_data = await file_service.download_file(target_file.file_path)
+            file_data = await file_service.download_file(
+                resolve_storage_path(dataset, target_file.file_path)
+            )
             return StreamingResponse(
                 BytesIO(file_data),
                 media_type='application/octet-stream',
@@ -797,7 +1104,7 @@ async def download_dataset(
         if split and split in ("train", "test", "drift") and (dataset.custom_metadata or {}).get("split"):
             subfolder = split
         file_data, download_name, media_type = await file_service.download_folder_subset(
-            dataset.file_path,
+            resolve_storage_path(dataset, dataset.file_path),
             subfolder_prefix=subfolder,
             archive_basename=f"{dataset_id}_{dataset.version}",
         )
@@ -806,7 +1113,9 @@ async def download_dataset(
             media_type=media_type,
             headers={"Content-Disposition": f"attachment; filename={download_name}"},
         )
-    file_data = await file_service.download_file(dataset.file_path)
+    file_data = await file_service.download_file(
+        resolve_storage_path(dataset, dataset.file_path)
+    )
     return StreamingResponse(
         BytesIO(file_data),
         media_type='application/octet-stream',
@@ -837,7 +1146,9 @@ async def download_dataset_by_version(
             target_file = next((f for f in dataset_files if f.filename == filename), None)
             if not target_file:
                 raise HTTPException(status_code=404, detail=f"File '{filename}' not found in dataset")
-            file_data = await file_service.download_file(target_file.file_path)
+            file_data = await file_service.download_file(
+                resolve_storage_path(dataset, target_file.file_path)
+            )
             return StreamingResponse(
                 BytesIO(file_data),
                 media_type='application/octet-stream',
@@ -847,7 +1158,7 @@ async def download_dataset_by_version(
         if split and split in ("train", "test", "drift") and (dataset.custom_metadata or {}).get("split"):
             subfolder = split
         file_data, download_name, media_type = await file_service.download_folder_subset(
-            dataset.file_path,
+            resolve_storage_path(dataset, dataset.file_path),
             subfolder_prefix=subfolder,
             archive_basename=f"{dataset_id}_{version}",
         )
@@ -856,7 +1167,9 @@ async def download_dataset_by_version(
             media_type=media_type,
             headers={"Content-Disposition": f"attachment; filename={download_name}"},
         )
-    file_data = await file_service.download_file(dataset.file_path)
+    file_data = await file_service.download_file(
+        resolve_storage_path(dataset, dataset.file_path)
+    )
     return StreamingResponse(
         BytesIO(file_data),
         media_type='application/octet-stream',
@@ -914,29 +1227,7 @@ async def get_dataset_versions(user_id: str, dataset_id: str):
     """Get all versions of a dataset"""
     datasets = await metadata_service.get_dataset_versions(dataset_id, user_id)
     
-    return [
-        DatasetResponse(
-            dataset_id=dataset.dataset_id,
-            user_id=dataset.user_id,
-            name=dataset.name,
-            description=dataset.description,
-            version=dataset.version,
-            file_type=dataset.file_type,
-            file_size=dataset.file_size,
-            original_filename=dataset.original_filename,
-            files=dataset.files,
-            is_folder=dataset.is_folder,
-            columns=dataset.columns,
-            row_count=dataset.row_count,
-            data_types=dataset.data_types,
-            tags=dataset.tags,
-            custom_metadata=dataset.custom_metadata,
-            created_at=dataset.created_at,
-            updated_at=dataset.updated_at,
-            file_hash=dataset.file_hash
-        )
-        for dataset in datasets
-    ]
+    return [_to_dataset_response(dataset) for dataset in datasets]
 
 
 @router.get("/{user_id}/{dataset_id}/version/{version}", response_model=DatasetResponse)
@@ -945,26 +1236,7 @@ async def get_dataset_by_version(user_id: str, dataset_id: str, version: str):
     dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    return DatasetResponse(
-        dataset_id=dataset.dataset_id,
-        user_id=dataset.user_id,
-        name=dataset.name,
-        description=dataset.description,
-        version=dataset.version,
-        file_type=dataset.file_type,
-        file_size=dataset.file_size,
-        original_filename=dataset.original_filename,
-        files=dataset.files,
-        is_folder=dataset.is_folder,
-        columns=dataset.columns,
-        row_count=dataset.row_count,
-        data_types=dataset.data_types,
-        tags=dataset.tags,
-        custom_metadata=dataset.custom_metadata,
-        created_at=dataset.created_at,
-        updated_at=dataset.updated_at,
-        file_hash=dataset.file_hash
-    )
+    return _to_dataset_response(dataset)
 
 
 @router.delete("/{user_id}/{dataset_id}/version/{version}")
@@ -976,12 +1248,19 @@ async def delete_dataset_by_version(user_id: str, dataset_id: str, version: str)
     
     # Handle folder vs single file deletion
     files_deleted = 0
-    if dataset.is_folder:
-        files_deleted = await file_service.delete_folder_files(dataset.file_path)
-        logger.info(f"Deleted {files_deleted} files from folder: {dataset.file_path}")
+    if not is_linked_public_copy(dataset):
+        if dataset.is_folder:
+            files_deleted = await file_service.delete_folder_files(dataset.file_path)
+            logger.info(f"Deleted {files_deleted} files from folder: {dataset.file_path}")
+        else:
+            file_deleted = await file_service.delete_file(dataset.file_path)
+            files_deleted = 1 if file_deleted else 0
     else:
-        file_deleted = await file_service.delete_file(dataset.file_path)
-        files_deleted = 1 if file_deleted else 0
+        logger.info(
+            "Skipping MinIO delete for linked public import %s version %s",
+            dataset.dataset_id,
+            dataset.version,
+        )
     
     metadata_deleted = await metadata_service.delete_dataset_by_version(dataset_id, user_id, version)
     if not metadata_deleted:

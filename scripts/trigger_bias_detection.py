@@ -4,24 +4,29 @@ Manually publish a bias-detection trigger to Kafka (replaces Agentic Core for lo
 
 Prerequisites:
   - AutoDW stack running (api + bias-detector + kafka), e.g. autodw/docker-compose.yaml
-  - Dataset already uploaded via POST /datasets/upload/{user_id}
+  - Dataset available under the user's namespace (upload or public import)
   - bias-detector container consuming bias-detection-trigger-events
 
-Usage (from repo root, with venv or inside a container that has aiokafka):
+Public-import flow (linked storage, no MinIO copy for v1/v2):
+  1. GET /datasets/public  →  user picks a dataset
+  2. POST /datasets/public/{id}/import/{user_id}  →  metadata + public_link (v1/v2)
+  3. This script triggers bias on v2 (split). Downloads resolve public_link via API.
+  4. Bias mitigation uploads v3 into datasets/{user_id}/... (real user-owned storage).
 
-  python scripts/trigger_bias_detection.py \\
-    --user-id 555889966 \\
-    --dataset-id 1 \\
-    --dataset-version v2 \\
-    --target-column human_label \\
-    --task-type classification
+Example — german_credit imported for user 99:
+
+  docker run --rm --network autodw_autodw-network \\
+    -v "%CD%:/work" -w /work \\
+    -e KAFKA_BOOTSTRAP_SERVERS=kafka:29092 -e API_BASE=http://api:8000 \\
+    gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:1.0.3 \\
+    python scripts/trigger_bias_detection.py --preset german_credit --user-id 99 --wait
 
 Watch bias-detector logs:
   docker logs -f autodw-bias-detector
 
 Verify after run:
   GET http://localhost:8000/bias-reports/{user_id}/{dataset_id}
-  Kafka topic bias-detection-complete-events (if task_id was set)
+  GET http://localhost:8000/datasets/{user_id}/{dataset_id}/versions
 """
 
 from __future__ import annotations
@@ -32,8 +37,10 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import requests
 
@@ -44,23 +51,71 @@ DEFAULT_KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 DEFAULT_TOPIC = os.getenv("KAFKA_BIAS_TRIGGER_TOPIC", "bias-detection-trigger-events")
 DEFAULT_API = os.getenv("API_BASE", "http://localhost:8000")
 
+# Summer-school catalog defaults (see summer_school_prepared/catalog_manifest.json)
+SUMMER_SCHOOL_PRESETS: dict[str, dict[str, str]] = {
+    "german_credit": {
+        "dataset_id": "german_credit",
+        "dataset_version": "v2",
+        "target_column": "credit_risk",
+        "task_type": "classification",
+    },
+    "compas_recidivism": {
+        "dataset_id": "compas_recidivism",
+        "dataset_version": "v2",
+        "target_column": "two_year_recid",
+        "task_type": "classification",
+    },
+    "adult_census_income": {
+        "dataset_id": "adult_census_income",
+        "dataset_version": "v2",
+        "target_column": "income",
+        "task_type": "classification",
+    },
+    "taiwan_credit_default": {
+        "dataset_id": "taiwan_credit_default",
+        "dataset_version": "v2",
+        "target_column": "default_next_month",
+        "task_type": "classification",
+    },
+    "communities_crime": {
+        "dataset_id": "communities_crime",
+        "dataset_version": "v2",
+        "target_column": "ViolentCrimesPerPop",
+        "task_type": "regression",
+    },
+}
 
-def _preflight_dataset(api_base: str, user_id: str, dataset_id: str, version: str | None) -> dict:
+
+def _dataset_url(api_base: str, user_id: str, dataset_id: str, version: str | None) -> str:
+    base = api_base.rstrip("/")
     if version:
-        url = f"{api_base.rstrip('/')}/datasets/{user_id}/{dataset_id}/version/{version}"
-    else:
-        url = f"{api_base.rstrip('/')}/datasets/{user_id}/{dataset_id}"
+        return f"{base}/datasets/{user_id}/{dataset_id}/version/{version}"
+    return f"{base}/datasets/{user_id}/{dataset_id}"
+
+
+def preflight_dataset(api_base: str, user_id: str, dataset_id: str, version: str | None) -> dict:
+    url = _dataset_url(api_base, user_id, dataset_id, version)
     logger.info("Checking dataset metadata: %s", url)
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     meta = r.json()
+    link = meta.get("public_link")
+    split = (meta.get("custom_metadata") or {}).get("split")
     logger.info(
-        "Dataset OK: version=%s is_folder=%s split=%s columns=%s",
+        "Dataset OK: version=%s is_folder=%s split=%s target_cols_hint=%s",
         meta.get("version"),
         meta.get("is_folder"),
-        (meta.get("custom_metadata") or {}).get("split"),
-        meta.get("columns"),
+        split,
+        meta.get("columns", [])[-3:] if meta.get("columns") else None,
     )
+    if link:
+        logger.info(
+            "Public link: reads from datasets/public/%s/%s/ (no user MinIO folder until bias uploads v3)",
+            link.get("dataset_id"),
+            link.get("version"),
+        )
+    else:
+        logger.info("Owned dataset (storage under datasets/%s/%s/)", user_id, dataset_id)
     return meta
 
 
@@ -112,16 +167,97 @@ async def publish_trigger(
         await producer.stop()
 
 
+def wait_for_bias_pipeline(
+    api_base: str,
+    user_id: str,
+    dataset_id: str,
+    *,
+    timeout_s: int = 300,
+    poll_s: float = 3.0,
+) -> dict[str, Any]:
+    """Poll bias report and dataset versions until v3 appears or timeout."""
+    base = api_base.rstrip("/")
+    report_url = f"{base}/bias-reports/{user_id}/{dataset_id}"
+    versions_url = f"{base}/datasets/{user_id}/{dataset_id}/versions"
+    deadline = time.time() + timeout_s
+    last_versions: list[str] = []
+
+    logger.info("Waiting up to %ss for bias report + mitigated v3...", timeout_s)
+    while time.time() < deadline:
+        try:
+            vr = requests.get(versions_url, timeout=30)
+            if vr.ok:
+                versions = [v.get("version") for v in vr.json()]
+                if versions != last_versions:
+                    logger.info("Dataset versions: %s", versions)
+                    last_versions = versions
+                mitigated = [v for v in vr.json() if "mitigated" in [t.lower() for t in (v.get("tags") or [])]]
+                if mitigated:
+                    v3 = mitigated[0]
+                    logger.info(
+                        "Mitigated version found: %s (public_link=%s)",
+                        v3.get("version"),
+                        v3.get("public_link"),
+                    )
+        except requests.RequestException as e:
+            logger.debug("versions poll: %s", e)
+
+        try:
+            br = requests.get(report_url, timeout=30)
+            if br.status_code == 200:
+                report = br.json()
+                logger.info(
+                    "Bias report ready (id=%s, dataset_version=%s)",
+                    report.get("id"),
+                    report.get("dataset_version"),
+                )
+                if "v3" in last_versions or any(
+                    "mitigated" in [t.lower() for t in (v.get("tags") or [])]
+                    for v in (vr.json() if vr.ok else [])
+                ):
+                    return {"report": report, "versions": last_versions}
+        except requests.RequestException:
+            pass
+
+        time.sleep(poll_s)
+
+    raise TimeoutError(
+        f"Timed out after {timeout_s}s. Check: docker logs autodw-bias-detector; GET {report_url}"
+    )
+
+
+def apply_preset(args: argparse.Namespace) -> None:
+    if not args.preset:
+        return
+    preset = SUMMER_SCHOOL_PRESETS.get(args.preset)
+    if not preset:
+        known = ", ".join(sorted(SUMMER_SCHOOL_PRESETS))
+        raise SystemExit(f"Unknown preset {args.preset!r}. Known: {known}")
+    if not args.dataset_id:
+        args.dataset_id = preset["dataset_id"]
+    if args.dataset_version == "v2" and preset.get("dataset_version"):
+        args.dataset_version = preset["dataset_version"]
+    if not args.target_column:
+        args.target_column = preset["target_column"]
+    if args.task_type == "classification" and preset.get("task_type"):
+        args.task_type = preset["task_type"]
+
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Publish bias-detection-trigger-events to Kafka")
-    p.add_argument("--user-id", required=True, help="Dataset owner user_id")
-    p.add_argument("--dataset-id", required=True, help="Dataset id")
+    p = argparse.ArgumentParser(
+        description="Publish bias-detection-trigger-events to Kafka",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Presets: " + ", ".join(sorted(SUMMER_SCHOOL_PRESETS.keys())),
+    )
+    p.add_argument("--preset", choices=sorted(SUMMER_SCHOOL_PRESETS.keys()), help="Summer-school catalog defaults")
+    p.add_argument("--user-id", required=True, help="Dataset owner user_id (after public import)")
+    p.add_argument("--dataset-id", default=None, help="Dataset id (default from --preset)")
     p.add_argument(
         "--dataset-version",
         default="v2",
-        help="Version to analyze (default v2 — split datasets use v2 after upload)",
+        help="Version to analyze (default v2 — split datasets / public import pipeline)",
     )
-    p.add_argument("--target-column", required=True, help="Label/target column for mitigation & downstream ML")
+    p.add_argument("--target-column", default=None, help="Label/target column (default from --preset)")
     p.add_argument(
         "--task-type",
         default="classification",
@@ -133,14 +269,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--topic", default=DEFAULT_TOPIC, help=f"Trigger topic (default {DEFAULT_TOPIC})")
     p.add_argument("--api-base", default=DEFAULT_API, help=f"AutoDW API for preflight (default {DEFAULT_API})")
     p.add_argument("--skip-preflight", action="store_true", help="Skip GET dataset metadata check")
+    p.add_argument(
+        "--wait",
+        action="store_true",
+        help="After trigger, poll API until bias report (+ mitigated v3 if applicable)",
+    )
+    p.add_argument("--wait-timeout", type=int, default=300, help="Seconds for --wait (default 300)")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
+        apply_preset(args)
+    except SystemExit as e:
+        logger.error("%s", e)
+        return 2
+
+    if not args.dataset_id:
+        logger.error("--dataset-id is required (or use --preset)")
+        return 2
+    if not args.target_column:
+        logger.error("--target-column is required (or use --preset)")
+        return 2
+
+    try:
         if not args.skip_preflight:
-            _preflight_dataset(args.api_base, args.user_id, args.dataset_id, args.dataset_version)
+            preflight_dataset(args.api_base, args.user_id, args.dataset_id, args.dataset_version)
     except requests.RequestException as e:
         logger.error("Preflight failed (is API up at %s?): %s", args.api_base, e)
         return 1
@@ -170,11 +325,31 @@ def main() -> int:
         "Next checks:\n"
         "  - docker logs -f autodw-bias-detector\n"
         "  - curl %s/bias-reports/%s/%s\n"
-        "  - If mitigated: note new version in logs / GET dataset versions",
+        "  - curl %s/datasets/%s/%s/versions",
+        args.api_base,
+        args.user_id,
+        args.dataset_id,
         args.api_base,
         args.user_id,
         args.dataset_id,
     )
+
+    if args.wait:
+        try:
+            wait_for_bias_pipeline(
+                args.api_base,
+                args.user_id,
+                args.dataset_id,
+                timeout_s=args.wait_timeout,
+            )
+            logger.info("Bias pipeline step completed.")
+        except TimeoutError as e:
+            logger.error("%s", e)
+            return 1
+        except requests.RequestException as e:
+            logger.error("Wait/verify failed: %s", e)
+            return 1
+
     return 0
 
 

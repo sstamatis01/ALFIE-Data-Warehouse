@@ -138,6 +138,78 @@ class MetadataService:
             logger.error(f"Error retrieving datasets for user {user_id}: {e}")
             raise HTTPException(status_code=500, detail="Failed to retrieve datasets")
 
+    async def get_public_datasets(
+        self,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+        query: str | None = None,
+        tags: list[str] | None = None,
+    ) -> List[DatasetMetadata]:
+        """List datasets that are part of the public catalog."""
+        try:
+            q: Dict[str, Any] = {"is_public": True}
+            if query:
+                # lightweight search over id + name + description
+                q["$or"] = [
+                    {"dataset_id": {"$regex": query, "$options": "i"}},
+                    {"name": {"$regex": query, "$options": "i"}},
+                    {"description": {"$regex": query, "$options": "i"}},
+                ]
+            if tags:
+                q["tags"] = {"$all": tags}
+
+            cursor = (
+                self.db.datasets.find(q)
+                .sort("updated_at", -1)
+                .skip(skip)
+                .limit(limit)
+            )
+            rows = await cursor.to_list(length=limit)
+            return [DatasetMetadata(**r) for r in rows]
+        except Exception as e:
+            logger.error(f"Error retrieving public datasets: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to retrieve public datasets")
+
+    async def get_public_dataset_latest(
+        self,
+        *,
+        dataset_id: str,
+    ) -> Optional[DatasetMetadata]:
+        """Get latest version of a public dataset by dataset_id."""
+        try:
+            cursor = (
+                self.db.datasets.find({"dataset_id": dataset_id, "is_public": True})
+                .sort("created_at", -1)
+                .limit(1)
+            )
+            rows = await cursor.to_list(length=1)
+            if rows:
+                return DatasetMetadata(**rows[0])
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving public dataset {dataset_id}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to retrieve public dataset")
+
+    async def get_public_dataset_by_version(
+        self,
+        *,
+        dataset_id: str,
+        version: str,
+    ) -> Optional[DatasetMetadata]:
+        """Get a specific version of a public dataset."""
+        try:
+            row = await self.db.datasets.find_one(
+                {"dataset_id": dataset_id, "version": version, "is_public": True}
+            )
+            return DatasetMetadata(**row) if row else None
+        except Exception as e:
+            logger.error(
+                f"Error retrieving public dataset {dataset_id} version {version}: {e}",
+                exc_info=True,
+            )
+            raise HTTPException(status_code=500, detail="Failed to retrieve public dataset")
+
     async def update_dataset_metadata(
         self, 
         dataset_id: str, 
@@ -146,6 +218,9 @@ class MetadataService:
     ) -> Optional[DatasetMetadata]:
         """Update dataset metadata for all versions of the dataset"""
         try:
+            if await self.dataset_has_public_link(dataset_id, user_id):
+                raise HTTPException(status_code=403, detail="Cannot modify a dataset imported from the public catalog")
+
             update_dict = {k: v for k, v in update_data.dict().items() if v is not None}
             update_dict['updated_at'] = datetime.now(tz=timezone.utc)
             
@@ -163,9 +238,27 @@ class MetadataService:
             
             return updated_dataset
             
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error updating dataset {dataset_id}: {e}")
             raise HTTPException(status_code=500, detail="Failed to update dataset")
+
+    async def dataset_has_public_link(self, dataset_id: str, user_id: str) -> bool:
+        """True if any version of this user dataset references the public catalog."""
+        try:
+            row = await self.db.datasets.find_one(
+                {
+                    "dataset_id": dataset_id,
+                    "user_id": user_id,
+                    "public_link": {"$exists": True, "$ne": None},
+                },
+                projection={"_id": 1},
+            )
+            return row is not None
+        except Exception as e:
+            logger.error(f"Error checking public link for dataset {dataset_id}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to check dataset link status")
 
     async def delete_dataset_metadata(self, dataset_id: str, user_id: str) -> bool:
         """Delete dataset metadata"""

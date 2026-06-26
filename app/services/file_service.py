@@ -44,6 +44,59 @@ class FileService:
         """Generate path with train/test/drift subfolder. Format: datasets/user1/dataset_id/v1/train/filename.csv"""
         return f"datasets/{user_id}/{dataset_id}/{version}/{subfolder}/{filename}"
 
+    async def copy_prefix(
+        self,
+        *,
+        src_prefix: str,
+        dst_prefix: str,
+    ) -> int:
+        """
+        Copy all objects under `src_prefix` to `dst_prefix` within the same bucket.
+        Returns number of objects copied.
+
+        Note: Implemented as a stream read + put (portable across S3 backends).
+        """
+        if not self.client:
+            await self.initialize()
+
+        # Normalize prefixes to ensure trailing slash semantics.
+        src_prefix_n = src_prefix if src_prefix.endswith("/") else (src_prefix + "/")
+        dst_prefix_n = dst_prefix if dst_prefix.endswith("/") else (dst_prefix + "/")
+
+        def _copy_sync() -> int:
+            copied = 0
+            objects = self.client.list_objects(
+                self.bucket_name, prefix=src_prefix_n, recursive=True
+            )
+            for obj in objects:
+                src_name = obj.object_name
+                rel = src_name[len(src_prefix_n) :]
+                dst_name = dst_prefix_n + rel
+
+                stat = self.client.stat_object(self.bucket_name, src_name)
+                resp = None
+                try:
+                    resp = self.client.get_object(self.bucket_name, src_name)
+                    self.client.put_object(
+                        bucket_name=self.bucket_name,
+                        object_name=dst_name,
+                        data=resp,
+                        length=stat.size,
+                        content_type=getattr(stat, "content_type", None)
+                        or "application/octet-stream",
+                    )
+                    copied += 1
+                finally:
+                    try:
+                        if resp is not None:
+                            resp.close()
+                            resp.release_conn()
+                    except Exception:
+                        pass
+            return copied
+
+        return await anyio.to_thread.run_sync(_copy_sync)
+
     @staticmethod
     def _should_split_dataset(num_samples: int, num_features: int) -> bool:
         """True if dataset is large enough to split: num_samples > (num_features + 1) * 10"""

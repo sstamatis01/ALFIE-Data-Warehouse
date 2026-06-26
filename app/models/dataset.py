@@ -20,6 +20,13 @@ PyObjectId = Annotated[
 ]
 
 
+class PublicDatasetLink(BaseModel):
+    """Reference to a public catalog dataset version (imported copy; storage is not duplicated)."""
+
+    dataset_id: str = Field(..., description="Source public dataset id")
+    version: str = Field(..., description="Source public dataset version")
+
+
 class DatasetFile(BaseModel):
     """Represents a single file within a dataset folder"""
     filename: str = Field(..., description="Original filename")
@@ -56,7 +63,18 @@ class DatasetMetadata(BaseModel):
     # Additional metadata
     tags: List[str] = Field(default_factory=list, description="Tags for categorization")
     custom_metadata: Dict[str, Any] = Field(default_factory=dict, description="Custom metadata fields")
-    
+
+    # Public catalog support (summer school datasets)
+    is_public: bool = Field(default=False, description="Whether this dataset is part of the public catalog")
+    public_source: Optional[str] = Field(
+        default=None,
+        description="Optional provenance string for public datasets (e.g. Kaggle/UCI/url/license)",
+    )
+    public_link: Optional[PublicDatasetLink] = Field(
+        default=None,
+        description="When set, this user dataset reads storage from the referenced public catalog version",
+    )
+
     # Timestamps
     created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
@@ -102,6 +120,9 @@ class DatasetResponse(BaseModel):
     data_types: Optional[Dict[str, str]]
     tags: List[str]
     custom_metadata: Dict[str, Any]
+    is_public: bool = False
+    public_source: Optional[str] = None
+    public_link: Optional[PublicDatasetLink] = None
     created_at: datetime
     updated_at: datetime
     file_hash: Optional[str]
