@@ -28,6 +28,7 @@ import re
 import asyncio
 import json
 import logging
+import random
 from datetime import datetime, timezone
 from io import StringIO
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -82,6 +83,10 @@ if VISION_AUTOML_HOST == "localhost" and os.getenv("KAFKA_BOOTSTRAP_SERVERS", ""
 
 # Large dataset downloads from DW (ZIP) can take many minutes; default 2h, override with env.
 DW_DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("AUTOML_DW_DOWNLOAD_TIMEOUT_SECONDS", str(2 * 60 * 60)))
+
+AUTOML_429_MAX_WAIT_SECONDS = int(os.getenv("AUTOML_429_MAX_WAIT_SECONDS", "900"))  # 15 min
+AUTOML_429_BASE_SLEEP_SECONDS = float(os.getenv("AUTOML_429_BASE_SLEEP_SECONDS", "5"))
+AUTOML_429_MAX_SLEEP_SECONDS = float(os.getenv("AUTOML_429_MAX_SLEEP_SECONDS", "60"))
 
 
 def compute_request_timeouts(time_budget_seconds: int) -> tuple[float, float]:
@@ -196,6 +201,78 @@ async def send_automl_failure_to_kafka(
         logger.info(f"Sent AutoML failure event to {KAFKA_AUTOML_COMPLETE_TOPIC}: {error_message[:200]}")
     except Exception as e:
         logger.error(f"Failed to send AutoML failure event to Kafka: {e}", exc_info=True)
+
+
+def claim_task_id(task_id: str, *, user_id: str, dataset_id: str, dataset_version: str | None) -> bool:
+    """
+    Idempotency guard: claim a task_id in the DW so only one consumer replica runs it.
+    Returns True when claimed; False when already claimed by another worker.
+    """
+    if not task_id:
+        return True
+    url = f"{API_BASE}/jobs/automl/claim"
+    payload = {
+        "task_id": task_id,
+        "user_id": user_id,
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 409:
+            logger.info("Task already claimed (skipping): task_id=%s user=%s dataset=%s", task_id, user_id, dataset_id)
+            return False
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        # Fail-open: if claim endpoint is unavailable, we still proceed (keeps backward compatibility),
+        # but duplicates may occur. Log loudly.
+        logger.warning("Could not claim task_id=%s (proceeding anyway): %s", task_id, e)
+        return True
+
+
+async def _post_with_429_retry(url: str, *, data: dict, headers: dict | None) -> requests.Response:
+    """
+    POST with bounded retries on 429 (busy worker).
+    We intentionally do NOT treat 429 as terminal failure; we retry for a short window so
+    parallel requests queue instead of generating immediate automl-complete failures.
+    """
+    started = __import__("time").time()
+    attempt = 0
+    last_exc: Exception | None = None
+    while True:
+        attempt += 1
+        try:
+            connect_timeout, read_timeout = compute_request_timeouts(int(data.get("time_budget") or 0))
+            r = requests.post(url, data=data, headers=headers, timeout=(connect_timeout, read_timeout))
+            if r.status_code != 429:
+                r.raise_for_status()
+                return r
+
+            elapsed = __import__("time").time() - started
+            if elapsed >= AUTOML_429_MAX_WAIT_SECONDS:
+                raise requests.HTTPError(f"429 after waiting {int(elapsed)}s", response=r)
+
+            # Exponential backoff + jitter
+            sleep_s = min(AUTOML_429_MAX_SLEEP_SECONDS, AUTOML_429_BASE_SLEEP_SECONDS * (2 ** min(attempt - 1, 6)))
+            sleep_s = sleep_s * (0.8 + 0.4 * random.random())
+            detail = ""
+            try:
+                detail = r.text[:200]
+            except Exception:
+                pass
+            logger.warning(
+                "AutoML service busy (429). Retrying in %.1fs (attempt=%d elapsed=%ds). %s",
+                sleep_s,
+                attempt,
+                int(elapsed),
+                detail,
+            )
+            await asyncio.sleep(sleep_s)
+            continue
+        except Exception as e:
+            last_exc = e
+            raise
 
 
 def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -> dict:
@@ -597,6 +674,10 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                 )
             return
 
+        # Idempotency claim across replicas (skip if another worker already took it).
+        if not claim_task_id(task_id, user_id=user_id, dataset_id=dataset_id, dataset_version=dataset_version):
+            return
+
         if task_category == "tabular" and (not target_column or not task_type):
             logger.warning("Tabular task requires target_column_name and task_type in event; skipping")
             if producer and task_id:
@@ -733,13 +814,11 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                     f"Setting request timeout to connect={connect_timeout}s, read={read_timeout}s "
                     f"(time_budget={time_budget_seconds}s + overhead)"
                 )
-                r = requests.post(
+                r = await _post_with_429_retry(
                     AUTOML_TABULAR_BEST_MODEL_URL,
                     data=data,
                     headers=headers,
-                    timeout=(connect_timeout, read_timeout),
                 )
-                r.raise_for_status()
             except requests.exceptions.ConnectionError as e:
                 logger.error(f"Failed to connect to AutoML Tabular at {AUTOML_TABULAR_BEST_MODEL_URL}")
                 logger.error(f"   Error: {e}")
