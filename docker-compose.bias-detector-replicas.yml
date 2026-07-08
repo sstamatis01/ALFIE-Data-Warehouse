@@ -1,0 +1,42 @@
+services:
+  # Run multiple Bias Detector consumer replicas in the SAME consumer group.
+  # Separate services are used because base compose sets `container_name` which prevents scaling.
+
+  bias-detector-1:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_BIAS_TRIGGER_TOPIC: bias-detection-trigger-events
+      KAFKA_BIAS_TRIGGER_CONSUMER_GROUP: bias-trigger-consumer
+      KAFKA_BIAS_TOPIC: bias-detection-complete-events
+      API_BASE: http://api:8000
+      # allow large downloads in busy server
+      BIAS_DW_DOWNLOAD_TIMEOUT_SECONDS: ${BIAS_DW_DOWNLOAD_TIMEOUT_SECONDS:-7200}
+    depends_on:
+      api:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - data-warehouse-network
+    command: >
+      sh -c "sleep 10 && python kafka_bias_detector_consumer_example.py"
+    volumes:
+      - ./app:/app/app:ro
+      - ./kafka_bias_detector_consumer_example.py:/app/kafka_bias_detector_consumer_example.py:ro
+
+  bias-detector-2:
+    extends:
+      service: bias-detector-1
+    command: >
+      sh -c "sleep 11 && python kafka_bias_detector_consumer_example.py"
+
+  bias-detector-3:
+    extends:
+      service: bias-detector-1
+    command: >
+      sh -c "sleep 12 && python kafka_bias_detector_consumer_example.py"
+

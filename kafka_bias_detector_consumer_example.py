@@ -34,6 +34,9 @@ KAFKA_BIAS_TRIGGER_TOPIC = os.getenv("KAFKA_BIAS_TRIGGER_TOPIC", "bias-detection
 KAFKA_BIAS_TRIGGER_CONSUMER_GROUP = os.getenv("KAFKA_BIAS_TRIGGER_CONSUMER_GROUP", "bias-trigger-consumer")
 KAFKA_BIAS_TOPIC = os.getenv("KAFKA_BIAS_TOPIC", "bias-detection-complete-events")
 
+# Large downloads can take minutes; default 2h (override via env).
+BIAS_DW_DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("BIAS_DW_DOWNLOAD_TIMEOUT_SECONDS", str(2 * 60 * 60)))
+
 # Use Docker service name if KAFKA_BOOTSTRAP_SERVERS points to kafka:29092; use deployment API when alfie.iti.gr
 if "kafka:" in KAFKA_BOOTSTRAP_SERVERS:
     API_BASE = os.getenv("API_BASE", "http://api:8000")
@@ -62,7 +65,7 @@ def download_dataset_file(user_id: str, dataset_id: str, version: str = None, sp
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/download"
     if split and split in ("train", "test", "drift"):
         url += f"?split={split}"
-    r = requests.get(url, timeout=60)
+    r = requests.get(url, timeout=BIAS_DW_DOWNLOAD_TIMEOUT_SECONDS)
     r.raise_for_status()
     return r.content
 
@@ -311,6 +314,33 @@ async def send_bias_complete_event(
             logger.info(f"   Includes mitigation info: version={mitigated_dataset_version}, report_id={transformation_report_id}")
     except Exception as e:
         logger.error(f"❌ Failed to send bias completion event: {e}", exc_info=True)
+
+
+def claim_task_id(task_id: str, *, user_id: str, dataset_id: str, dataset_version: str | None) -> bool:
+    """
+    Idempotency guard: claim a task_id in the DW so only one bias-detector replica runs it.
+    Returns True when claimed; False when already claimed by another worker.
+    """
+    if not task_id:
+        return True
+    url = f"{API_BASE}/jobs/bias/claim"
+    payload = {
+        "task_id": task_id,
+        "user_id": user_id,
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 409:
+            logger.info("Task already claimed (skipping): task_id=%s user=%s dataset=%s", task_id, user_id, dataset_id)
+            return False
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        # Fail-open for backward compatibility; duplicates may occur if API endpoint is unavailable.
+        logger.warning("Could not claim task_id=%s (proceeding anyway): %s", task_id, e)
+        return True
 
 
 def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
@@ -1049,6 +1079,10 @@ async def run_consumer() -> None:
 
                 # Extract dataset version from input (if provided)
                 dataset_version = input_data.get("dataset_version", "v1")  # Default to v1 for backward compatibility
+
+                # Idempotency claim across replicas (skip if another worker already took it).
+                if not claim_task_id(task_id, user_id=user_id, dataset_id=dataset_id, dataset_version=dataset_version):
+                    continue
                 
                 # Fetch metadata first to detect split (train/test/drift) datasets
                 meta = fetch_dataset_metadata(user_id, dataset_id, dataset_version)

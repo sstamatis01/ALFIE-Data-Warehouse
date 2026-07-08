@@ -34,6 +34,7 @@ from .services.user_file_service import user_file_service
 from .services.gdpr_service import gdpr_service
 from .api import gdpr
 from .api import automl_jobs
+from .api import bias_jobs
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -218,6 +219,7 @@ inner_app.include_router(transformation_reports.router)
 inner_app.include_router(ai_models.router)
 inner_app.include_router(xai_reports.router)
 inner_app.include_router(automl_jobs.router)
+inner_app.include_router(bias_jobs.router)
 inner_app.include_router(etd_hub.router)
 inner_app.include_router(etd_hub_import.router)
 inner_app.include_router(graphdb.router)
