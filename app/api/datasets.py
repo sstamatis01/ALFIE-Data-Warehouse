@@ -531,6 +531,28 @@ async def list_public_datasets(
     return [DatasetResponse(**r.dict()) for r in rows]
 
 
+@router.get("/public/catalog", response_model=List[DatasetResponse])
+async def list_public_datasets_catalog(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    q: Optional[str] = Query(None, description="Search query (dataset_id, name, description)"),
+    tags: Optional[str] = Query(None, description="Comma-separated required tags"),
+):
+    """
+    List public datasets for UI browse (one entry per dataset).
+
+    Returns only **v1** (original upload) rows so users do not see duplicate v1/v2 catalog entries.
+    Import and pipeline behavior are unchanged; use POST .../import/{user_id} after selection.
+    """
+    rows = await metadata_service.get_public_datasets_catalog(
+        skip=skip,
+        limit=limit,
+        query=q,
+        tags=_parse_csv_list(tags),
+    )
+    return [DatasetResponse(**r.dict()) for r in rows]
+
+
 @router.get("/public/{dataset_id}", response_model=DatasetResponse)
 async def get_public_dataset_latest(dataset_id: str):
     """Get the latest version of a public dataset."""

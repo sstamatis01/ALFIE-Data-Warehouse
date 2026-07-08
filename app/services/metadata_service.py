@@ -171,6 +171,42 @@ class MetadataService:
             logger.error(f"Error retrieving public datasets: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Failed to retrieve public datasets")
 
+    async def get_public_datasets_catalog(
+        self,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+        query: str | None = None,
+        tags: list[str] | None = None,
+    ) -> List[DatasetMetadata]:
+        """
+        List public catalog entries for UI browse: one row per dataset (v1 / original only).
+
+        Split versions (typically v2) are omitted; import still creates user v1+v2 links as needed.
+        """
+        try:
+            q: Dict[str, Any] = {"is_public": True, "version": "v1"}
+            if query:
+                q["$or"] = [
+                    {"dataset_id": {"$regex": query, "$options": "i"}},
+                    {"name": {"$regex": query, "$options": "i"}},
+                    {"description": {"$regex": query, "$options": "i"}},
+                ]
+            if tags:
+                q["tags"] = {"$all": tags}
+
+            cursor = (
+                self.db.datasets.find(q)
+                .sort("updated_at", -1)
+                .skip(skip)
+                .limit(limit)
+            )
+            rows = await cursor.to_list(length=limit)
+            return [DatasetMetadata(**r) for r in rows]
+        except Exception as e:
+            logger.error(f"Error retrieving public catalog datasets: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to retrieve public catalog")
+
     async def get_public_dataset_latest(
         self,
         *,

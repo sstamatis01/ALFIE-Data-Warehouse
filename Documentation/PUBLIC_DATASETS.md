@@ -28,7 +28,13 @@ The storage layout in MinIO remains the standard layout, just under a reserved o
 
 ### List public datasets
 
-- `GET /datasets/public?skip=0&limit=100&q=<optional>&tags=tag1,tag2`
+- `GET /datasets/public?skip=0&limit=100&q=<optional>&tags=tag1,tag2` — all public versions (v1, v2, …)
+
+### List public datasets for UI browse (v1 only)
+
+- `GET /datasets/public/catalog?skip=0&limit=100&q=<optional>&tags=tag1,tag2` — **one row per dataset** (original **v1** only; no split v2 rows)
+
+Use this endpoint in the frontend catalog so users do not see the same dataset twice. Selection/import via `POST /datasets/public/{id}/import/{user_id}` is unchanged (user still gets v1+v2 links when a split exists).
 
 ### Get a public dataset (latest)
 
