@@ -40,9 +40,15 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+# Allow `from summer_school_presets import ...` when invoked as scripts/trigger_*.py
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import requests
+
+from summer_school_presets import PRESET_NAMES, SUMMER_SCHOOL_PRESETS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("trigger_bias_detection")
@@ -50,40 +56,6 @@ logger = logging.getLogger("trigger_bias_detection")
 DEFAULT_KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 DEFAULT_TOPIC = os.getenv("KAFKA_BIAS_TRIGGER_TOPIC", "bias-detection-trigger-events")
 DEFAULT_API = os.getenv("API_BASE", "http://localhost:8000")
-
-# Summer-school catalog defaults (see summer_school_prepared/catalog_manifest.json)
-SUMMER_SCHOOL_PRESETS: dict[str, dict[str, str]] = {
-    "german_credit": {
-        "dataset_id": "german_credit",
-        "dataset_version": "v2",
-        "target_column": "credit_risk",
-        "task_type": "classification",
-    },
-    "compas_recidivism": {
-        "dataset_id": "compas_recidivism",
-        "dataset_version": "v2",
-        "target_column": "two_year_recid",
-        "task_type": "classification",
-    },
-    "adult_census_income": {
-        "dataset_id": "adult_census_income",
-        "dataset_version": "v2",
-        "target_column": "income",
-        "task_type": "classification",
-    },
-    "taiwan_credit_default": {
-        "dataset_id": "taiwan_credit_default",
-        "dataset_version": "v2",
-        "target_column": "default_next_month",
-        "task_type": "classification",
-    },
-    "communities_crime": {
-        "dataset_id": "communities_crime",
-        "dataset_version": "v2",
-        "target_column": "ViolentCrimesPerPop",
-        "task_type": "regression",
-    },
-}
 
 
 def _dataset_url(api_base: str, user_id: str, dataset_id: str, version: str | None) -> str:
@@ -235,8 +207,8 @@ def apply_preset(args: argparse.Namespace) -> None:
         raise SystemExit(f"Unknown preset {args.preset!r}. Known: {known}")
     if not args.dataset_id:
         args.dataset_id = preset["dataset_id"]
-    if args.dataset_version == "v2" and preset.get("dataset_version"):
-        args.dataset_version = preset["dataset_version"]
+    if args.dataset_version == "v2" and preset.get("bias_version"):
+        args.dataset_version = preset["bias_version"]
     if not args.target_column:
         args.target_column = preset["target_column"]
     if args.task_type == "classification" and preset.get("task_type"):
@@ -247,9 +219,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Publish bias-detection-trigger-events to Kafka",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Presets: " + ", ".join(sorted(SUMMER_SCHOOL_PRESETS.keys())),
+        epilog="Presets: " + ", ".join(PRESET_NAMES),
     )
-    p.add_argument("--preset", choices=sorted(SUMMER_SCHOOL_PRESETS.keys()), help="Summer-school catalog defaults")
+    p.add_argument("--preset", choices=PRESET_NAMES, help="Summer-school catalog defaults")
     p.add_argument("--user-id", required=True, help="Dataset owner user_id (after public import)")
     p.add_argument("--dataset-id", default=None, help="Dataset id (default from --preset)")
     p.add_argument(

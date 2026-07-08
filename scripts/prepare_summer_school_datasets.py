@@ -14,10 +14,12 @@ Outputs:
     - taiwan_credit_default.csv
     - hateval_hate_speech_en.csv
     - asap_essay_scoring.csv
+    - hmda_mortgage_lending_sample.csv
+    - chicago_tnp_fares_sample.csv
     - catalog_manifest.json
 
 Notes:
-  - Skips large HMDA and TNP by default.
+  - HMDA (~4GB) and TNP (~1.5GB) are downsampled for workshop use (default 400k rows).
   - Does not upload anything; only prepares local files + a manifest for later ingestion.
 """
 
@@ -29,12 +31,13 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import pandas as pd
 
 
 REPO_DEFAULT = Path(__file__).resolve().parents[1]
+DEFAULT_SAMPLE_ROWS = 400_000
 
 
 def _ensure_dir(p: Path) -> None:
@@ -55,6 +58,56 @@ def _write_manifest(out_path: Path, items: list[dict]) -> None:
 
 def _safe_slug(s: str) -> str:
     return re.sub(r"[^a-z0-9_]+", "_", (s or "").strip().lower()).strip("_")
+
+
+def _count_csv_data_rows(path: Path) -> int:
+    with path.open(newline="", encoding="utf-8", errors="replace") as f:
+        return max(0, sum(1 for _ in f) - 1)
+
+
+def _downsample_csv_systematic(
+    src: Path,
+    out: Path,
+    *,
+    target_rows: int,
+    transform_chunk: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
+) -> int:
+    """
+    Stream a large CSV, optionally transform each chunk, and keep every Nth row
+    to reach ~target_rows without loading the full file into memory.
+    Returns number of rows written.
+    """
+    total = _count_csv_data_rows(src)
+    if total <= 0:
+        raise ValueError(f"No data rows in {src}")
+    step = max(1, total // target_rows)
+
+    first = True
+    kept = 0
+    global_i = 0
+    for chunk in pd.read_csv(src, chunksize=100_000, low_memory=False):
+        if transform_chunk is not None:
+            chunk = transform_chunk(chunk)
+        if chunk.empty:
+            global_i += 0
+            continue
+
+        pick_idx = [j for j in range(len(chunk)) if (global_i + j) % step == 0]
+        global_i += len(chunk)
+        if not pick_idx:
+            continue
+
+        part = chunk.iloc[pick_idx]
+        if kept + len(part) > target_rows:
+            part = part.iloc[: target_rows - kept]
+
+        part.to_csv(out, mode="w" if first else "a", header=first, index=False)
+        kept += len(part)
+        first = False
+        if kept >= target_rows:
+            break
+
+    return kept
 
 
 def prepare_compas(src_root: Path, out_dir: Path) -> Path:
@@ -303,6 +356,79 @@ def prepare_asap(src_root: Path, out_dir: Path) -> Path:
     return out
 
 
+def _transform_hmda_chunk(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep numeric / code columns; drop redundant long text *_name fields."""
+    keep = [c for c in df.columns if not str(c).endswith("_name")]
+    df = df[keep]
+    df = df.drop(columns=["respondent_id", "sequence_number"], errors="ignore")
+    return df
+
+
+def prepare_hmda_mortgage_lending(
+    src_root: Path, out_dir: Path, *, sample_rows: int = DEFAULT_SAMPLE_ROWS
+) -> Path:
+    src = src_root / "HMDA" / "mortage_lending_discrimination.csv"
+    out = out_dir / "hmda_mortgage_lending_sample.csv"
+    if not src.exists():
+        raise FileNotFoundError(f"HMDA source not found: {src}")
+    kept = _downsample_csv_systematic(
+        src,
+        out,
+        target_rows=sample_rows,
+        transform_chunk=_transform_hmda_chunk,
+    )
+    print(f"  HMDA downsampled to {kept} rows (target {sample_rows})")
+    return out
+
+
+_TNP_DROP = [
+    "Trip ID",
+    "Taxi ID",
+    "Pickup Centroid Location",
+    "Dropoff Centroid  Location",
+]
+_TNP_RENAME = {
+    "Trip Start Timestamp": "trip_start",
+    "Trip End Timestamp": "trip_end",
+    "Trip Seconds": "trip_seconds",
+    "Trip Miles": "trip_miles",
+    "Pickup Census Tract": "pickup_census_tract",
+    "Dropoff Census Tract": "dropoff_census_tract",
+    "Pickup Community Area": "pickup_community_area",
+    "Dropoff Community Area": "dropoff_community_area",
+    "Payment Type": "payment_type",
+    "Pickup Centroid Latitude": "pickup_lat",
+    "Pickup Centroid Longitude": "pickup_lon",
+    "Dropoff Centroid Latitude": "dropoff_lat",
+    "Dropoff Centroid Longitude": "dropoff_lon",
+}
+
+
+def _transform_tnp_chunk(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.drop(columns=_TNP_DROP, errors="ignore")
+    df = df.rename(columns=_TNP_RENAME)
+    if "Fare" in df.columns:
+        df = df.dropna(subset=["Fare"])
+    return df
+
+
+def prepare_chicago_tnp_fares(
+    src_root: Path, out_dir: Path, *, sample_rows: int = DEFAULT_SAMPLE_ROWS
+) -> Path:
+    src = src_root / "TNP" / "Taxi_Trips_-_2023.csv"
+    out = out_dir / "chicago_tnp_fares_sample.csv"
+    if not src.exists():
+        raise FileNotFoundError(f"TNP source not found: {src}")
+    kept = _downsample_csv_systematic(
+        src,
+        out,
+        target_rows=sample_rows,
+        transform_chunk=_transform_tnp_chunk,
+    )
+    print(f"  TNP downsampled to {kept} rows (target {sample_rows})")
+    return out
+
+
 def build_manifest(out_dir: Path) -> Path:
     items = [
         {
@@ -372,6 +498,37 @@ def build_manifest(out_dir: Path) -> Path:
             "tags": ["summer-school", "public", "finance"],
             "protected_attributes": ["SEX", "AGE", "EDUCATION", "MARRIAGE"],
         },
+        {
+            "dataset_id": "hmda_mortgage_lending",
+            "name": "HMDA Mortgage Lending (sample)",
+            "prepared_filename": "hmda_mortgage_lending_sample.csv",
+            "task_type": "classification",
+            "target_column_name": "action_taken",
+            "tags": ["summer-school", "public", "finance", "housing"],
+            "protected_attributes": [
+                "applicant_race_1",
+                "applicant_ethnicity",
+                "applicant_sex",
+                "state_code",
+                "county_code",
+            ],
+            "notes": "Downsampled from mortage_lending_discrimination.csv; action_taken is the loan outcome code.",
+        },
+        {
+            "dataset_id": "chicago_tnp_fares",
+            "name": "Chicago Taxi Trips 2023 (sample)",
+            "prepared_filename": "chicago_tnp_fares_sample.csv",
+            "task_type": "regression",
+            "target_column_name": "Fare",
+            "tags": ["summer-school", "public", "transport", "geographic"],
+            "protected_attributes": [
+                "pickup_community_area",
+                "dropoff_community_area",
+                "payment_type",
+                "Company",
+            ],
+            "notes": "Downsampled from Taxi_Trips_-_2023.csv; WKT POINT columns dropped; target is Fare.",
+        },
     ]
     out = out_dir / "catalog_manifest.json"
     _write_manifest(out, items)
@@ -383,6 +540,22 @@ def main() -> int:
     ap.add_argument("--repo", default=str(REPO_DEFAULT), help="Repo root path")
     ap.add_argument("--src", default="summer school", help="Relative path to raw datasets folder")
     ap.add_argument("--out", default="summer_school_prepared", help="Relative output folder")
+    ap.add_argument(
+        "--sample-rows",
+        type=int,
+        default=DEFAULT_SAMPLE_ROWS,
+        help="Rows to keep when downsampling HMDA/TNP (default 400000)",
+    )
+    ap.add_argument(
+        "--skip-large",
+        action="store_true",
+        help="Skip HMDA/TNP downsampling (faster; only refresh the 7 smaller datasets)",
+    )
+    ap.add_argument(
+        "--only-large",
+        action="store_true",
+        help="Only downsample HMDA/TNP and refresh catalog_manifest.json",
+    )
     args = ap.parse_args()
 
     repo = Path(args.repo).resolve()
@@ -394,13 +567,21 @@ def main() -> int:
         raise SystemExit(f"Source folder not found: {src_root}")
 
     written: list[Path] = []
-    written.append(prepare_compas(src_root, out_dir))
-    written.append(prepare_adult_census(src_root, out_dir))
-    written.append(prepare_german_credit_numeric(src_root, out_dir))
-    written.append(prepare_communities_crime(src_root, out_dir))
-    written.append(prepare_taiwan_credit(src_root, out_dir))
-    written.append(prepare_hateval_en(src_root, out_dir))
-    written.append(prepare_asap(src_root, out_dir))
+    if not args.only_large:
+        written.append(prepare_compas(src_root, out_dir))
+        written.append(prepare_adult_census(src_root, out_dir))
+        written.append(prepare_german_credit_numeric(src_root, out_dir))
+        written.append(prepare_communities_crime(src_root, out_dir))
+        written.append(prepare_taiwan_credit(src_root, out_dir))
+        written.append(prepare_hateval_en(src_root, out_dir))
+        written.append(prepare_asap(src_root, out_dir))
+    if not args.skip_large:
+        written.append(
+            prepare_hmda_mortgage_lending(src_root, out_dir, sample_rows=args.sample_rows)
+        )
+        written.append(
+            prepare_chicago_tnp_fares(src_root, out_dir, sample_rows=args.sample_rows)
+        )
     written.append(build_manifest(out_dir))
 
     # Print a short summary for logs

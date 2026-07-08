@@ -1,0 +1,58 @@
+services:
+  # Run multiple AutoML consumer replicas in the SAME consumer group.
+  # This file intentionally defines 3 distinct services instead of using `--scale`
+  # because the base compose sets `container_name` (which prevents scaling).
+  #
+  # Usage (local):
+  #   docker compose -f docker-compose.yml -f docker-compose.deployment.yml stop automl-consumer
+  #   docker compose -f docker-compose.yml -f docker-compose.deployment.yml rm -f automl-consumer
+  #   docker compose -f docker-compose.yml -f docker-compose.deployment.yml -f docker-compose.automl-consumer-replicas.yml up -d --build automl-consumer-1 automl-consumer-2 automl-consumer-3
+  #
+  # Ensure topic has >=3 partitions:
+  #   docker exec -it data-warehouse-kafka kafka-topics --bootstrap-server localhost:29092 --describe --topic automl-trigger-events
+  #   docker exec -it data-warehouse-kafka kafka-topics --bootstrap-server localhost:29092 --alter --topic automl-trigger-events --partitions 3
+
+  automl-consumer-1:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_AUTOML_TRIGGER_TOPIC: automl-trigger-events
+      KAFKA_AUTOML_COMPLETE_TOPIC: automl-complete-events
+      KAFKA_CONSUMER_GROUP: automl-consumer
+      API_BASE: http://api:8000
+      DW_HOST: api
+      DW_PORT: 8000
+      TABULAR_AUTOML_HOST: host.docker.internal
+      TABULAR_AUTOML_PORT: 8001
+      VISION_AUTOML_HOST: host.docker.internal
+      VISION_AUTOML_PORT: 8002
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      api:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - data-warehouse-network
+    command: >
+      sh -c "sleep 5 && python kafka_automl_consumer_example_v3.py"
+    volumes:
+      - ./app:/app/app:ro
+      - ./kafka_automl_consumer_example_v3.py:/app/kafka_automl_consumer_example_v3.py:ro
+
+  automl-consumer-2:
+    extends:
+      service: automl-consumer-1
+    command: >
+      sh -c "sleep 6 && python kafka_automl_consumer_example_v3.py"
+
+  automl-consumer-3:
+    extends:
+      service: automl-consumer-1
+    command: >
+      sh -c "sleep 7 && python kafka_automl_consumer_example_v3.py"
+

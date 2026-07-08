@@ -1,0 +1,47 @@
+services:
+  # Local autodw stack: run 3 AutoML consumer replicas in the SAME consumer group.
+  # We define separate services because the base file sets `container_name` on `automl-consumer`,
+  # which prevents `--scale automl-consumer=3`.
+
+  automl-consumer-1:
+    image: ${AUTODW_IMAGE:-gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw}:${AUTODW_VERSION:-1.0.3}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_AUTOML_TRIGGER_TOPIC: automl-trigger-events
+      KAFKA_AUTOML_COMPLETE_TOPIC: automl-complete-events
+      KAFKA_CONSUMER_GROUP: automl-consumer
+      API_BASE: http://api:8000
+      DW_HOST: api
+      DW_PORT: 8000
+      TABULAR_AUTOML_HOST: ${TABULAR_AUTOML_HOST:-host.docker.internal}
+      TABULAR_AUTOML_PORT: ${TABULAR_AUTOML_PORT:-8001}
+      VISION_AUTOML_HOST: ${VISION_AUTOML_HOST:-host.docker.internal}
+      VISION_AUTOML_PORT: ${VISION_AUTOML_PORT:-8002}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      api:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - autodw-network
+    command: >
+      sh -c "sleep 10 && python kafka_automl_consumer_example_v3.py"
+
+  automl-consumer-2:
+    extends:
+      service: automl-consumer-1
+    command: >
+      sh -c "sleep 11 && python kafka_automl_consumer_example_v3.py"
+
+  automl-consumer-3:
+    extends:
+      service: automl-consumer-1
+    command: >
+      sh -c "sleep 12 && python kafka_automl_consumer_example_v3.py"
+

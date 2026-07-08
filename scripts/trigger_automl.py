@@ -19,7 +19,8 @@ Example — german_credit mitigated v3 for user 99:
     gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw:1.0.3 \\
     python scripts/trigger_automl.py --preset german_credit --user-id 99 --wait
 
-Note: time_budget is passed through to the consumer as SECONDS (60 = 1 minute max training).
+Note: time_budget is passed through to the consumer as SECONDS (60 = 1 minute, 300 = 5 minutes).
+Use --time-budget 300 for text/NLP datasets, or rely on preset defaults for hateval/asap.
 
 Watch:
   docker logs -f autodw-automl-consumer
@@ -39,9 +40,14 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import requests
+
+from summer_school_presets import PRESET_NAMES, SUMMER_SCHOOL_PRESETS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("trigger_automl")
@@ -49,45 +55,6 @@ logger = logging.getLogger("trigger_automl")
 DEFAULT_KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 DEFAULT_TOPIC = os.getenv("KAFKA_AUTOML_TRIGGER_TOPIC", "automl-trigger-events")
 DEFAULT_API = os.getenv("API_BASE", "http://localhost:8000")
-
-# Defaults for summer-school catalog (train on mitigated v3 after bias step)
-SUMMER_SCHOOL_PRESETS: dict[str, dict[str, str]] = {
-    "german_credit": {
-        "dataset_id": "german_credit",
-        "dataset_version": "v3",
-        "target_column": "credit_risk",
-        "task_type": "classification",
-        "task_category": "tabular",
-    },
-    "compas_recidivism": {
-        "dataset_id": "compas_recidivism",
-        "dataset_version": "v3",
-        "target_column": "two_year_recid",
-        "task_type": "classification",
-        "task_category": "tabular",
-    },
-    "adult_census_income": {
-        "dataset_id": "adult_census_income",
-        "dataset_version": "v3",
-        "target_column": "income",
-        "task_type": "classification",
-        "task_category": "tabular",
-    },
-    "taiwan_credit_default": {
-        "dataset_id": "taiwan_credit_default",
-        "dataset_version": "v3",
-        "target_column": "default_next_month",
-        "task_type": "classification",
-        "task_category": "tabular",
-    },
-    "communities_crime": {
-        "dataset_id": "communities_crime",
-        "dataset_version": "v3",
-        "target_column": "ViolentCrimesPerPop",
-        "task_type": "regression",
-        "task_category": "tabular",
-    },
-}
 
 
 def _dataset_url(api_base: str, user_id: str, dataset_id: str, version: str | None) -> str:
@@ -236,23 +203,25 @@ def apply_preset(args: argparse.Namespace) -> None:
         raise SystemExit(f"Unknown preset {args.preset!r}. Known: {known}")
     if not args.dataset_id:
         args.dataset_id = preset["dataset_id"]
-    if args.dataset_version == "v3" and preset.get("dataset_version"):
-        args.dataset_version = preset["dataset_version"]
+    if args.dataset_version == "v3" and preset.get("automl_version"):
+        args.dataset_version = preset["automl_version"]
     if not args.target_column:
         args.target_column = preset["target_column"]
     if args.task_type == "classification" and preset.get("task_type"):
         args.task_type = preset["task_type"]
     if args.task_category == "tabular" and preset.get("task_category"):
         args.task_category = preset["task_category"]
+    if args.time_budget is None and preset.get("time_budget_seconds") is not None:
+        args.time_budget = int(preset["time_budget_seconds"])
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Publish automl-trigger-events to Kafka",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Presets: " + ", ".join(sorted(SUMMER_SCHOOL_PRESETS.keys())),
+        epilog="Presets: " + ", ".join(PRESET_NAMES),
     )
-    p.add_argument("--preset", choices=sorted(SUMMER_SCHOOL_PRESETS.keys()), help="Summer-school catalog defaults (v3 mitigated)")
+    p.add_argument("--preset", choices=PRESET_NAMES, help="Summer-school catalog defaults (v3 mitigated)")
     p.add_argument("--user-id", required=True)
     p.add_argument("--dataset-id", default=None)
     p.add_argument(
@@ -274,9 +243,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--time-budget",
         type=int,
-        default=60,
+        default=None,
         metavar="SECONDS",
-        help="Training time budget in seconds (default 60 = 1 minute)",
+        help="Training time budget in seconds (default: 60 tabular, 300 for hateval/asap presets)",
     )
     p.add_argument("--task-id", default=None)
     p.add_argument("--kafka", default=DEFAULT_KAFKA)
@@ -302,6 +271,8 @@ def main() -> int:
     if not args.target_column:
         logger.error("--target-column is required (or use --preset)")
         return 2
+    if args.time_budget is None:
+        args.time_budget = 60
 
     try:
         if not args.skip_preflight:
