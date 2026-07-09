@@ -148,7 +148,7 @@ Confirm exact topic names in the XAI consumer source — update `.env.example` i
 
 ## Parallel consumers (3 replicas)
 
-AutoDW exposes **`POST /jobs/xai/claim`** (Mongo collection `xai_job_locks`, unique `task_id`) so multiple XAI Kafka consumers can share one consumer group without duplicate work.
+AutoDW exposes **`POST /jobs/xai/claim`** (Mongo collection `xai_job_locks`, unique `task_id` and `job_key`) so multiple XAI Kafka consumers can share one consumer group without duplicate work.
 
 ### AutoDW (this repo)
 
@@ -157,11 +157,15 @@ AutoDW exposes **`POST /jobs/xai/claim`** (Mongo collection `xai_job_locks`, uni
 
 ### XAI consumer (`scripts/kafka_call.py` or equivalent)
 
-1. Add `claim_task_id()` — copy from `kafka_bias_detector_consumer_example.py` / `kafka_automl_consumer_example_v3.py`, URL `POST {API_BASE}/jobs/xai/claim`.
-2. After parsing the Kafka message, **before** downloading dataset/model or calling Flask:
-   - Extract `task_id`, `input.user_id`, `input.dataset_id`, `input.dataset_version`, `input.model_id`, `input.model_version`.
-   - If `claim_task_id(...)` returns `False` (HTTP 409), **skip** the message (`continue` / `return`).
-3. Keep fail-open on claim errors (log warning, proceed) for backward compatibility when the API is old.
+1. Add `claim_task_id()` — URL `POST {API_BASE}/jobs/xai/claim`.
+2. Build and send **`job_key`** (or let the API build it server-side from the same fields):
+   `user_id|dataset_id|dataset_version|model_id|model_version|report_type|level`
+   - Model and data reports for the same dataset get **different** `job_key` values → both allowed.
+   - Retries with a new `task_id` but the same report → **409** on `job_key`.
+3. After parsing the Kafka message, **before** downloading dataset/model or calling Flask:
+   - Extract `task_id`, `input.user_id`, `input.dataset_id`, `input.dataset_version`, `input.model_id`, `input.model_version`, `report_type`, `level`.
+   - If `claim_task_id(...)` returns `False` (HTTP 409: `task_id already claimed` or `job_key already claimed`), **skip** the message.
+4. Keep fail-open on claim errors (log warning, proceed) for backward compatibility when the API is old.
 
 ### Compose (XAI repo)
 
