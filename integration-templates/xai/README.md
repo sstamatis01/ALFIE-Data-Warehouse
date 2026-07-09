@@ -145,3 +145,33 @@ Secrets: same `DOCKER_REGISTRY_USERNAME` / `DOCKER_REGISTRY_PASSWORD` as AutoDW.
 | DW emits `xai-events` / completion via API when report saved | XAI → AutoDW API |
 
 Confirm exact topic names in the XAI consumer source — update `.env.example` if your repo uses different names.
+
+## Parallel consumers (3 replicas)
+
+AutoDW exposes **`POST /jobs/xai/claim`** (Mongo collection `xai_job_locks`, unique `task_id`) so multiple XAI Kafka consumers can share one consumer group without duplicate work.
+
+### AutoDW (this repo)
+
+- Deploy API with `xai_jobs` router (restart API after pull).
+- No change to trigger or report upload APIs.
+
+### XAI consumer (`scripts/kafka_call.py` or equivalent)
+
+1. Add `claim_task_id()` — copy from `kafka_bias_detector_consumer_example.py` / `kafka_automl_consumer_example_v3.py`, URL `POST {API_BASE}/jobs/xai/claim`.
+2. After parsing the Kafka message, **before** downloading dataset/model or calling Flask:
+   - Extract `task_id`, `input.user_id`, `input.dataset_id`, `input.dataset_version`, `input.model_id`, `input.model_version`.
+   - If `claim_task_id(...)` returns `False` (HTTP 409), **skip** the message (`continue` / `return`).
+3. Keep fail-open on claim errors (log warning, proceed) for backward compatibility when the API is old.
+
+### Compose (XAI repo)
+
+- Copy `docker-compose.replicas.yaml` from this template.
+- Stop single `kafka-xai-consumer`; start `kafka-xai-consumer-1` … `_3` with the **same** `KAFKA_CONSUMER_GROUP`.
+- Flask services (`:5010`, `:5001`) stay **one instance each** — only the Kafka consumer scales.
+- Increase `xai-trigger-events` partitions to match replica count (e.g. 3).
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.replicas.yaml up -d \
+  universal-model-explainability flexible-data-interpretability \
+  kafka-xai-consumer-1 kafka-xai-consumer-2 kafka-xai-consumer-3
+```

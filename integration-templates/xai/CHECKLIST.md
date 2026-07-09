@@ -69,3 +69,11 @@ Same format as AutoDW:
 - Module: `xai`
 - Image: `.../alfie/xai:1.0.0`
 - Attach: `docker-compose.yaml`, `.env.example`, README
+
+## 8. Parallel Kafka consumers (optional)
+
+- [ ] AutoDW API includes `POST /jobs/xai/claim` (Data Warehouse repo)
+- [ ] Consumer calls claim after parsing message; skip on HTTP 409
+- [ ] `docker-compose.replicas.yaml` — 3× `kafka-xai-consumer-*`, same `KAFKA_CONSUMER_GROUP`
+- [ ] Topic `xai-trigger-events` has ≥3 partitions
+- [ ] Flask explainability services remain single-instance (consumer only scales)
