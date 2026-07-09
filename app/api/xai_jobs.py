@@ -53,8 +53,29 @@ async def _ensure_indexes() -> None:
     if _index_ready:
         return
     db = get_database()
-    await db.xai_job_locks.create_index("task_id", unique=True)
-    await db.xai_job_locks.create_index("job_key", unique=True)
+    col = db.xai_job_locks
+    await col.create_index("task_id", unique=True)
+    # Backfill legacy rows so a unique job_key index can be created safely.
+    await col.update_many(
+        {"$or": [{"job_key": {"$exists": False}}, {"job_key": None}]},
+        [{"$set": {"job_key": {"$concat": ["legacy:", "$task_id"]}}}],
+    )
+    try:
+        await col.create_index(
+            "job_key",
+            unique=True,
+            partialFilterExpression={"job_key": {"$exists": True, "$type": "string"}},
+        )
+    except Exception as e:
+        logger.warning("job_key index create failed (%s); attempting drop+recreate", e)
+        for index in await col.list_indexes().to_list(length=None):
+            if index.get("name") != "_id_" and "job_key" in index.get("key", {}):
+                await col.drop_index(index["name"])
+        await col.create_index(
+            "job_key",
+            unique=True,
+            partialFilterExpression={"job_key": {"$exists": True, "$type": "string"}},
+        )
     _index_ready = True
 
 
@@ -141,4 +162,7 @@ async def claim_xai_job(payload: XaiJobClaimRequest) -> XaiJobClaimResponse:
         raise HTTPException(status_code=409, detail=detail)
     except Exception as e:
         logger.error("Failed to claim xai job: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to claim xai job")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to claim xai job: {type(e).__name__}: {e}",
+        )
