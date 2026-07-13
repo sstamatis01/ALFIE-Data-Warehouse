@@ -139,19 +139,26 @@ Optional API env vars: `CONCEPT_DRIFT_JOB_LOCK_HEARTBEAT_FRESH_SECONDS` (120), `
 
 **Kafka:** use the **same** consumer group on all workers (`concept-drift-consumer`). Set `concept-drift-trigger-events` to **≥3 partitions**.
 
-**Host (non-Docker):** run 3 processes from the same venv with different `CONCEPT_DRIFT_WORKER_ID` (for logs only):
+**Host (non-Docker):** run 3 processes from `.venv-concept-drift` with different `CONCEPT_DRIFT_WORKER_ID` (for logs only):
 
 ```bash
+cd ~/ALFIE-Data-Warehouse
+source .venv-concept-drift/bin/activate
 export KAFKA_BOOTSTRAP_SERVERS=alfie.iti.gr:9092
 export API_BASE=https://alfie.iti.gr/autodw
 export KAFKA_CONCEPT_DRIFT_CONSUMER_GROUP=concept-drift-consumer
 
-CONCEPT_DRIFT_WORKER_ID=1 nohup python kafka_concept_drift_consumer_example.py > logs/concept_drift_1.log 2>&1 &
-CONCEPT_DRIFT_WORKER_ID=2 nohup python kafka_concept_drift_consumer_example.py > logs/concept_drift_2.log 2>&1 &
-CONCEPT_DRIFT_WORKER_ID=3 nohup python kafka_concept_drift_consumer_example.py > logs/concept_drift_3.log 2>&1 &
+chmod +x scripts/run_concept_drift_workers.sh
+./scripts/run_concept_drift_workers.sh 3
 ```
 
-Or use `scripts/run_concept_drift_workers.sh`.
+Or manually:
+
+```bash
+CONCEPT_DRIFT_WORKER_ID=1 nohup .venv-concept-drift/bin/python kafka_concept_drift_consumer_example.py > logs/concept_drift_1.log 2>&1 &
+CONCEPT_DRIFT_WORKER_ID=2 nohup .venv-concept-drift/bin/python kafka_concept_drift_consumer_example.py > logs/concept_drift_2.log 2>&1 &
+CONCEPT_DRIFT_WORKER_ID=3 nohup .venv-concept-drift/bin/python kafka_concept_drift_consumer_example.py > logs/concept_drift_3.log 2>&1 &
+```
 
 **Server sizing:** 12 cores / 125 GiB RAM can comfortably run 3 parallel drift jobs (each may use several GB during AutoGluon retrain).
 

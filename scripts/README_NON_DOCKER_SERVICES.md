@@ -98,11 +98,11 @@ python agentic_core_orchestrator.py
 
 ### Concept Drift Consumer
 
-Listens to concept-drift-trigger-events, runs drift detection and retraining, publishes concept-drift-complete-events.
+Uses dedicated venv **`.venv-concept-drift`** (separate from orchestrator `.venv` if needed).
 
 ```bash
 cd ~/ALFIE-Data-Warehouse
-source .venv/bin/activate
+source .venv-concept-drift/bin/activate
 export KAFKA_BOOTSTRAP_SERVERS=alfie.iti.gr:9092
 export API_BASE=https://alfie.iti.gr/autodw
 python kafka_concept_drift_consumer_example.py
@@ -113,25 +113,33 @@ python kafka_concept_drift_consumer_example.py
 Use the **same** consumer group on all processes; Kafka distributes partitions across workers. The consumer calls `POST /jobs/concept-drift/claim` before each job (requires API restart after deploy).
 
 ```bash
+cd ~/ALFIE-Data-Warehouse
+source .venv-concept-drift/bin/activate
+export KAFKA_BOOTSTRAP_SERVERS=alfie.iti.gr:9092
+export API_BASE=https://alfie.iti.gr/autodw
+
 # One-time: ensure topic has >=3 partitions (from host with Kafka access)
 docker exec -it data-warehouse-kafka kafka-topics \
   --bootstrap-server localhost:29092 \
   --alter --topic concept-drift-trigger-events --partitions 3
 
-# Start 3 workers (same venv, different log files)
+# Start 3 workers (uses .venv-concept-drift/bin/python by default)
 chmod +x scripts/run_concept_drift_workers.sh
 ./scripts/run_concept_drift_workers.sh 3
 ```
 
 Or manually in tmux (set `CONCEPT_DRIFT_WORKER_ID=1`, `2`, `3` per pane for log identification).
 
----
+## 4. Run in background (optional)
 
 **Using nohup:**
 
 ```bash
 source .venv/bin/activate
 nohup python agentic_core_orchestrator.py > logs/orchestrator.log 2>&1 &
+
+source .venv-concept-drift/bin/activate
+export KAFKA_BOOTSTRAP_SERVERS=alfie.iti.gr:9092 API_BASE=https://alfie.iti.gr/autodw
 nohup python kafka_concept_drift_consumer_example.py > logs/concept_drift.log 2>&1 &
 ```
 
@@ -155,7 +163,7 @@ Repeat in another tmux session for the concept drift consumer.
 ## 5. Quick checklist
 
 - [ ] Python 3.10+ and venv installed  
-- [ ] `.venv` created and `requirements.txt` installed  
+- [ ] `.venv-concept-drift` created and `requirements.txt` installed (concept drift)
 - [ ] Task Manager client available (PYTHONPATH or pip) for the orchestrator  
 - [ ] `.env` or exports set (KAFKA_BOOTSTRAP_SERVERS, API_BASE, TASK_MANAGER_URL)  
 - [ ] Kafka reachable (e.g. `telnet alfie.iti.gr 9092` or `nc -zv alfie.iti.gr 9092`)  
