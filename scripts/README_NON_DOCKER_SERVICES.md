@@ -108,7 +108,24 @@ export API_BASE=https://alfie.iti.gr/autodw
 python kafka_concept_drift_consumer_example.py
 ```
 
-## 4. Run in background (optional)
+#### Three parallel workers (multi-user)
+
+Use the **same** consumer group on all processes; Kafka distributes partitions across workers. The consumer calls `POST /jobs/concept-drift/claim` before each job (requires API restart after deploy).
+
+```bash
+# One-time: ensure topic has >=3 partitions (from host with Kafka access)
+docker exec -it data-warehouse-kafka kafka-topics \
+  --bootstrap-server localhost:29092 \
+  --alter --topic concept-drift-trigger-events --partitions 3
+
+# Start 3 workers (same venv, different log files)
+chmod +x scripts/run_concept_drift_workers.sh
+./scripts/run_concept_drift_workers.sh 3
+```
+
+Or manually in tmux (set `CONCEPT_DRIFT_WORKER_ID=1`, `2`, `3` per pane for log identification).
+
+---
 
 **Using nohup:**
 

@@ -123,6 +123,38 @@ The concept-drift consumer sends to `concept-drift-complete-events`:
 
 The consumer downloads the drift split, loads the model from the DW, runs `monitor_drift_and_retrain` (ADWIN + AutoGluon retrain), zips the new model, uploads it via `POST /ai-models/upload/folder/{user_id}`, then sends `concept-drift-complete`.
 
+### Parallel workers (3 replicas, multi-user)
+
+AutoDW job lock endpoints (Mongo `concept_drift_job_locks`):
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /jobs/concept-drift/claim` | Acquire lock (`task_id` + `job_key`) |
+| `POST /jobs/concept-drift/heartbeat` | Refresh lock during long AutoGluon jobs |
+| `POST /jobs/concept-drift/release` | Delete lock on success/failure |
+
+**`job_key`:** `user_id|dataset_id|dataset_version|model_id|model_version`
+
+Optional API env vars: `CONCEPT_DRIFT_JOB_LOCK_HEARTBEAT_FRESH_SECONDS` (120), `CONCEPT_DRIFT_JOB_LOCK_STALE_SECONDS` (300).
+
+**Kafka:** use the **same** consumer group on all workers (`concept-drift-consumer`). Set `concept-drift-trigger-events` to **≥3 partitions**.
+
+**Host (non-Docker):** run 3 processes from the same venv with different `CONCEPT_DRIFT_WORKER_ID` (for logs only):
+
+```bash
+export KAFKA_BOOTSTRAP_SERVERS=alfie.iti.gr:9092
+export API_BASE=https://alfie.iti.gr/autodw
+export KAFKA_CONCEPT_DRIFT_CONSUMER_GROUP=concept-drift-consumer
+
+CONCEPT_DRIFT_WORKER_ID=1 nohup python kafka_concept_drift_consumer_example.py > logs/concept_drift_1.log 2>&1 &
+CONCEPT_DRIFT_WORKER_ID=2 nohup python kafka_concept_drift_consumer_example.py > logs/concept_drift_2.log 2>&1 &
+CONCEPT_DRIFT_WORKER_ID=3 nohup python kafka_concept_drift_consumer_example.py > logs/concept_drift_3.log 2>&1 &
+```
+
+Or use `scripts/run_concept_drift_workers.sh`.
+
+**Server sizing:** 12 cores / 125 GiB RAM can comfortably run 3 parallel drift jobs (each may use several GB during AutoGluon retrain).
+
 ---
 
 ## Running the consumer outside Docker (Anaconda)

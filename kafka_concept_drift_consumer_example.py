@@ -29,6 +29,7 @@ import pathlib
 import tempfile
 import uuid
 import zipfile
+import threading
 from datetime import datetime, timezone
 from collections import deque
 
@@ -66,13 +67,157 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_DRIFT_TRIGGER_TOPIC = os.getenv("KAFKA_CONCEPT_DRIFT_TRIGGER_TOPIC", "concept-drift-trigger-events")
 KAFKA_DRIFT_COMPLETE_TOPIC = os.getenv("KAFKA_CONCEPT_DRIFT_COMPLETE_TOPIC", "concept-drift-complete-events")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONCEPT_DRIFT_CONSUMER_GROUP", "concept-drift-consumer")
+WORKER_ID = os.getenv("CONCEPT_DRIFT_WORKER_ID", "1")
+HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("CONCEPT_DRIFT_HEARTBEAT_INTERVAL_SECONDS", "60"))
 
 # Data Warehouse API
 DW_HOST = os.getenv("DW_HOST", "localhost")
 DW_PORT = os.getenv("DW_PORT", "8000")
 API_BASE = os.getenv("API_BASE") or f"http://{DW_HOST}:{DW_PORT}"
 
-logger.info(f"Configuration: API_BASE={API_BASE}, trigger_topic={KAFKA_DRIFT_TRIGGER_TOPIC}, complete_topic={KAFKA_DRIFT_COMPLETE_TOPIC}")
+logger.info(
+    "Configuration: API_BASE=%s, trigger_topic=%s, complete_topic=%s, group=%s, worker_id=%s",
+    API_BASE,
+    KAFKA_DRIFT_TRIGGER_TOPIC,
+    KAFKA_DRIFT_COMPLETE_TOPIC,
+    KAFKA_CONSUMER_GROUP,
+    WORKER_ID,
+)
+
+
+def build_job_key(
+    *,
+    user_id: str,
+    dataset_id: str,
+    dataset_version: str | None,
+    model_id: str,
+    model_version: str | None,
+) -> str:
+    return "|".join([
+        user_id,
+        dataset_id,
+        dataset_version or "v1",
+        model_id,
+        model_version or "v1",
+    ])
+
+
+def claim_task_id(
+    task_id: str,
+    *,
+    user_id: str,
+    dataset_id: str,
+    dataset_version: str | None,
+    model_id: str,
+    model_version: str | None,
+) -> bool:
+    """
+    Idempotency guard across consumer replicas.
+    Returns True when this worker should process the task; False to skip.
+    """
+    if not task_id:
+        return True
+    url = f"{API_BASE.rstrip('/')}/jobs/concept-drift/claim"
+    payload = {
+        "task_id": task_id,
+        "job_key": build_job_key(
+            user_id=user_id,
+            dataset_id=dataset_id,
+            dataset_version=dataset_version,
+            model_id=model_id,
+            model_version=model_version,
+        ),
+        "user_id": user_id,
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+        "model_id": model_id,
+        "model_version": model_version,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code == 409:
+            detail = ""
+            try:
+                detail = r.json().get("detail", "")
+            except Exception:
+                detail = r.text
+            logger.info(
+                "Worker %s skipping task_id=%s (%s)",
+                WORKER_ID,
+                task_id,
+                detail or "already claimed",
+            )
+            return False
+        r.raise_for_status()
+        body = r.json()
+        if body.get("reclaimed"):
+            logger.warning(
+                "Worker %s reclaimed stale lock for task_id=%s job_key=%s",
+                WORKER_ID,
+                task_id,
+                body.get("job_key"),
+            )
+        return True
+    except Exception as e:
+        logger.warning(
+            "Worker %s could not claim task_id=%s (proceeding anyway): %s",
+            WORKER_ID,
+            task_id,
+            e,
+        )
+        return True
+
+
+def heartbeat_task_id(task_id: str) -> None:
+    if not task_id:
+        return
+    url = f"{API_BASE.rstrip('/')}/jobs/concept-drift/heartbeat"
+    try:
+        r = requests.post(url, json={"task_id": task_id}, timeout=15)
+        if r.status_code == 404:
+            logger.warning("Heartbeat: lock not found for task_id=%s", task_id)
+            return
+        r.raise_for_status()
+        logger.debug("Heartbeat ok for task_id=%s", task_id)
+    except Exception as e:
+        logger.warning("Heartbeat failed for task_id=%s: %s", task_id, e)
+
+
+def release_task_id(task_id: str) -> None:
+    if not task_id:
+        return
+    url = f"{API_BASE.rstrip('/')}/jobs/concept-drift/release"
+    try:
+        r = requests.post(url, json={"task_id": task_id}, timeout=15)
+        r.raise_for_status()
+        logger.info("Released lock for task_id=%s", task_id)
+    except Exception as e:
+        logger.warning("Failed to release lock for task_id=%s: %s", task_id, e)
+
+
+class _DriftJobHeartbeat:
+    """Background heartbeat while sync AutoGluon work blocks the asyncio loop."""
+
+    def __init__(self, task_id: str, interval_seconds: int = HEARTBEAT_INTERVAL_SECONDS):
+        self.task_id = task_id
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            heartbeat_task_id(self.task_id)
+
+    def start(self) -> None:
+        if not self.task_id:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"drift-hb-{self.task_id[:12]}")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
 
 
 def download_drift_dataset(user_id: str, dataset_id: str, version: str) -> pd.DataFrame:
@@ -823,6 +968,56 @@ async def process_drift_trigger(event: dict, producer: AIOKafkaProducer) -> None
         await _send_complete(producer, task_id, user_id, model_id, None, dataset_id, dataset_version, success=False, error_message="Missing target_column_name")
         return
 
+    if not claim_task_id(
+        task_id,
+        user_id=user_id,
+        dataset_id=dataset_id,
+        dataset_version=dataset_version,
+        model_id=model_id,
+        model_version=model_version,
+    ):
+        return
+
+    heartbeat = _DriftJobHeartbeat(task_id)
+    heartbeat.start()
+    try:
+        logger.info(
+            "Worker %s processing concept drift task_id=%s user=%s dataset=%s model=%s",
+            WORKER_ID,
+            task_id,
+            user_id,
+            dataset_id,
+            model_id,
+        )
+        await _process_drift_trigger_body(
+            producer=producer,
+            task_id=task_id,
+            user_id=user_id,
+            dataset_id=dataset_id,
+            dataset_version=dataset_version,
+            model_id=model_id,
+            model_version=model_version,
+            target_column=target_column,
+            window_size=window_size,
+        )
+    finally:
+        heartbeat.stop()
+        release_task_id(task_id)
+
+
+async def _process_drift_trigger_body(
+    *,
+    producer: AIOKafkaProducer,
+    task_id: str,
+    user_id: str,
+    dataset_id: str,
+    dataset_version: str,
+    model_id: str,
+    model_version: str,
+    target_column: str,
+    window_size: int,
+) -> None:
+    """Core drift detection logic (called after lock claim)."""
     try:
         logger.info(f"Downloading drift split: dataset {dataset_id} version {dataset_version}")
         df_drift = download_drift_dataset(user_id, dataset_id, dataset_version)
@@ -1056,7 +1251,13 @@ async def run_consumer() -> None:
         key_deserializer=lambda m: m.decode("utf-8") if m else None,
     )
     await consumer.start()
-    logger.info(f"Listening to {KAFKA_DRIFT_TRIGGER_TOPIC}; sending completions to {KAFKA_DRIFT_COMPLETE_TOPIC}")
+    logger.info(
+        "Listening to %s (group=%s, worker_id=%s); completions -> %s",
+        KAFKA_DRIFT_TRIGGER_TOPIC,
+        KAFKA_CONSUMER_GROUP,
+        WORKER_ID,
+        KAFKA_DRIFT_COMPLETE_TOPIC,
+    )
     try:
         async for msg in consumer:
             logger.info("Concept drift trigger received: %s", json.dumps(msg.value, indent=2))
