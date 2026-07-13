@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -15,6 +16,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/jobs/xai", tags=["xai-jobs"])
 
 _index_ready = False
+
+# If heartbeat is newer than this, another worker is assumed active.
+HEARTBEAT_FRESH_SECONDS = int(os.getenv("XAI_JOB_LOCK_HEARTBEAT_FRESH_SECONDS", "120"))
+# Steal an in_progress lock when last heartbeat/claim is older than this.
+STALE_LOCK_SECONDS = int(os.getenv("XAI_JOB_LOCK_STALE_SECONDS", "300"))
 
 
 def _normalize_report_type(report_type: Optional[str]) -> str:
@@ -48,6 +54,33 @@ def build_xai_job_key(
     ])
 
 
+def _parse_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return None
+
+
+def _lock_age_seconds(doc: dict, now: datetime) -> float:
+    ref = _parse_iso(doc.get("last_heartbeat_at")) or _parse_iso(doc.get("claimed_at"))
+    if ref is None:
+        return float("inf")
+    return max(0.0, (now - ref).total_seconds())
+
+
+def _is_lock_fresh(doc: dict, now: datetime) -> bool:
+    return _lock_age_seconds(doc, now) < HEARTBEAT_FRESH_SECONDS
+
+
+def _is_lock_stale(doc: dict, now: datetime) -> bool:
+    return _lock_age_seconds(doc, now) >= STALE_LOCK_SECONDS
+
+
 async def _ensure_indexes() -> None:
     global _index_ready
     if _index_ready:
@@ -55,7 +88,6 @@ async def _ensure_indexes() -> None:
     db = get_database()
     col = db.xai_job_locks
     await col.create_index("task_id", unique=True)
-    # Backfill legacy rows so a unique job_key index can be created safely.
     await col.update_many(
         {"$or": [{"job_key": {"$exists": False}}, {"job_key": None}]},
         [{"$set": {"job_key": {"$concat": ["legacy:", "$task_id"]}}}],
@@ -102,6 +134,11 @@ class XaiJobClaimResponse(BaseModel):
     job_key: str
     claimed: bool
     claimed_at: str
+    reclaimed: bool = False
+
+
+class XaiJobTaskRequest(BaseModel):
+    task_id: str
 
 
 @router.post("/claim", response_model=XaiJobClaimResponse)
@@ -109,15 +146,14 @@ async def claim_xai_job(payload: XaiJobClaimRequest) -> XaiJobClaimResponse:
     """
     Idempotency guard for XAI triggers.
 
-    With multiple XAI consumer replicas, at-least-once delivery can cause duplicates.
-    This endpoint ensures only ONE worker proceeds for a given task_id OR job_key.
-
-    job_key dedupes orchestrator retries that reuse the same dataset/model/report_type
-    but assign a new task_id (common when model and data are separate triggers).
+    Stale in_progress locks (no heartbeat within STALE_LOCK_SECONDS) can be
+    reclaimed so a redelivered Kafka message is not stuck on "already claimed".
     """
     await _ensure_indexes()
     db = get_database()
-    now = datetime.now(tz=timezone.utc).isoformat()
+    col = db.xai_job_locks
+    now_dt = datetime.now(tz=timezone.utc)
+    now = now_dt.isoformat()
     resolved_job_key = build_xai_job_key(
         user_id=payload.user_id,
         dataset_id=payload.dataset_id,
@@ -138,31 +174,110 @@ async def claim_xai_job(payload: XaiJobClaimRequest) -> XaiJobClaimResponse:
         "model_version": payload.model_version,
         "report_type": _normalize_report_type(payload.report_type),
         "level": payload.level or "beginner",
+        "status": "in_progress",
         "claimed_at": now,
+        "last_heartbeat_at": now,
     }
     try:
-        await db.xai_job_locks.insert_one(doc)
+        await col.insert_one(doc)
         return XaiJobClaimResponse(
             task_id=payload.task_id,
             job_key=resolved_job_key,
             claimed=True,
             claimed_at=now,
+            reclaimed=False,
         )
     except DuplicateKeyError:
-        existing = await db.xai_job_locks.find_one(
+        existing = await col.find_one(
             {"$or": [{"task_id": payload.task_id}, {"job_key": resolved_job_key}]},
-            projection={"task_id": 1, "job_key": 1},
         )
-        detail = "task_id or job_key already claimed"
-        if existing:
-            if existing.get("task_id") == payload.task_id:
-                detail = "task_id already claimed"
-            elif existing.get("job_key") == resolved_job_key:
-                detail = "job_key already claimed"
-        raise HTTPException(status_code=409, detail=detail)
+        if not existing:
+            raise HTTPException(status_code=409, detail="task_id or job_key already claimed")
+
+        if existing.get("status") == "completed":
+            raise HTTPException(status_code=409, detail="task_id already completed")
+
+        fresh = _is_lock_fresh(existing, now_dt)
+        stale = _is_lock_stale(existing, now_dt)
+
+        if existing.get("task_id") == payload.task_id:
+            if fresh:
+                raise HTTPException(status_code=409, detail="task_id in progress")
+            await col.update_one(
+                {"_id": existing["_id"]},
+                {"$set": {
+                    "status": "in_progress",
+                    "last_heartbeat_at": now,
+                    "claimed_at": now,
+                }},
+            )
+            logger.warning(
+                "Reclaimed stale task_id lock: task_id=%s age=%.0fs",
+                payload.task_id,
+                _lock_age_seconds(existing, now_dt),
+            )
+            return XaiJobClaimResponse(
+                task_id=payload.task_id,
+                job_key=resolved_job_key,
+                claimed=True,
+                claimed_at=now,
+                reclaimed=True,
+            )
+
+        if existing.get("job_key") == resolved_job_key:
+            if fresh:
+                raise HTTPException(status_code=409, detail="job_key already claimed")
+            if not stale:
+                raise HTTPException(status_code=409, detail="job_key already claimed")
+            await col.delete_one({"_id": existing["_id"]})
+            try:
+                await col.insert_one(doc)
+            except DuplicateKeyError:
+                raise HTTPException(status_code=409, detail="job_key already claimed")
+            logger.warning(
+                "Reclaimed stale job_key lock: job_key=%s old_task_id=%s new_task_id=%s",
+                resolved_job_key,
+                existing.get("task_id"),
+                payload.task_id,
+            )
+            return XaiJobClaimResponse(
+                task_id=payload.task_id,
+                job_key=resolved_job_key,
+                claimed=True,
+                claimed_at=now,
+                reclaimed=True,
+            )
+
+        raise HTTPException(status_code=409, detail="task_id or job_key already claimed")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Failed to claim xai job: %s", e, exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to claim xai job: {type(e).__name__}: {e}",
         )
+
+
+@router.post("/heartbeat")
+async def heartbeat_xai_job(payload: XaiJobTaskRequest) -> dict:
+    """Extend an in_progress lock while a long XAI job runs."""
+    await _ensure_indexes()
+    col = get_database().xai_job_locks
+    now = datetime.now(tz=timezone.utc).isoformat()
+    result = await col.update_one(
+        {"task_id": payload.task_id, "status": "in_progress"},
+        {"$set": {"last_heartbeat_at": now}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="lock not found or not in progress")
+    return {"task_id": payload.task_id, "last_heartbeat_at": now}
+
+
+@router.post("/release")
+async def release_xai_job(payload: XaiJobTaskRequest) -> dict:
+    """Release a lock after success/failure so retries and re-runs can claim again."""
+    await _ensure_indexes()
+    col = get_database().xai_job_locks
+    result = await col.delete_one({"task_id": payload.task_id})
+    return {"task_id": payload.task_id, "released": result.deleted_count > 0}

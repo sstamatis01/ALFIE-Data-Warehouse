@@ -73,7 +73,9 @@ Same format as AutoDW:
 ## 8. Parallel Kafka consumers (optional)
 
 - [ ] AutoDW API includes `POST /jobs/xai/claim` (Data Warehouse repo)
-- [ ] Consumer sends `job_key` (or `report_type` + `level` so API builds it); skip on HTTP 409
+- [ ] Consumer sends `job_key` (or `report_type` + `level` so API builds it); skip on 409 in progress
+- [ ] Consumer calls `POST /jobs/xai/heartbeat` during long jobs (~60s interval)
+- [ ] Consumer calls `POST /jobs/xai/release` on success/failure
 - [ ] `docker-compose.replicas.yaml` — 3× `kafka-xai-consumer-*`, same `KAFKA_CONSUMER_GROUP`
 - [ ] Topic `xai-trigger-events` has ≥3 partitions
 - [ ] Flask explainability services remain single-instance (consumer only scales)
