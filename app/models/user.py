@@ -55,7 +55,7 @@ class UserResponse(BaseModel):
     user_id: str
     username: str
     email: EmailStr
-    full_name: Optional[str]
+    full_name: Optional[str] = None
     is_active: bool
     is_admin: bool
     created_at: datetime

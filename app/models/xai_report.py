@@ -62,7 +62,7 @@ class XAIReportResponse(BaseModel):
     level: ExpertiseLevel
     file_path: str
     file_size: int
-    file_hash: Optional[str]
+    file_hash: Optional[str] = None
     custom_metadata: Dict[str, Any]
     created_at: datetime
     updated_at: datetime

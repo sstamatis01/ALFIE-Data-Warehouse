@@ -108,16 +108,16 @@ class DatasetResponse(BaseModel):
     dataset_id: str
     user_id: str
     name: str
-    description: Optional[str]
+    description: Optional[str] = None
     version: str
     file_type: str
     file_size: int
     original_filename: str
     files: Optional[List[DatasetFile]] = None
     is_folder: bool = False
-    columns: Optional[List[str]]
-    row_count: Optional[int]
-    data_types: Optional[Dict[str, str]]
+    columns: Optional[List[str]] = None
+    row_count: Optional[int] = None
+    data_types: Optional[Dict[str, str]] = None
     tags: List[str]
     custom_metadata: Dict[str, Any]
     is_public: bool = False
@@ -125,4 +125,4 @@ class DatasetResponse(BaseModel):
     public_link: Optional[PublicDatasetLink] = None
     created_at: datetime
     updated_at: datetime
-    file_hash: Optional[str]
+    file_hash: Optional[str] = None

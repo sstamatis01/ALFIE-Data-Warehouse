@@ -216,25 +216,25 @@ class ModelResponse(BaseModel):
     model_id: str
     user_id: str
     name: str
-    description: Optional[str]
+    description: Optional[str] = None
     version: str
     framework: ModelFramework
     model_type: Annotated[ModelType, BeforeValidator(_normalize_model_type_slug)]
-    algorithm: Optional[str]
+    algorithm: Optional[str] = None
     files: List[ModelFile]
-    primary_file_path: Optional[str]
-    input_shape: Optional[List[int]]
-    output_shape: Optional[List[int]]
-    num_parameters: Optional[int]
-    model_size_mb: Optional[float]
-    training_dataset: Optional[str]
-    training_accuracy: Optional[float]
-    validation_accuracy: Optional[float]
-    test_accuracy: Optional[float]
-    training_loss: Optional[float]
-    python_version: Optional[str]
+    primary_file_path: Optional[str] = None
+    input_shape: Optional[List[int]] = None
+    output_shape: Optional[List[int]] = None
+    num_parameters: Optional[int] = None
+    model_size_mb: Optional[float] = None
+    training_dataset: Optional[str] = None
+    training_accuracy: Optional[float] = None
+    validation_accuracy: Optional[float] = None
+    test_accuracy: Optional[float] = None
+    training_loss: Optional[float] = None
+    python_version: Optional[str] = None
     dependencies: List[str]
-    hardware_requirements: Optional[str]
+    hardware_requirements: Optional[str] = None
     tags: List[str]
     custom_metadata: Dict[str, Any]
     created_at: datetime

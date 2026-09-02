@@ -148,12 +148,12 @@ class DocumentUpdate(BaseModel):
 class DocumentResponse(BaseModel):
     document_id: int
     title: str
-    description: Optional[str]
-    file_path: Optional[str]
-    file_size: Optional[int]
-    content_type: Optional[str]
+    description: Optional[str] = None
+    file_path: Optional[str] = None
+    file_size: Optional[int] = None
+    content_type: Optional[str] = None
     expert_id: int
-    theme_id: Optional[int]
+    theme_id: Optional[int] = None
     created_at: datetime
 
 
@@ -229,7 +229,7 @@ class AnswerResponse(BaseModel):
     created_at: datetime
     question_id: int
     expert_id: int
-    parent_id: Optional[int]
+    parent_id: Optional[int] = None
 
 
 # Vote Models
