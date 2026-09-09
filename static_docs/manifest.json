@@ -1,0 +1,18 @@
+{
+  "documents": [
+    {
+      "id": "altai",
+      "title": "Assessment List for Trustworthy Artificial Intelligence (ALTAI)",
+      "description": "EU High-Level Expert Group on AI — ALTAI self-assessment list for trustworthy AI.",
+      "filename": "altai.pdf",
+      "content_type": "application/pdf"
+    },
+    {
+      "id": "ai-ethics",
+      "title": "Ethics by Design and Ethics of Use Approaches for Artificial Intelligence",
+      "description": "European Commission guidance on ethics by design and ethics of use for AI.",
+      "filename": "ai-ethics.pdf",
+      "content_type": "application/pdf"
+    }
+  ]
+}

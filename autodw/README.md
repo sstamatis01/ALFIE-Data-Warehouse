@@ -18,6 +18,7 @@ Self-contained AutoDW for **partner / local integration**. Not for `alfie.iti.gr
 | `../graphdb_init/graphdb_backup_*.tar.gz` | GraphDB triple-store on first start | No — mount from host |
 | `../graphdb_init/entrypoint.sh` | Backup restore entrypoint | No — mount from host |
 | `../etd_hub_init/etd_hub_seed.xlsx` | ETD-Hub forum data (optional mount) | Yes in `autodw` **≥ 1.0.3** |
+| `../static_docs/*.pdf` | Project reference PDFs (`altai`, `ai-ethics`) | Yes when image includes `static_docs/` |
 
 Clone the **full repository** (not only `autodw/`) so GraphDB backup restore works.
 
@@ -127,6 +128,18 @@ Full list: `autodw/.env.example`.
 - Seed file: `etd_hub_init/etd_hub_seed.xlsx` (production export format)
 - Update for next release: replace file, rebuild/push `autodw` — see [etd_hub_init/README.md](../etd_hub_init/README.md)
 - Manual re-import: `POST /etd-hub/import/upload-excel`
+
+## Bundled static documents (PDFs)
+
+Reference PDFs for partner services (ALTAI checklist, AI ethics guidance):
+
+```bash
+curl -s http://localhost:8000/static-docs
+curl -o altai.pdf http://localhost:8000/static-docs/altai/download
+curl -o ai-ethics.pdf http://localhost:8000/static-docs/ai-ethics/download
+```
+
+See [static_docs/README.md](../static_docs/README.md).
 
 ## GraphDB
 

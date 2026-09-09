@@ -37,6 +37,7 @@ from .api import automl_jobs
 from .api import bias_jobs
 from .api import xai_jobs
 from .api import concept_drift_jobs
+from .api import static_docs
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -229,6 +230,7 @@ inner_app.include_router(etd_hub_import.router)
 inner_app.include_router(graphdb.router)
 inner_app.include_router(user_files.router)
 inner_app.include_router(gdpr.router)
+inner_app.include_router(static_docs.router)
 
 
 @inner_app.get("/")

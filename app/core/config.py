@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     # Kafka Configuration
     # Default to localhost for local development; deployment should override via env.
     kafka_bootstrap_servers: str = "localhost:9092"
+    # Used by compose for Kafka advertised listeners; accepted here so root .env can be shared
+    kafka_advertised_host: Optional[str] = None
     kafka_dataset_topic: str = "dataset-events"
     kafka_client_id: str = "data-warehouse-api"
     kafka_bias_topic: str = "bias-detection-complete-events"
@@ -37,6 +39,9 @@ class Settings(BaseSettings):
     kafka_xai_trigger_topic: str = "xai-trigger-events"
     kafka_concept_drift_trigger_topic: str = "concept-drift-trigger-events"
     kafka_concept_drift_topic: str = "concept-drift-complete-events"
+
+    # Bundled static project documents (PDFs in image under /app/static_docs)
+    static_docs_dir: Optional[str] = None
 
     class Config:
         env_file = ".env"
