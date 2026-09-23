@@ -23,6 +23,17 @@ router = APIRouter(prefix="/datasets", tags=["datasets"])
 # Public dataset catalog (summer school)
 PUBLIC_USER_ID = "public"
 
+# Appended to auto-created train/test/drift split versions so the UI distinguishes them from v1.
+SPLIT_DATASET_NAME_SUFFIX = " (Splits 70/15/15)"
+
+
+def _split_dataset_display_name(original_name: str) -> str:
+    """UI-facing name for auto-created split versions (keeps v1 name + split ratios)."""
+    base = (original_name or "").strip() or "dataset"
+    if base.endswith(SPLIT_DATASET_NAME_SUFFIX):
+        return base
+    return f"{base}{SPLIT_DATASET_NAME_SUFFIX}"
+
 
 def _to_dataset_response(dataset: DatasetMetadata) -> DatasetResponse:
     return DatasetResponse(
@@ -222,7 +233,7 @@ async def _run_folder_upload_job(
             dataset_metadata_v2 = DatasetMetadata(
                 dataset_id=dataset_id,
                 user_id=user_id,
-                name=name,
+                name=_split_dataset_display_name(name),
                 description=description,
                 version=v2,
                 file_type=", ".join(file_types_v2),
@@ -464,7 +475,7 @@ async def upload_dataset(
             dataset_create_v2 = DatasetCreate(
                 dataset_id=dataset_id,
                 user_id=user_id,
-                name=name,
+                name=_split_dataset_display_name(name),
                 description=description,
                 version=v2,
                 tags=tag_list
@@ -633,7 +644,7 @@ async def upload_public_dataset(
         dataset_create_v2 = DatasetCreate(
             dataset_id=dataset_id,
             user_id=PUBLIC_USER_ID,
-            name=name,
+            name=_split_dataset_display_name(name),
             description=description,
             version=v2,
             tags=tag_list,
@@ -756,7 +767,7 @@ async def import_public_dataset_to_user(
             dataset_create_v2 = DatasetCreate(
                 dataset_id=desired_id,
                 user_id=user_id,
-                name=src_v2.name,
+                name=_split_dataset_display_name(src_v1.name),
                 description=src_v2.description,
                 version=dst_v2,
                 tags=v2_meta.get("tags", []),

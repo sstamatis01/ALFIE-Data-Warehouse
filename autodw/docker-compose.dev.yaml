@@ -1,0 +1,12 @@
+# Local development override: mount API source so code changes apply without rebuilding the image.
+#
+# Usage (from repo root):
+#   docker compose -f autodw/docker-compose.yaml -f autodw/docker-compose.dev.yaml --env-file autodw/.env up -d api
+#   docker compose -f autodw/docker-compose.yaml -f autodw/docker-compose.dev.yaml --env-file autodw/.env restart api
+#
+# Rebuild is still required when requirements.txt or Dockerfile changes.
+
+services:
+  api:
+    volumes:
+      - ../app:/app/app:ro
