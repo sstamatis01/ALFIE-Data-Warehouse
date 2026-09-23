@@ -41,7 +41,8 @@ services:
       - autodw-network
 
   minio:
-    image: minio/minio:latest
+    # Docker Hub minio/minio was removed (2026); use Quay mirror
+    image: quay.io/minio/minio:latest
     container_name: autodw-minio
     restart: unless-stopped
     ports:

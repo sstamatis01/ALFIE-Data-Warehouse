@@ -18,7 +18,8 @@ services:
 
   # MinIO for file storage
   minio:
-    image: minio/minio:latest
+    # Docker Hub minio/minio was removed (2026); use Quay mirror
+    image: quay.io/minio/minio:latest
     container_name: data-warehouse-minio
     restart: unless-stopped
     ports:
