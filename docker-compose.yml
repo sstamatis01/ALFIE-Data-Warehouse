@@ -18,8 +18,8 @@ services:
 
   # MinIO for file storage
   minio:
-    # Docker Hub minio/minio was removed (2026); use Quay mirror
-    image: quay.io/minio/minio:latest
+    # MinIO Community images removed from Docker Hub; Chainguard rebuilds from source
+    image: cgr.dev/chainguard/minio:latest
     container_name: data-warehouse-minio
     restart: unless-stopped
     ports:

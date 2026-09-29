@@ -40,7 +40,7 @@ Clone the **full repository** (not only `autodw/`) so GraphDB backup restore wor
 | Image | Source |
 |-------|--------|
 | `autodw` (API + workers) | GitLab `gitlab.catalink.eu:5050/external/alfie_eu/alfie/autodw` |
-| MongoDB, MinIO, Kafka, GraphDB, Zookeeper | Docker Hub |
+| MongoDB, MinIO, Kafka, GraphDB, Zookeeper | Public registries (MinIO via Chainguard; others typically Docker Hub) |
 
 Same `autodw` image runs as `api`, `bias-detector`, and `automl-consumer` with different commands.
 

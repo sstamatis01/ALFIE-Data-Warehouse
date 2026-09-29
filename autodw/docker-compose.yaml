@@ -1,7 +1,8 @@
 # AutoDW localized stack (localhost) — one compose file, multiple containers.
 #
 # What gets pulled from GitLab: only the `autodw` app image (api + kafka workers).
-# MongoDB, MinIO, Kafka, GraphDB, Zookeeper: public images from Docker Hub.
+# MongoDB, Kafka, GraphDB, Zookeeper: public images from Docker Hub.
+# MinIO: Chainguard (cgr.dev/chainguard/minio) — Docker Hub minio/minio was removed.
 #
 # Setup (from repo root):
 #   cp autodw/.env.example autodw/.env
@@ -41,8 +42,8 @@ services:
       - autodw-network
 
   minio:
-    # Docker Hub minio/minio was removed (2026); use Quay mirror
-    image: quay.io/minio/minio:latest
+    # MinIO Community images removed from Docker Hub; Chainguard rebuilds from source
+    image: cgr.dev/chainguard/minio:latest
     container_name: autodw-minio
     restart: unless-stopped
     ports:
