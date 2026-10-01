@@ -30,6 +30,7 @@ COPY static_docs/ ./static_docs/
 COPY scripts/init_graphdb_config.py scripts/init_etd_hub_from_excel.py ./scripts/
 COPY kafka_bias_detector_consumer_example.py ./
 COPY kafka_automl_consumer_example_v3.py ./
+COPY kafka_automl_consumer_example_v5.py ./
 
 # Note: .env is handled via env_file in docker-compose.yml, so it's not required at build time
 # If .env exists, it will be copied, but the build won't fail if it doesn't exist

@@ -25,10 +25,12 @@ services:
       API_BASE: http://api:8000
       DW_HOST: api
       DW_PORT: 8000
+      AUTOML_ENGINE_HOST: host.docker.internal
+      AUTOML_ENGINE_PORT: "8001"
       TABULAR_AUTOML_HOST: host.docker.internal
-      TABULAR_AUTOML_PORT: 8001
+      TABULAR_AUTOML_PORT: "8001"
       VISION_AUTOML_HOST: host.docker.internal
-      VISION_AUTOML_PORT: 8002
+      VISION_AUTOML_PORT: "8001"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -39,20 +41,19 @@ services:
     networks:
       - data-warehouse-network
     command: >
-      sh -c "sleep 5 && python kafka_automl_consumer_example_v3.py"
+      sh -c "sleep 5 && python kafka_automl_consumer_example_v5.py"
     volumes:
       - ./app:/app/app:ro
-      - ./kafka_automl_consumer_example_v3.py:/app/kafka_automl_consumer_example_v3.py:ro
+      - ./kafka_automl_consumer_example_v5.py:/app/kafka_automl_consumer_example_v5.py:ro
 
   automl-consumer-2:
     extends:
       service: automl-consumer-1
     command: >
-      sh -c "sleep 6 && python kafka_automl_consumer_example_v3.py"
+      sh -c "sleep 6 && python kafka_automl_consumer_example_v5.py"
 
   automl-consumer-3:
     extends:
       service: automl-consumer-1
     command: >
-      sh -c "sleep 7 && python kafka_automl_consumer_example_v3.py"
-
+      sh -c "sleep 7 && python kafka_automl_consumer_example_v5.py"
