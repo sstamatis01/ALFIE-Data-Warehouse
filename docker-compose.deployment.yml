@@ -20,10 +20,34 @@ services:
       API_BASE: http://api:8000
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
 
+  # AutoML workers must use kafka_automl_consumer_example_v5.py (see base compose)
+  # and the unified engine paths: /automl/tabular/... and /automl/vision/...
   automl-consumer:
     environment:
       API_BASE: http://api:8000
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      AUTOML_ENGINE_HOST: host.docker.internal
+      AUTOML_ENGINE_PORT: "8001"
+      TABULAR_AUTOML_HOST: host.docker.internal
+      TABULAR_AUTOML_PORT: "8001"
+      VISION_AUTOML_HOST: host.docker.internal
+      VISION_AUTOML_PORT: "8001"
+
+  # Replica workers (docker-compose.automl-consumer-replicas.yml) — same unified engine.
+  automl-consumer-1: &automl_deploy_env
+    environment:
+      API_BASE: http://api:8000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      AUTOML_ENGINE_HOST: host.docker.internal
+      AUTOML_ENGINE_PORT: "8001"
+      TABULAR_AUTOML_HOST: host.docker.internal
+      TABULAR_AUTOML_PORT: "8001"
+      VISION_AUTOML_HOST: host.docker.internal
+      VISION_AUTOML_PORT: "8001"
+  automl-consumer-2:
+    <<: *automl_deploy_env
+  automl-consumer-3:
+    <<: *automl_deploy_env
 
   # If you later run xai-consumer in this stack, keep it consistent too.
   # xai-consumer:
