@@ -149,6 +149,17 @@ class AIModelMetadata(BaseModel):
     # Additional metadata
     tags: List[str] = Field(default_factory=list, description="Tags for categorization")
     custom_metadata: Dict[str, Any] = Field(default_factory=dict, description="Custom metadata fields")
+
+    # AutoML deployment guide (markdown). Captured from results ZIP / folder at upload.
+    deployment_instructions: Optional[str] = Field(
+        None, description="Markdown deployment/loading instructions for this model"
+    )
+    deployment_instructions_filename: Optional[str] = Field(
+        None, description="Source filename, e.g. tabular_deployment_instructions.md"
+    )
+    deployment_instructions_modality: Optional[str] = Field(
+        None, description="tabular | vision | unknown"
+    )
     
     # Timestamps
     created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
@@ -237,10 +248,30 @@ class ModelResponse(BaseModel):
     hardware_requirements: Optional[str] = None
     tags: List[str]
     custom_metadata: Dict[str, Any]
+    deployment_instructions: Optional[str] = None
+    deployment_instructions_filename: Optional[str] = None
+    deployment_instructions_modality: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     is_active: bool
     is_production_ready: bool
+
+    model_config = ConfigDict(protected_namespaces=())
+
+
+class DeploymentInstructionsResponse(BaseModel):
+    """Markdown deployment guide for Agentic Core / UI."""
+
+    user_id: str
+    model_id: str
+    version: str
+    instructions: str
+    modality: Optional[str] = None
+    filename: Optional[str] = None
+    source: str = Field(
+        ...,
+        description="Where text was resolved from: metadata | minio | zip | bundled",
+    )
 
     model_config = ConfigDict(protected_namespaces=())
 

@@ -9,6 +9,7 @@ from fastapi import UploadFile, HTTPException
 from ..core.minio_client import minio_client
 from ..models.ai_model import AIModelMetadata, ModelFile, ModelFramework, ModelType
 from ..core.database import get_database
+from .deployment_instructions import extract_from_text_file, extract_from_zip_bytes
 import logging
 
 logger = logging.getLogger(__name__)
@@ -67,17 +68,20 @@ class AIModelService:
         version: str = "v1",
         is_primary: bool = False,
         description: Optional[str] = None
-    ) -> Tuple[str, ModelFile]:
+    ) -> Tuple[str, ModelFile, Optional[Dict[str, str]]]:
         """
         Upload a single model file to MinIO
         
         Returns:
-            Tuple of (file_path, ModelFile object)
+            Tuple of (file_path, ModelFile object, optional deployment-instructions dict)
         """
         try:
             # Read file data
             file_data = await file.read()
             file_size = len(file_data)
+            deployment_info = self.extract_deployment_instructions_from_upload(
+                file.filename, file_data
+            )
             
             # Generate file path
             file_path = self.generate_model_path(user_id, model_id, version, file.filename)
@@ -108,7 +112,7 @@ class AIModelService:
                 description=description
             )
             
-            return file_path, model_file
+            return file_path, model_file, deployment_info
             
         except S3Error as e:
             logger.error(f"MinIO error during model file upload: {e}")
@@ -124,16 +128,17 @@ class AIModelService:
         model_id: str, 
         version: str = "v1",
         preserve_structure: bool = True
-    ) -> List[ModelFile]:
+    ) -> Tuple[List[ModelFile], Optional[Dict[str, str]]]:
         """
         Upload a folder of model files (as zip) to MinIO
         
         Returns:
-            List of ModelFile objects
+            (list of ModelFile objects, optional deployment-instructions dict)
         """
         try:
             # Read zip file data
             zip_data = await zip_file.read()
+            deployment_info = extract_from_zip_bytes(zip_data)
             
             model_files = []
             
@@ -158,6 +163,11 @@ class AIModelService:
                         # Read file data
                         with open(file_path, 'rb') as f:
                             file_data = f.read()
+
+                        if deployment_info is None:
+                            maybe = extract_from_text_file(file, file_data)
+                            if maybe:
+                                deployment_info = maybe
                         
                         file_size = len(file_data)
                         
@@ -198,7 +208,7 @@ class AIModelService:
                         
                         logger.info(f"Model file uploaded from folder: {minio_path}")
             
-            return model_files
+            return model_files, deployment_info
             
         except zipfile.BadZipFile:
             raise HTTPException(status_code=400, detail="Invalid zip file")
@@ -208,6 +218,19 @@ class AIModelService:
         except Exception as e:
             logger.error(f"Unexpected error during model folder upload: {e}")
             raise HTTPException(status_code=500, detail=f"Model folder upload failed: {str(e)}")
+
+    def extract_deployment_instructions_from_upload(
+        self, filename: Optional[str], file_data: bytes
+    ) -> Optional[Dict[str, str]]:
+        """Peek a single uploaded file (``.md`` or ``.zip``) for deployment instructions."""
+        if not filename:
+            return None
+        from_md = extract_from_text_file(filename, file_data)
+        if from_md:
+            return from_md
+        if filename.lower().endswith(".zip"):
+            return extract_from_zip_bytes(file_data)
+        return None
 
     def _is_primary_model_file(self, filename: str) -> bool:
         """Determine if a file should be considered the primary model file"""

@@ -6,16 +6,32 @@ import logging
 from datetime import datetime, timezone
 
 from ..models.ai_model import (
-    AIModelMetadata, ModelCreate, ModelUpdate, ModelResponse, 
-    ModelFile, ModelFramework, ModelType
+    AIModelMetadata, ModelCreate, ModelUpdate, ModelResponse,
+    ModelFile, ModelFramework, ModelType, DeploymentInstructionsResponse,
 )
 from ..services.ai_model_service import ai_model_service
 from ..services.kafka_service import kafka_producer_service
 from ..services.metadata_service import metadata_service
+from ..services.deployment_instructions import (
+    bundled_fallback,
+    extract_from_text_file,
+    is_deployment_instructions_filename,
+    modality_from_model_type,
+)
 from ..core.database import get_database
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ai-models", tags=["AI Models"])
+
+
+def _deployment_fields(info: Optional[dict]) -> dict:
+    if not info:
+        return {}
+    return {
+        "deployment_instructions": info.get("instructions"),
+        "deployment_instructions_filename": info.get("filename"),
+        "deployment_instructions_modality": info.get("modality"),
+    }
 
 
 async def _get_dataset_folder_info(user_id: str, dataset_id: str) -> tuple:
@@ -124,14 +140,16 @@ async def upload_single_model_file(
         version = await _get_next_model_version(user_id, model_id)
         logger.info(f"Auto-detected version: {version} for model {model_id}")
         
-        # Upload file to MinIO
-        file_path, model_file = await ai_model_service.upload_model_file(
+        # Upload file to MinIO (also peeks ZIP/.md for AutoML deployment instructions)
+        file_path, model_file, deployment_info = await ai_model_service.upload_model_file(
             file=file,
             user_id=user_id,
             model_id=model_id,
             version=version,
             is_primary=is_primary
         )
+        if deployment_info and not deployment_info.get("modality"):
+            deployment_info["modality"] = modality_from_model_type(model_type)
         
         # Parse tags
         tag_list = []
@@ -169,13 +187,20 @@ async def upload_single_model_file(
             training_loss=training_loss,
             python_version=python_version,
             hardware_requirements=hardware_requirements,
-            tags=tag_list
+            tags=tag_list,
+            **_deployment_fields(deployment_info),
         )
         
         # Save to MongoDB
         result = await collection.insert_one(model_metadata.dict(by_alias=True))
         
         logger.info(f"AI model uploaded successfully: {model_id} by {user_id}")
+        if deployment_info:
+            logger.info(
+                "Cached deployment instructions from %s (%s)",
+                deployment_info.get("filename"),
+                deployment_info.get("modality"),
+            )
         
         # Return the created model
         created_model = await collection.find_one({"_id": result.inserted_id})
@@ -302,8 +327,8 @@ async def upload_model_folder(
         version = await _get_next_model_version(user_id, model_id)
         logger.info(f"Auto-detected version: {version} for model {model_id}")
         
-        # Upload folder to MinIO
-        model_files = await ai_model_service.upload_model_folder(
+        # Upload folder to MinIO (captures tabular_/vision_deployment_instructions.md)
+        model_files, deployment_info = await ai_model_service.upload_model_folder(
             zip_file=zip_file,
             user_id=user_id,
             model_id=model_id,
@@ -313,6 +338,9 @@ async def upload_model_folder(
         
         if not model_files:
             raise HTTPException(status_code=400, detail="No valid model files found in the uploaded folder")
+
+        if deployment_info and not deployment_info.get("modality"):
+            deployment_info["modality"] = modality_from_model_type(model_type)
         
         # Detect primary file
         primary_file = await ai_model_service.detect_primary_file(model_files)
@@ -349,13 +377,20 @@ async def upload_model_folder(
             training_loss=training_loss,
             python_version=python_version,
             hardware_requirements=hardware_requirements,
-            tags=tag_list
+            tags=tag_list,
+            **_deployment_fields(deployment_info),
         )
         
         # Save to MongoDB
         result = await collection.insert_one(model_metadata.dict(by_alias=True))
         
         logger.info(f"AI model folder uploaded successfully: {model_id} by {user_id}")
+        if deployment_info:
+            logger.info(
+                "Cached deployment instructions from %s (%s)",
+                deployment_info.get("filename"),
+                deployment_info.get("modality"),
+            )
         
         # Return the created model
         created_model = await collection.find_one({"_id": result.inserted_id})
@@ -485,6 +520,138 @@ async def get_model(user_id: str, model_id: str, version: str = Query("v1")):
     except Exception as e:
         logger.error(f"Error retrieving AI model: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve AI model")
+
+
+@router.get(
+    "/{user_id}/{model_id}/deployment-instructions",
+    response_model=DeploymentInstructionsResponse,
+)
+async def get_model_deployment_instructions(
+    user_id: str,
+    model_id: str,
+    version: Optional[str] = Query(
+        None,
+        description="Model version (e.g. v1). Defaults to latest for this model_id.",
+    ),
+):
+    """
+    Return markdown deployment/loading instructions for a stored model.
+
+    Used by Agentic Core to show users how to load/deploy AutoML artifacts.
+    Does **not** call the AutoML engine at request time (it may be host-local only).
+
+    Resolution order:
+      1. Cached text on the model Mongo document (set at upload from ZIP)
+      2. ``*_deployment_instructions.md`` file already in MinIO for this version
+      3. Bundled AutoDW fallback under ``static_docs/deployment/`` by modality
+    """
+    try:
+        db = get_database()
+        collection = db.ai_models
+
+        if version:
+            model = await collection.find_one(
+                {"user_id": user_id, "model_id": model_id, "version": version}
+            )
+        else:
+            model = await collection.find_one(
+                {"user_id": user_id, "model_id": model_id},
+                sort=[("created_at", -1)],
+            )
+
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        resolved_version = model.get("version") or version or "v1"
+        modality = model.get("deployment_instructions_modality") or modality_from_model_type(
+            model.get("model_type")
+        )
+
+        # 1) Mongo cache
+        cached = (model.get("deployment_instructions") or "").strip()
+        if cached:
+            return DeploymentInstructionsResponse(
+                user_id=user_id,
+                model_id=model_id,
+                version=resolved_version,
+                instructions=cached,
+                modality=modality,
+                filename=model.get("deployment_instructions_filename"),
+                source="metadata",
+            )
+
+        # 2) MinIO file listed on the model
+        files = model.get("files") or []
+        found = None
+        for f in files:
+            filename = f.get("filename") if isinstance(f, dict) else getattr(f, "filename", None)
+            file_path = f.get("file_path") if isinstance(f, dict) else getattr(f, "file_path", None)
+            if not filename or not file_path:
+                continue
+            if not is_deployment_instructions_filename(filename):
+                continue
+            try:
+                raw = await ai_model_service.download_model_file(file_path)
+                found = extract_from_text_file(filename, raw)
+                if found:
+                    found["source"] = "minio"
+                    break
+            except Exception as e:
+                logger.warning("Failed reading %s for deployment instructions: %s", file_path, e)
+        if found:
+            # Lazy backfill so subsequent calls hit Mongo
+            try:
+                await collection.update_one(
+                    {"user_id": user_id, "model_id": model_id, "version": resolved_version},
+                    {
+                        "$set": {
+                            "deployment_instructions": found["instructions"],
+                            "deployment_instructions_filename": found.get("filename"),
+                            "deployment_instructions_modality": found.get("modality") or modality,
+                            "updated_at": datetime.now(tz=timezone.utc),
+                        }
+                    },
+                )
+            except Exception as e:
+                logger.warning("Could not backfill deployment instructions: %s", e)
+            return DeploymentInstructionsResponse(
+                user_id=user_id,
+                model_id=model_id,
+                version=resolved_version,
+                instructions=found["instructions"],
+                modality=found.get("modality") or modality,
+                filename=found.get("filename"),
+                source="minio",
+            )
+
+        # 3) Bundled static fallback (no AutoML host dependency)
+        bundled = bundled_fallback(modality) or (
+            bundled_fallback("tabular") if modality is None else None
+        )
+        if bundled:
+            return DeploymentInstructionsResponse(
+                user_id=user_id,
+                model_id=model_id,
+                version=resolved_version,
+                instructions=bundled["instructions"],
+                modality=bundled.get("modality") or modality,
+                filename=bundled.get("filename"),
+                source="bundled",
+            )
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No deployment instructions found for this model. "
+                "Expected tabular_deployment_instructions.md or "
+                "vision_deployment_instructions.md in the model artifact."
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving deployment instructions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve deployment instructions")
 
 
 @router.get("/{user_id}", response_model=List[ModelResponse])
