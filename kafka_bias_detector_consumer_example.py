@@ -344,7 +344,17 @@ def claim_task_id(task_id: str, *, user_id: str, dataset_id: str, dataset_versio
 
 
 def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
-    """Build bias/EDA report (target_column, shape, summary stats, missing, duplicates, correlation, distribution, outliers, drift)."""
+    """
+    Build bias/EDA report plus optional ``fairness_profile``.
+
+    Fairness protected attributes (priority):
+      1. meta['protected_attributes'] from Kafka bias-trigger (user / Agentic Core)
+      2. Heuristic regex on column headers (sex/gender, ethnicity, age, …)
+      3. Skip fairness_profile if neither yields usable columns
+
+    When fairness_profile is present, protected columns are removed from
+    categorical_value_counts / unique_values to avoid duplicate UI stats.
+    """
     report: dict = {}
     try:
         if df is not None:
@@ -432,6 +442,35 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
             except Exception as e:
                 logger.warning(f"Error in drift detection: {e}")
                 report["data_drift"] = {"message": f"Drift detection failed: {str(e)}"}
+
+            # Fairness profile (AIF360 / fallback) — shared AutoDW module
+            try:
+                from app.services.fairness_profile import (
+                    build_fairness_profile,
+                    strip_duplicate_categorical_stats,
+                )
+
+                fairness = build_fairness_profile(
+                    df,
+                    target_column=meta.get("target_column_name"),
+                    protected_attributes=meta.get("protected_attributes"),
+                    privileged_groups=meta.get("privileged_groups"),
+                    pos_label=meta.get("pos_label"),
+                )
+                if fairness:
+                    report["fairness_profile"] = fairness
+                    attrs = (fairness.get("config") or {}).get("protected_attributes") or []
+                    strip_duplicate_categorical_stats(report, attrs)
+                    logger.info(
+                        "Fairness profile added (source=%s, attrs=%s)",
+                        (fairness.get("config") or {}).get("source"),
+                        attrs,
+                    )
+                else:
+                    logger.info("Fairness profile skipped (no user/heuristic protected attributes)")
+            except Exception as e:
+                logger.warning("Fairness profile generation failed: %s", e, exc_info=True)
+
             logger.info("Bias report generation complete")
         else:
             report["shape"] = [int(meta.get("row_count", 0)), len(meta.get("columns", []) or [])]
@@ -1068,10 +1107,18 @@ async def run_consumer() -> None:
                 dataset_id = input_data.get("dataset_id")
                 target_column_name = input_data.get("target_column_name")
                 task_type = input_data.get("task_type")
+                # Optional fairness inputs from Agentic Core / user
+                protected_attributes = input_data.get("protected_attributes")
+                privileged_groups = input_data.get("privileged_groups")
+                pos_label = input_data.get("pos_label")
                 
                 logger.info(f"Task ID={task_id}")
                 logger.info(f"Target column={target_column_name}")
                 logger.info(f"Task type={task_type}")
+                if protected_attributes:
+                    logger.info(f"Protected attributes (user/trigger)={protected_attributes}")
+                if privileged_groups:
+                    logger.info(f"Privileged groups (user/trigger)={privileged_groups}")
                 
                 if not user_id or not dataset_id:
                     logger.warning("Missing user_id/dataset_id in event; skipping")
@@ -1110,8 +1157,15 @@ async def run_consumer() -> None:
                     except Exception as e:
                         logger.warning(f"Could not load dataset as CSV or zip: {e}; proceeding with raw bytes")
 
-                # Build bias report (profile); include target_column_name in meta so report has target_column for mitigation
-                meta_for_report = {**meta, "target_column_name": target_column_name}
+                # Build bias report (EDA + optional fairness_profile).
+                # protected_attributes from Kafka override heuristic column detection.
+                meta_for_report = {
+                    **meta,
+                    "target_column_name": target_column_name,
+                    "protected_attributes": protected_attributes,
+                    "privileged_groups": privileged_groups,
+                    "pos_label": pos_label,
+                }
                 bias_report = build_bias_report(df, meta_for_report) if df is not None else {}
 
                 # POST bias report to API WITHOUT task_id initially (so no event is sent)

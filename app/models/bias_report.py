@@ -1,7 +1,30 @@
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from bson import ObjectId
+
+
+class ProtectedAttributeCandidatesRequest(BaseModel):
+    """Column headers (and optional exclude list) for heuristic protected-attribute detection."""
+
+    columns: List[str] = Field(..., description="Dataset / annotation column names")
+    exclude: Optional[List[str]] = Field(
+        None, description="Columns to ignore (e.g. target_column_name)"
+    )
+
+
+class ProtectedAttributeCandidate(BaseModel):
+    column: str
+    category: str
+    pattern: str
+
+
+class ProtectedAttributeCandidatesResponse(BaseModel):
+    candidates: List[ProtectedAttributeCandidate]
+    note: str = (
+        "Heuristic only. Agentic Core may ask the user to confirm or override; "
+        "pass confirmed names as input.protected_attributes on bias-trigger."
+    )
 
 
 class BiasReport(BaseModel):

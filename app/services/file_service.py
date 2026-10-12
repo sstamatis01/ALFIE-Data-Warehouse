@@ -23,6 +23,80 @@ SPLIT_DRIFT_RATIO = 0.15
 SPLIT_SUBFOLDERS = ("train", "test", "drift")
 
 
+def stratified_train_test_drift_indices(
+    labels: List[Any],
+    *,
+    train_ratio: float = SPLIT_TRAIN_RATIO,
+    test_ratio: float = SPLIT_TEST_RATIO,
+    rng: Optional[random.Random] = None,
+) -> Tuple[List[int], List[int], List[int]]:
+    """
+    Stratified 70/15/15 index split that keeps class coverage when possible.
+
+    Guardrails per class size ``n``:
+      - n == 1: train only
+      - n == 2: train + test (cannot cover all three splits)
+      - n >= 3: at least one sample in train, test, and drift; remainder follows ratios
+
+    Without stratification, small classes are often missing from test/drift
+    (e.g. 10 images/class with random 70/15/15).
+    """
+    if not labels:
+        return [], [], []
+
+    rng = rng or random.Random()
+    by_class: Dict[Any, List[int]] = {}
+    for i, label in enumerate(labels):
+        key = label if label is not None and str(label).strip() != "" else "__missing__"
+        by_class.setdefault(key, []).append(i)
+
+    train_idx: List[int] = []
+    test_idx: List[int] = []
+    drift_idx: List[int] = []
+
+    for _label, idxs in by_class.items():
+        idxs = list(idxs)
+        rng.shuffle(idxs)
+        n = len(idxs)
+
+        if n == 1:
+            train_idx.append(idxs[0])
+            continue
+        if n == 2:
+            train_idx.append(idxs[0])
+            test_idx.append(idxs[1])
+            continue
+
+        # n >= 3: guarantee coverage in all three splits
+        n_test = max(1, int(n * test_ratio))
+        n_drift = max(1, int(n * (1.0 - train_ratio - test_ratio)))
+        n_train = n - n_test - n_drift
+        if n_train < 1:
+            # Shrink test/drift until train has at least one sample
+            while n_train < 1 and (n_test > 1 or n_drift > 1):
+                if n_test >= n_drift and n_test > 1:
+                    n_test -= 1
+                elif n_drift > 1:
+                    n_drift -= 1
+                else:
+                    break
+                n_train = n - n_test - n_drift
+        if n_train < 1:
+            n_train = 1
+            rem = n - 1
+            n_test = max(1, rem // 2)
+            n_drift = rem - n_test
+
+        train_idx.extend(idxs[:n_train])
+        test_idx.extend(idxs[n_train : n_train + n_test])
+        drift_idx.extend(idxs[n_train + n_test :])
+
+    rng.shuffle(train_idx)
+    rng.shuffle(test_idx)
+    rng.shuffle(drift_idx)
+    return train_idx, test_idx, drift_idx
+
+
 class FileService:
     def __init__(self):
         self.client = None
@@ -653,14 +727,33 @@ class FileService:
             df = pd.read_excel(BytesIO(file_data))
 
         n = len(df)
-        indices = list(range(n))
-        random.shuffle(indices)
-        n_train = int(n * SPLIT_TRAIN_RATIO)
-        n_test = int(n * SPLIT_TEST_RATIO)
-        n_drift = n - n_train - n_test
-        train_idx = indices[:n_train]
-        test_idx = indices[n_train : n_train + n_test]
-        drift_idx = indices[n_train + n_test :]
+        # Stratify on a label-like column when present so rare classes are not dropped
+        # from test/drift; otherwise fall back to a plain shuffle.
+        label_col = None
+        cols_l = {str(c).strip().lower(): c for c in df.columns}
+        for cand in self._VISION_LABEL_COLUMNS:
+            if cand in cols_l:
+                label_col = cols_l[cand]
+                break
+        if label_col is not None:
+            train_idx, test_idx, drift_idx = stratified_train_test_drift_indices(
+                df[label_col].tolist()
+            )
+            logger.info(
+                "Tabular split stratified on column '%s' (train=%d test=%d drift=%d)",
+                label_col,
+                len(train_idx),
+                len(test_idx),
+                len(drift_idx),
+            )
+        else:
+            indices = list(range(n))
+            random.shuffle(indices)
+            n_train = int(n * SPLIT_TRAIN_RATIO)
+            n_test = int(n * SPLIT_TEST_RATIO)
+            train_idx = indices[:n_train]
+            test_idx = indices[n_train : n_train + n_test]
+            drift_idx = indices[n_train + n_test :]
 
         base_path = f"datasets/{user_id}/{dataset_id}/{version}/"
         split_dfs = {"train": df.iloc[train_idx], "test": df.iloc[test_idx], "drift": df.iloc[drift_idx]}
@@ -1215,31 +1308,6 @@ class FileService:
         fn_key = _find_key(rows[0], fn_key_l) or (filename_column or "filename")
         lbl_key = _find_key(rows[0], lbl_key_l) or (label_column or "label")
 
-        # Split image list
-        indices = list(range(len(image_relpaths)))
-        random.shuffle(indices)
-        n = len(indices)
-        n_train = int(n * SPLIT_TRAIN_RATIO)
-        n_test = int(n * SPLIT_TEST_RATIO)
-        if n_train == 0 and n > 0:
-            n_train = 1
-        if n_test == 0 and n > 2:
-            n_test = 1
-        n_train = min(n_train, n)
-        n_test = min(n_test, n - n_train)
-        train_idx = set(indices[:n_train])
-        test_idx = set(indices[n_train : n_train + n_test])
-        drift_idx = set(indices[n_train + n_test :])
-
-        split_to_images: dict[str, set[str]] = {"train": set(), "test": set(), "drift": set()}
-        for i, rel_norm in enumerate(image_relpaths):
-            if i in train_idx:
-                split_to_images["train"].add(rel_norm)
-            elif i in test_idx:
-                split_to_images["test"].add(rel_norm)
-            else:
-                split_to_images["drift"].add(rel_norm)
-
         # Map a filename from annotations to an image relpath in the ZIP
         def _map_to_rel(fn_val) -> str | None:
             if fn_val is None:
@@ -1253,6 +1321,58 @@ class FileService:
                     if os.path.basename(r).lower() == bn:
                         return r
             return None
+
+        # Build image -> label map from annotations (needed for stratified split)
+        image_to_label: dict[str, Any] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            mapped = _map_to_rel(row.get(fn_key))
+            lbl_val = row.get(lbl_key)
+            if mapped is None or lbl_val is None or str(lbl_val).strip() == "":
+                continue
+            image_to_label[mapped] = lbl_val
+
+        # Stratified split by class so test/drift are not missing a label when n>=3 per class
+        image_labels = [image_to_label.get(rel, "__unlabeled__") for rel in image_relpaths]
+        n_labeled = sum(1 for lab in image_labels if lab != "__unlabeled__")
+        if n_labeled > 0:
+            train_list, test_list, drift_list = stratified_train_test_drift_indices(image_labels)
+            logger.info(
+                "Vision split stratified by label (%d/%d images labeled): train=%d test=%d drift=%d",
+                n_labeled,
+                len(image_relpaths),
+                len(train_list),
+                len(test_list),
+                len(drift_list),
+            )
+        else:
+            # No usable labels — fall back to random partition
+            indices = list(range(len(image_relpaths)))
+            random.shuffle(indices)
+            n = len(indices)
+            n_train = int(n * SPLIT_TRAIN_RATIO)
+            n_test = int(n * SPLIT_TEST_RATIO)
+            if n_train == 0 and n > 0:
+                n_train = 1
+            if n_test == 0 and n > 2:
+                n_test = 1
+            n_train = min(n_train, n)
+            n_test = min(n_test, n - n_train)
+            train_list = indices[:n_train]
+            test_list = indices[n_train : n_train + n_test]
+            drift_list = indices[n_train + n_test :]
+            logger.warning(
+                "Vision split could not stratify (no labels matched images); using random split"
+            )
+
+        split_to_images: dict[str, set[str]] = {"train": set(), "test": set(), "drift": set()}
+        for i in train_list:
+            split_to_images["train"].add(image_relpaths[i])
+        for i in test_list:
+            split_to_images["test"].add(image_relpaths[i])
+        for i in drift_list:
+            split_to_images["drift"].add(image_relpaths[i])
 
         # Build split annotation rows
         split_rows: dict[str, list[dict]] = {"train": [], "test": [], "drift": []}
@@ -1279,7 +1399,12 @@ class FileService:
 
         dataset_files: List[DatasetFile] = []
         total_size = 0
-        split_counts: Dict[str, int] = {"train": 0, "test": 0, "drift": 0}
+        # custom_metadata.split should reflect labeled samples (images), not annotation files
+        image_split_counts: Dict[str, int] = {
+            "train": len(split_to_images["train"]),
+            "test": len(split_to_images["test"]),
+            "drift": len(split_to_images["drift"]),
+        }
 
         # Upload images to their assigned split; copy other non-annotation files to all splits
         rel_to_split = {}
@@ -1316,7 +1441,6 @@ class FileService:
                     )
                 )
                 total_size += file_size
-                split_counts[subfolder] += 1
             else:
                 for subfolder in ("train", "test", "drift"):
                     path_in_split = f"{subfolder}/{relative_path}" if preserve_structure else f"{subfolder}/{file}"
@@ -1339,7 +1463,6 @@ class FileService:
                         )
                     )
                     total_size += file_size
-                    split_counts[subfolder] += 1
 
         # Upload generated annotations at root of each split folder
         for subfolder in ("train", "test", "drift"):
@@ -1364,16 +1487,29 @@ class FileService:
                 )
             )
             total_size += len(out_bytes)
-            split_counts[subfolder] += 1
+
+        # Log per-class coverage for debugging AutoML empty-class failures
+        for split_name, rows_s in split_rows.items():
+            class_counts: Dict[str, int] = {}
+            for r in rows_s:
+                lab = str(r.get(lbl_key, "")).strip() or "?"
+                class_counts[lab] = class_counts.get(lab, 0) + 1
+            logger.info(
+                "Vision split '%s' class coverage: %s (images=%d, annotation_rows=%d)",
+                split_name,
+                class_counts,
+                image_split_counts[split_name],
+                len(rows_s),
+            )
 
         logger.info(
             "Vision folder split complete: train=%d test=%d drift=%d (image files=%d)",
-            split_counts["train"],
-            split_counts["test"],
-            split_counts["drift"],
+            image_split_counts["train"],
+            image_split_counts["test"],
+            image_split_counts["drift"],
             len(image_relpaths),
         )
-        return dataset_files, total_size, split_counts
+        return dataset_files, total_size, image_split_counts
     
     async def delete_folder_files(self, folder_path: str) -> int:
         """

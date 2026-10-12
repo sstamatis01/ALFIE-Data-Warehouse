@@ -27,6 +27,8 @@ scipy==1.11.4
 imbalanced-learn==0.11.0
 river==0.21.0
 requests>=2.22.0
+# Bias fairness metrics (DI / SPD / smoothed EDF); worker falls back if import fails
+aif360>=0.6.0
 # For concept drift consumer (AutoGluon tabular retraining; backends needed to load saved predictors)
 autogluon.tabular>=1.0.0,<1.2
 catboost>=1.0.0

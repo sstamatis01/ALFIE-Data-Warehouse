@@ -1,0 +1,451 @@
+{
+  "fairness_profile": {
+    "config": {
+      "source_csv": "c:\\Users\\Stamatis\\ALFIE-Data-Warehouse-main\\updated_bias_detection\\tabular_data_modified (1).csv",
+      "target_column": "label",
+      "pos_label": 1,
+      "protected_attributes": [
+        "gender",
+        "ethnicity"
+      ],
+      "privileged_groups": {
+        "gender": "Male",
+        "ethnicity": "Caucasian"
+      },
+      "label_legend_from_frame_class": {
+        "0": {
+          "drowsy": 215,
+          "yawning": 129
+        },
+        "1": {
+          "alert": 350
+        }
+      }
+    },
+    "global_target_balance": {
+      "counts": {
+        "1": {
+          "count": 350,
+          "percent": 0.504323
+        },
+        "0": {
+          "count": 344,
+          "percent": 0.495677
+        }
+      },
+      "comment": "Looks roughly balanced overall — subgroup views below are needed to see gender/ethnicity skew."
+    },
+    "representation": {
+      "gender": {
+        "groups": {
+          "Female": {
+            "count": 381,
+            "percent": 0.548991
+          },
+          "Male": {
+            "count": 313,
+            "percent": 0.451009
+          }
+        },
+        "n_groups": 2,
+        "largest_group": "Female",
+        "smallest_group": "Male",
+        "max_min_ratio": 1.217,
+        "groups_under_30": []
+      },
+      "ethnicity": {
+        "groups": {
+          "Middle Eastern": {
+            "count": 270,
+            "percent": 0.389049
+          },
+          "Caucasian": {
+            "count": 191,
+            "percent": 0.275216
+          },
+          "Unknown": {
+            "count": 179,
+            "percent": 0.257925
+          },
+          "African": {
+            "count": 47,
+            "percent": 0.067723
+          },
+          "Asian": {
+            "count": 7,
+            "percent": 0.010086
+          }
+        },
+        "n_groups": 5,
+        "largest_group": "Middle Eastern",
+        "smallest_group": "Asian",
+        "max_min_ratio": 38.571,
+        "groups_under_30": [
+          "Asian"
+        ]
+      }
+    },
+    "target_by_attribute": {
+      "gender": {
+        "counts": {
+          "Female": {
+            "0": 168,
+            "1": 213
+          },
+          "Male": {
+            "0": 176,
+            "1": 137
+          }
+        },
+        "row_percent_within_group": {
+          "Female": {
+            "0": 0.440945,
+            "1": 0.559055
+          },
+          "Male": {
+            "0": 0.5623,
+            "1": 0.4377
+          }
+        },
+        "col_percent_within_label": {
+          "0": {
+            "Female": 0.488372,
+            "Male": 0.511628
+          },
+          "1": {
+            "Female": 0.608571,
+            "Male": 0.391429
+          }
+        },
+        "positive_rate_by_group": {
+          "Female": 0.559055,
+          "Male": 0.4377
+        }
+      },
+      "ethnicity": {
+        "counts": {
+          "African": {
+            "0": 33,
+            "1": 14
+          },
+          "Asian": {
+            "0": 1,
+            "1": 6
+          },
+          "Caucasian": {
+            "0": 110,
+            "1": 81
+          },
+          "Middle Eastern": {
+            "0": 109,
+            "1": 161
+          },
+          "Unknown": {
+            "0": 91,
+            "1": 88
+          }
+        },
+        "row_percent_within_group": {
+          "African": {
+            "0": 0.702128,
+            "1": 0.297872
+          },
+          "Asian": {
+            "0": 0.142857,
+            "1": 0.857143
+          },
+          "Caucasian": {
+            "0": 0.575916,
+            "1": 0.424084
+          },
+          "Middle Eastern": {
+            "0": 0.403704,
+            "1": 0.596296
+          },
+          "Unknown": {
+            "0": 0.50838,
+            "1": 0.49162
+          }
+        },
+        "col_percent_within_label": {
+          "0": {
+            "African": 0.09593,
+            "Asian": 0.002907,
+            "Caucasian": 0.319767,
+            "Middle Eastern": 0.31686,
+            "Unknown": 0.264535
+          },
+          "1": {
+            "African": 0.04,
+            "Asian": 0.017143,
+            "Caucasian": 0.231429,
+            "Middle Eastern": 0.46,
+            "Unknown": 0.251429
+          }
+        },
+        "positive_rate_by_group": {
+          "African": 0.297872,
+          "Asian": 0.857143,
+          "Caucasian": 0.424084,
+          "Middle Eastern": 0.596296,
+          "Unknown": 0.49162
+        }
+      }
+    },
+    "intersection": {
+      "attributes": [
+        "gender",
+        "ethnicity"
+      ],
+      "representation": {
+        "groups": {
+          "Female | Middle Eastern": {
+            "count": 270,
+            "percent": 0.389049
+          },
+          "Male | Unknown": {
+            "count": 179,
+            "percent": 0.257925
+          },
+          "Female | Caucasian": {
+            "count": 104,
+            "percent": 0.149856
+          },
+          "Male | Caucasian": {
+            "count": 87,
+            "percent": 0.12536
+          },
+          "Male | African": {
+            "count": 47,
+            "percent": 0.067723
+          },
+          "Female | Asian": {
+            "count": 7,
+            "percent": 0.010086
+          }
+        },
+        "n_groups": 6,
+        "largest_group": "Female | Middle Eastern",
+        "smallest_group": "Female | Asian",
+        "max_min_ratio": 38.571,
+        "groups_under_30": [
+          "Female | Asian"
+        ]
+      },
+      "target_by_intersection": {
+        "counts": {
+          "Female | Asian": {
+            "0": 1,
+            "1": 6
+          },
+          "Female | Caucasian": {
+            "0": 58,
+            "1": 46
+          },
+          "Female | Middle Eastern": {
+            "0": 109,
+            "1": 161
+          },
+          "Male | African": {
+            "0": 33,
+            "1": 14
+          },
+          "Male | Caucasian": {
+            "0": 52,
+            "1": 35
+          },
+          "Male | Unknown": {
+            "0": 91,
+            "1": 88
+          }
+        },
+        "row_percent_within_group": {
+          "Female | Asian": {
+            "0": 0.142857,
+            "1": 0.857143
+          },
+          "Female | Caucasian": {
+            "0": 0.557692,
+            "1": 0.442308
+          },
+          "Female | Middle Eastern": {
+            "0": 0.403704,
+            "1": 0.596296
+          },
+          "Male | African": {
+            "0": 0.702128,
+            "1": 0.297872
+          },
+          "Male | Caucasian": {
+            "0": 0.597701,
+            "1": 0.402299
+          },
+          "Male | Unknown": {
+            "0": 0.50838,
+            "1": 0.49162
+          }
+        },
+        "col_percent_within_label": {
+          "0": {
+            "Female | Asian": 0.002907,
+            "Female | Caucasian": 0.168605,
+            "Female | Middle Eastern": 0.31686,
+            "Male | African": 0.09593,
+            "Male | Caucasian": 0.151163,
+            "Male | Unknown": 0.264535
+          },
+          "1": {
+            "Female | Asian": 0.017143,
+            "Female | Caucasian": 0.131429,
+            "Female | Middle Eastern": 0.46,
+            "Male | African": 0.04,
+            "Male | Caucasian": 0.1,
+            "Male | Unknown": 0.251429
+          }
+        },
+        "positive_rate_by_group": {
+          "Female | Asian": 0.857143,
+          "Female | Caucasian": 0.442308,
+          "Female | Middle Eastern": 0.596296,
+          "Male | African": 0.297872,
+          "Male | Caucasian": 0.402299,
+          "Male | Unknown": 0.49162
+        }
+      },
+      "empty_combos_note": "Missing gender×ethnicity combinations are informative: this CSV nests ethnicity heavily by gender (e.g. Middle Eastern only Female, African/Unknown only Male)."
+    },
+    "aif360_metrics": {
+      "library": "aif360",
+      "api": "aif360.sklearn.metrics",
+      "backend": "aif360",
+      "note": "Dataset-level metrics: y_true = labels, no y_pred. DI/SPD need a binary privileged vs rest (or privileged vs unprivileged) view; smoothed_edf supports multi-group / intersectional protected attributes.",
+      "per_attribute": {
+        "gender": {
+          "privileged_group": "Male",
+          "functions": {
+            "base_rate_overall": {
+              "value": 0.5043227665706052,
+              "meaning": "P(Y=pos_label) overall"
+            },
+            "disparate_impact_ratio": {
+              "value": 1.2772573136387149,
+              "ideal": 1.0,
+              "rule_of_thumb": "Often flagged if < 0.8 or > 1.25 (four-fifths rule)",
+              "meaning": "P(Y=1|unprivileged) / P(Y=1|privileged)",
+              "aif360": "aif360.sklearn.metrics.disparate_impact_ratio"
+            },
+            "statistical_parity_difference": {
+              "value": 0.1213554375990541,
+              "ideal": 0.0,
+              "meaning": "P(Y=1|unprivileged) - P(Y=1|privileged)",
+              "aif360": "aif360.sklearn.metrics.statistical_parity_difference"
+            },
+            "smoothed_edf": {
+              "value": 0.2439852928637315,
+              "ideal": 0.0,
+              "meaning": "Max log-ratio gap in (smoothed) positive rates across groups; lower is fairer. Captures multi-category imbalance (e.g. ethnicity).",
+              "aif360": "aif360.sklearn.metrics.smoothed_edf"
+            }
+          },
+          "pairwise_vs_privileged": [
+            {
+              "privileged": "Male",
+              "unprivileged": "Female",
+              "disparate_impact_ratio": 1.2772573136387149,
+              "statistical_parity_difference": 0.1213554375990541,
+              "n": 694
+            }
+          ]
+        },
+        "ethnicity": {
+          "privileged_group": "Caucasian",
+          "functions": {
+            "base_rate_overall": {
+              "value": 0.5043227665706052,
+              "meaning": "P(Y=pos_label) overall"
+            },
+            "disparate_impact_ratio": {
+              "value": 1.2610509780821244,
+              "ideal": 1.0,
+              "rule_of_thumb": "Often flagged if < 0.8 or > 1.25 (four-fifths rule)",
+              "meaning": "P(Y=1|unprivileged) / P(Y=1|privileged)",
+              "aif360": "aif360.sklearn.metrics.disparate_impact_ratio"
+            },
+            "statistical_parity_difference": {
+              "value": 0.11070748285158155,
+              "ideal": 0.0,
+              "meaning": "P(Y=1|unprivileged) - P(Y=1|privileged)",
+              "aif360": "aif360.sklearn.metrics.statistical_parity_difference"
+            },
+            "smoothed_edf": {
+              "value": 1.3143208614948014,
+              "ideal": 0.0,
+              "meaning": "Max log-ratio gap in (smoothed) positive rates across groups; lower is fairer. Captures multi-category imbalance (e.g. ethnicity).",
+              "aif360": "aif360.sklearn.metrics.smoothed_edf"
+            }
+          },
+          "pairwise_vs_privileged": [
+            {
+              "privileged": "Caucasian",
+              "unprivileged": "African",
+              "disparate_impact_ratio": 0.7023903335960073,
+              "statistical_parity_difference": -0.12621142920797596,
+              "n": 238
+            },
+            {
+              "privileged": "Caucasian",
+              "unprivileged": "Asian",
+              "disparate_impact_ratio": 2.021164021164021,
+              "statistical_parity_difference": 0.43305908750934924,
+              "n": 198
+            },
+            {
+              "privileged": "Caucasian",
+              "unprivileged": "Middle Eastern",
+              "disparate_impact_ratio": 1.4060813900320073,
+              "statistical_parity_difference": 0.17221252666278847,
+              "n": 461
+            },
+            {
+              "privileged": "Caucasian",
+              "unprivileged": "Unknown",
+              "disparate_impact_ratio": 1.159252362231878,
+              "statistical_parity_difference": 0.0675363420983357,
+              "n": 370
+            }
+          ]
+        }
+      },
+      "intersectional": {
+        "attributes": [
+          "gender",
+          "ethnicity"
+        ],
+        "smoothed_edf": {
+          "value": 1.3143208614948014,
+          "ideal": 0.0,
+          "aif360": "aif360.sklearn.metrics.smoothed_edf(prot_attr=[...])",
+          "meaning": "Intersectional smoothed EDF across gender×ethnicity cells"
+        },
+        "n_observed_cells": 6
+      },
+      "import_errors": []
+    },
+    "alerts": [
+      "ethnicity: largest/smallest group ratio 38.571 (>= 3.0) - representation skew",
+      "ethnicity: group 'Asian' has < 30 samples - treat metrics cautiously",
+      "gender: disparate_impact_ratio=1.2773 outside [0.8, 1.25] (privileged=Male)",
+      "gender: statistical_parity_difference=0.1214 (|SPD| >= 0.1)",
+      "ethnicity: disparate_impact_ratio=1.2611 outside [0.8, 1.25] (privileged=Caucasian)",
+      "ethnicity: statistical_parity_difference=0.1107 (|SPD| >= 0.1)"
+    ],
+    "integration_notes_for_autodw": [
+      "Bias trigger / dataset metadata must pass protected_attributes + optional privileged_groups + pos_label.",
+      "Store this object under bias_report['fairness_profile'] (report is already Any JSON).",
+      "Prefer aif360.sklearn.metrics for new code; tables above do not need AIF360 but metrics do.",
+      "For multi-class ethnicity, always keep pairwise + smoothed_edf — binary DI alone collapses groups.",
+      "Sparse cells (Asian=7) should surface as alerts; do not auto-mitigate on tiny n without review.",
+      "Mitigation (DI Remover, Reweighing, …) is a separate later phase; this probe is metrics-only."
+    ]
+  }
+}

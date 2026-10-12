@@ -1,14 +1,39 @@
 from fastapi import APIRouter, HTTPException, Header, Query
 from typing import Optional
 import logging
-from ..models.bias_report import BiasReportCreate, BiasReportResponse
+from ..models.bias_report import (
+    BiasReportCreate,
+    BiasReportResponse,
+    ProtectedAttributeCandidatesRequest,
+    ProtectedAttributeCandidatesResponse,
+    ProtectedAttributeCandidate,
+)
 from ..services.bias_report_service import bias_report_service
 from ..services.kafka_service import kafka_producer_service
 from ..services.transformation_report_service import transformation_report_service
+from ..services.fairness_profile import detect_protected_attribute_candidates
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/bias-reports", tags=["bias-reports"])
+
+
+@router.post(
+    "/protected-attribute-candidates",
+    response_model=ProtectedAttributeCandidatesResponse,
+)
+async def protected_attribute_candidates(payload: ProtectedAttributeCandidatesRequest):
+    """
+    Heuristic scan of column headers for likely protected attributes
+    (sex/gender, ethnicity, age, …). Used by Agentic Core to propose questions
+    to the user before emitting bias-trigger with ``protected_attributes``.
+    """
+    found = detect_protected_attribute_candidates(
+        payload.columns, exclude=payload.exclude
+    )
+    return ProtectedAttributeCandidatesResponse(
+        candidates=[ProtectedAttributeCandidate(**c) for c in found]
+    )
 
 
 @router.post("/", response_model=BiasReportResponse)
