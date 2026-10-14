@@ -48,6 +48,13 @@ The Data Warehouse participates in an event-driven ML pipeline via Kafka:
 
 **Flow (simplified):** Dataset upload → Bias detection → AutoML training → Model upload → XAI report generation. Concept drift runs after AutoML using the **drift** split (15%) and can upload a new model version.
 
+### Bias mitigation & extreme class imbalance (text)
+
+- Bias reports include a **`class_imbalance`** block (per-class counts, `imbalance_ratio`, `extreme_imbalance`, modality).
+- **Classic SMOTE does not apply to raw text** (non-numeric features). For text+label CSVs with extreme imbalance, train-only mitigation uses **document-level undersample/oversample** (`text_random_oversample_undersample`); test/drift stay unresampled.
+- AutoML v5 forwards `eval_metric` (e.g. `f1_macro`), `imbalance_handling`, `extreme_imbalance`, and optional `fallback_trainer=tfidf_logreg_balanced` to the engine; model metadata can store `test_f1_macro` / per-class metrics in `custom_metadata`.
+- Demographic **`fairness_profile`** still requires protected-attribute columns; target imbalance alone is learning bias toward the majority class.
+
 See [KAFKA_ORCHESTRATION_COMPLETE.md](KAFKA_ORCHESTRATION_COMPLETE.md) and [KAFKA_QUICK_REFERENCE.md](KAFKA_QUICK_REFERENCE.md).
 
 ---

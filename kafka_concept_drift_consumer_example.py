@@ -632,11 +632,20 @@ def monitor_drift_and_retrain(
 
         final_accuracy = accuracy_score(y_true_labels, y_pred_labels)
         f1 = f1_score(y_true_labels, y_pred_labels, average="weighted")
+        f1_macro = f1_score(
+            y_true_labels, y_pred_labels, average="macro", zero_division=0
+        )
         precision = precision_score(
             y_true_labels, y_pred_labels, average="weighted", zero_division=0
         )
+        precision_macro = precision_score(
+            y_true_labels, y_pred_labels, average="macro", zero_division=0
+        )
         recall = recall_score(
             y_true_labels, y_pred_labels, average="weighted", zero_division=0
+        )
+        recall_macro = recall_score(
+            y_true_labels, y_pred_labels, average="macro", zero_division=0
         )
         cumulative_accuracy = float((y_true_labels == y_pred_labels).mean())
 
@@ -656,8 +665,11 @@ def monitor_drift_and_retrain(
             "final_accuracy": final_accuracy,
             "final_window_accuracy": final_window_accuracy,
             "f1_score": f1,
+            "f1_macro": float(f1_macro),
             "precision": precision,
+            "precision_macro": float(precision_macro),
             "recall": recall,
+            "recall_macro": float(recall_macro),
             "total_drifts": total_drifts,
             "total_retrain_time_seconds": total_retrain_time,
             "total_runtime_seconds": total_runtime,

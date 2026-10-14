@@ -420,6 +420,26 @@ def build_bias_report(df: pd.DataFrame | None, meta: dict) -> dict:
                 except Exception:
                     outlier_summary[col] = {"count": 0, "percent": 0.0}
             report["outlier_detection"] = outlier_summary
+
+            # Class-imbalance diagnostics (target distribution / extreme-ratio alerts)
+            try:
+                from app.services.class_imbalance import build_class_imbalance_profile
+
+                imbalance_profile = build_class_imbalance_profile(
+                    df, meta.get("target_column_name")
+                )
+                if imbalance_profile:
+                    report["class_imbalance"] = imbalance_profile
+                    logger.info(
+                        "Class imbalance: ratio=%s extreme=%s modality=%s counts=%s",
+                        imbalance_profile.get("imbalance_ratio"),
+                        imbalance_profile.get("extreme_imbalance"),
+                        imbalance_profile.get("modality"),
+                        imbalance_profile.get("class_counts"),
+                    )
+            except Exception as e:
+                logger.warning("Class imbalance profile failed: %s", e, exc_info=True)
+
             try:
                 from river import drift
                 if len(numeric_cols) > 0:
@@ -690,7 +710,7 @@ def preprocess_data(
     - Drop duplicates
     - Encode categoricals (boolean-like kept as bool; one-hot fit on train only)
     - Skew correction and drift mitigation (train-fitted, applied on other splits)
-    - SMOTE on train split only
+    - Class balance on train only: text document resample, else SMOTE when numeric
 
     Returns (transformed_dataframe, transformation_log, state).
     """
@@ -837,16 +857,78 @@ def preprocess_data(
                 method, transformer = state.skew_transformers[col]
                 df_cleaned[col] = transformer.transform(df_cleaned[[col]])
 
-        # 5. Classification-only SMOTE — train split only
+        # 5. Classification balancing — train split only
+        # Text features: document-level undersample/oversample (SMOTE inapplicable).
+        # Numeric-only: classic SMOTE when imbalanced.
         if fitting and task_type == "classification" and target_column is not None:
             X = df_cleaned.drop(columns=[target_column])
             y = df_cleaned[target_column]
 
             if type_of_target(y) in {"binary", "multiclass"}:
+                from app.services.class_imbalance import (
+                    detect_text_feature_columns,
+                    resample_text_train_balance,
+                    IMBALANCE_RATIO_ALERT,
+                )
+
+                text_feat_cols = detect_text_feature_columns(df_cleaned, target_column)
                 non_numeric = [
                     c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])
                 ]
-                if non_numeric:
+                vc_pre = y.value_counts()
+                max_c = int(vc_pre.max()) if not vc_pre.empty else 0
+                min_c = int(vc_pre.min()) if not vc_pre.empty else 0
+                ratio_max_min = (max_c / min_c) if min_c > 0 else 0.0
+                needs_balance = ratio_max_min >= IMBALANCE_RATIO_ALERT or (
+                    max_c > 0 and (min_c / max_c) < 0.5
+                )
+
+                if text_feat_cols and needs_balance:
+                    try:
+                        df_cleaned, text_meta = resample_text_train_balance(
+                            df_cleaned, target_column
+                        )
+                        transformation_log.append(
+                            {
+                                "column": target_column,
+                                "transformation": "text_class_balance",
+                                "method": text_meta.get(
+                                    "method", "text_random_oversample_undersample"
+                                ),
+                                "original_value": text_meta.get("before"),
+                                "modified_value": text_meta.get("after"),
+                                "details": {
+                                    k: text_meta[k]
+                                    for k in (
+                                        "majority_cap",
+                                        "minority_floor",
+                                        "median_class_count",
+                                        "actions",
+                                        "n_rows_before",
+                                        "n_rows_after",
+                                    )
+                                    if k in text_meta
+                                },
+                            }
+                        )
+                        # Refresh feature column lists after row changes
+                        numeric_cols = df_cleaned.select_dtypes(
+                            include=[np.number]
+                        ).columns.tolist()
+                        feature_numeric_cols = [
+                            c for c in numeric_cols if c != target_column
+                        ]
+                    except Exception as e:
+                        transformation_log.append(
+                            {
+                                "column": target_column,
+                                "transformation": "text_class_balance_skipped",
+                                "method": "text_random_oversample_undersample",
+                                "original_value": vc_pre.to_dict(),
+                                "modified_value": f"Skipped due to error: {e}",
+                            }
+                        )
+                elif non_numeric:
                     transformation_log.append(
                         {
                             "column": target_column,
@@ -1198,7 +1280,22 @@ async def run_consumer() -> None:
                     abs(stats.get("skew", 0)) > 0.75 
                     for stats in bias_report.get("distribution_statistics", {}).values()
                 )
-                needs_mitigation = has_missing_values or has_duplicates or has_skewed_cols
+                class_imbalance = bias_report.get("class_imbalance") or {}
+                has_extreme_imbalance = bool(
+                    class_imbalance.get("extreme_imbalance")
+                )
+                needs_mitigation = (
+                    has_missing_values
+                    or has_duplicates
+                    or has_skewed_cols
+                    or has_extreme_imbalance
+                )
+                if has_extreme_imbalance:
+                    logger.info(
+                        "Extreme class imbalance detected (ratio=%s modality=%s) — mitigation will run",
+                        class_imbalance.get("imbalance_ratio"),
+                        class_imbalance.get("modality"),
+                    )
                 
                 # Variables to track mitigation results
                 mitigated_dataset_version = None

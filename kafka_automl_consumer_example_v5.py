@@ -575,13 +575,15 @@ def _extract_scores_from_leaderboard(leaderboard: str) -> dict[str, float | None
 def _parse_automl_response_metrics(response_data: dict) -> dict:
     """
     Extract metrics from AutoML tabular response for DW metadata update.
-    Returns dict with: leaderboard, test_accuracy, validation_accuracy, training_accuracy, custom_metadata.
+    Returns dict with: leaderboard, test_accuracy, validation_accuracy, training_accuracy,
+    test_f1_macro, custom_metadata (incl. per-class metrics when provided by the engine).
     """
     out = {
         "leaderboard": None,
         "test_accuracy": None,
         "validation_accuracy": None,
         "training_accuracy": None,
+        "test_f1_macro": None,
         "custom_metadata": {},
     }
     if not response_data:
@@ -590,6 +592,11 @@ def _parse_automl_response_metrics(response_data: dict) -> dict:
     out["test_accuracy"] = _coerce_metric_float(response_data.get("test_accuracy"))
     out["validation_accuracy"] = _coerce_metric_float(response_data.get("validation_accuracy"))
     out["training_accuracy"] = _coerce_metric_float(response_data.get("training_accuracy"))
+    out["test_f1_macro"] = _coerce_metric_float(
+        response_data.get("test_f1_macro")
+        or response_data.get("f1_macro")
+        or response_data.get("score_test_f1_macro")
+    )
 
     best_score = response_data.get("best_score") or response_data.get("score_test")
     if best_score is not None and out["test_accuracy"] is None:
@@ -617,7 +624,51 @@ def _parse_automl_response_metrics(response_data: dict) -> dict:
             out["custom_metadata"][key] = response_data[key]
     if out["leaderboard"]:
         out["custom_metadata"]["leaderboard"] = out["leaderboard"]
+    if out["test_f1_macro"] is not None:
+        out["custom_metadata"]["test_f1_macro"] = out["test_f1_macro"]
+    # Engine-provided imbalance / per-class detail (pass through into custom_metadata)
+    for key in (
+        "per_class_metrics",
+        "per_class_f1",
+        "per_class_precision",
+        "per_class_recall",
+        "eval_metric",
+        "imbalance_handling",
+        "fallback_trainer",
+        "extreme_imbalance",
+    ):
+        if key in response_data and response_data[key] is not None:
+            out["custom_metadata"][key] = response_data[key]
     return out
+
+
+def _infer_extreme_imbalance_from_df(
+    df: pd.DataFrame, target_column: str | None
+) -> dict:
+    """Best-effort imbalance flags from a local tabular preview (for engine contract)."""
+    result = {
+        "extreme_imbalance": False,
+        "imbalance_ratio": None,
+        "eval_metric_default": None,
+        "fallback_trainer": None,
+    }
+    if df is None or not target_column or target_column not in df.columns:
+        return result
+    try:
+        from app.services.class_imbalance import build_class_imbalance_profile
+
+        profile = build_class_imbalance_profile(df, target_column)
+        if not profile:
+            return result
+        result["extreme_imbalance"] = bool(profile.get("extreme_imbalance"))
+        result["imbalance_ratio"] = profile.get("imbalance_ratio")
+        if result["extreme_imbalance"]:
+            result["eval_metric_default"] = "f1_macro"
+            result["fallback_trainer"] = "tfidf_logreg_balanced"
+            result["imbalance_handling_default"] = "class_weight"
+    except Exception as e:
+        logger.debug("Could not infer class imbalance from preview: %s", e)
+    return result
 
 
 async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None) -> None:
@@ -639,7 +690,11 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
             "filename_column": "filename",         // vision (optional)
             "label_column": "label",               // vision (optional)
             "model_size": "small",                 // vision (optional: small/medium/large)
-            "time_budget": "10"                    // seconds (both tabular and vision)
+            "time_budget": "10",                   // seconds (both tabular and vision)
+            "eval_metric": "f1_macro",             // optional; auto-set on extreme imbalance
+            "imbalance_handling": "class_weight",  // optional
+            "extreme_imbalance": true,             // optional; inferred from preview if omitted
+            "fallback_trainer": "tfidf_logreg_balanced"  // optional; when extreme imbalance
         }
     }
     
@@ -763,6 +818,7 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
 
             # Optional validation before calling AutoML service: ensure bytes are readable tabular data.
             # This catches malformed/incorrect dataset payloads early with clear logs.
+            df_preview = None
             try:
                 df_preview = load_tabular_dataframe(file_bytes)
                 logger.info(f"Tabular dataset validation OK: shape={df_preview.shape}")
@@ -801,6 +857,36 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                 "num_cpus": num_cpus,
                 "num_gpus": num_gpus,
             }
+            # Imbalance-aware contract for the external AutoML engine
+            inferred = _infer_extreme_imbalance_from_df(df_preview, target_column)
+            eval_metric = input_obj.get("eval_metric") or inferred.get("eval_metric_default")
+            imbalance_handling = input_obj.get("imbalance_handling") or (
+                inferred.get("imbalance_handling_default") if inferred.get("extreme_imbalance") else None
+            )
+            if "extreme_imbalance" in input_obj:
+                extreme_imbalance = bool(input_obj.get("extreme_imbalance"))
+            else:
+                extreme_imbalance = bool(inferred.get("extreme_imbalance"))
+            fallback_trainer = input_obj.get("fallback_trainer")
+            if extreme_imbalance and not fallback_trainer:
+                fallback_trainer = inferred.get("fallback_trainer") or "tfidf_logreg_balanced"
+            if eval_metric:
+                data["eval_metric"] = str(eval_metric)
+            if imbalance_handling:
+                data["imbalance_handling"] = str(imbalance_handling)
+            data["extreme_imbalance"] = str(bool(extreme_imbalance)).lower()
+            if fallback_trainer and extreme_imbalance:
+                data["fallback_trainer"] = str(fallback_trainer)
+            if inferred.get("imbalance_ratio") is not None:
+                data["imbalance_ratio"] = str(inferred["imbalance_ratio"])
+            if extreme_imbalance:
+                logger.info(
+                    "  Extreme imbalance contract: eval_metric=%s imbalance_handling=%s fallback=%s ratio=%s",
+                    data.get("eval_metric"),
+                    data.get("imbalance_handling"),
+                    data.get("fallback_trainer"),
+                    data.get("imbalance_ratio"),
+                )
             # Tell the AutoML tabular service to request the train split when downloading from DW (split datasets)
             if has_split:
                 data["dataset_split"] = "train"
@@ -889,6 +975,7 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                     or metrics["test_accuracy"] is not None
                     or metrics["validation_accuracy"] is not None
                     or metrics["training_accuracy"] is not None
+                    or metrics.get("test_f1_macro") is not None
                     or metrics["custom_metadata"]
                 ):
                     update_model_metadata_in_dw(
@@ -902,12 +989,13 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                         custom_metadata=metrics["custom_metadata"] or None,
                     )
                     logger.info(
-                        "   Updated model metadata in DW for %s %s (test=%s, val=%s, train=%s)",
+                        "   Updated model metadata in DW for %s %s (test=%s, val=%s, train=%s, f1_macro=%s)",
                         model_id_to_update,
                         version_to_update,
                         metrics["test_accuracy"],
                         metrics["validation_accuracy"],
                         metrics["training_accuracy"],
+                        metrics.get("test_f1_macro"),
                     )
             except Exception as meta_e:
                 logger.warning(f"   Could not update model metadata with AutoML metrics: {meta_e}")
