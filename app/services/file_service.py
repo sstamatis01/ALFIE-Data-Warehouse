@@ -526,6 +526,101 @@ class FileService:
         return None
 
     @staticmethod
+    def _extract_vision_annotation_schema(
+        collected: List[Tuple[str, str, str, int, str]],
+        *,
+        filename_column: str = "filename",
+        label_column: str = "label",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Read the vision annotation CSV/JSON and return schema for dataset metadata.
+
+        Returns dict with: columns, row_count, data_types, annotation_file,
+        filename_column, label_column — or None if not a usable annotation set.
+        """
+        picked = FileService._select_annotation_candidate(collected)
+        if not picked:
+            return None
+        rel_norm, ext_lower, abs_path = picked
+        fn_pref = (filename_column or "filename").strip().lower()
+        lbl_pref = (label_column or "label").strip().lower()
+
+        try:
+            with open(abs_path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            logger.warning("Could not read annotation file %s: %s", rel_norm, e)
+            return None
+
+        if ext_lower == "csv":
+            try:
+                df = pd.read_csv(BytesIO(data))
+            except Exception as e:
+                logger.warning("Could not parse annotation CSV %s: %s", rel_norm, e)
+                return None
+            if df.empty and len(df.columns) == 0:
+                return None
+            cols_map = {str(c).strip().lower(): str(c) for c in df.columns}
+            cols_l = set(cols_map.keys())
+            fn_l = FileService._pick_annotation_column(
+                cols_l, FileService._VISION_FILENAME_COLUMNS, fn_pref
+            )
+            lbl_l = FileService._pick_annotation_column(
+                cols_l, FileService._VISION_LABEL_COLUMNS, lbl_pref
+            )
+            columns = [str(c) for c in df.columns]
+            data_types = {str(c): str(df[c].dtype) for c in df.columns}
+            return {
+                "columns": columns,
+                "row_count": int(len(df)),
+                "data_types": data_types,
+                "annotation_file": rel_norm,
+                "filename_column": cols_map.get(fn_l) if fn_l else None,
+                "label_column": cols_map.get(lbl_l) if lbl_l else None,
+            }
+
+        if ext_lower == "json":
+            try:
+                obj = json.loads(data.decode("utf-8", errors="strict"))
+            except Exception as e:
+                logger.warning("Could not parse annotation JSON %s: %s", rel_norm, e)
+                return None
+            if isinstance(obj, dict) and "annotations" in obj:
+                obj = obj["annotations"]
+            if not isinstance(obj, list) or not obj:
+                return None
+            rows = [x for x in obj if isinstance(x, dict)]
+            if not rows:
+                return None
+            # Union of keys across rows (stable order: first-row keys, then extras)
+            columns: list[str] = []
+            seen: set[str] = set()
+            for r in rows:
+                for k in r.keys():
+                    ks = str(k)
+                    if ks not in seen:
+                        seen.add(ks)
+                        columns.append(ks)
+            keys_l = {str(k).strip().lower(): str(k) for k in columns}
+            fn_l = FileService._pick_annotation_column(
+                set(keys_l.keys()), FileService._VISION_FILENAME_COLUMNS, fn_pref
+            )
+            lbl_l = FileService._pick_annotation_column(
+                set(keys_l.keys()), FileService._VISION_LABEL_COLUMNS, lbl_pref
+            )
+            data_types = {c: "object" for c in columns}
+            return {
+                "columns": columns,
+                "row_count": int(len(rows)),
+                "data_types": data_types,
+                "annotation_file": rel_norm,
+                "filename_column": keys_l.get(fn_l) if fn_l else None,
+                "label_column": keys_l.get(lbl_l) if lbl_l else None,
+            }
+
+        return None
+
+    @staticmethod
     def _parse_vision_annotations_to_rows(
         annotation_relpath: str,
         ext_lower: str,
@@ -914,14 +1009,19 @@ class FileService:
         version: str = "v1",
         version_split: Optional[str] = None,
         preserve_structure: bool = True
-    ) -> Tuple[Tuple[List[DatasetFile], int, Optional[Dict[str, int]]], Optional[Tuple[List[DatasetFile], int, Dict[str, int]]]]:
+    ) -> Tuple[
+        Tuple[List[DatasetFile], int, Optional[Dict[str, int]]],
+        Optional[Tuple[List[DatasetFile], int, Dict[str, int]]],
+        Optional[Dict[str, Any]],
+    ]:
         """
         Upload a folder of dataset files (as zip). Original is always stored under `version` (v1).
         If the number of files is large enough and `version_split` is set, a train/test/drift split
         is also stored under `version_split` (v2).
 
         Returns:
-            ((v1_files, v1_size, None), (v2_files, v2_size, split_counts) or None).
+            ((v1_files, v1_size, split_counts|None), (v2_files, v2_size, split_counts) or None,
+             vision_annotation_schema or None).
         """
         try:
             collected: List[Tuple[str, str, str, int, str]] = []  # (relative_path, file_basename, abs_path, size, file_type)
@@ -956,8 +1056,12 @@ class FileService:
             # Enforce AutoML Vision contract for image datasets:
             # require machine-readable annotations that reference images in the ZIP.
             is_image_folder, _has_annotation = self._check_image_folder_has_annotations(collected)
+            vision_schema: Optional[Dict[str, Any]] = None
             if is_image_folder:
                 self._validate_automl_vision_annotations(collected, filename_column="filename", label_column="label")
+                vision_schema = self._extract_vision_annotation_schema(
+                    collected, filename_column="filename", label_column="label"
+                )
 
             # Detect if the uploaded ZIP already contains a train/test/drift split structure.
             # This commonly happens for bias-mitigated datasets that are uploaded as:
@@ -1035,11 +1139,11 @@ class FileService:
                     v2_files, v2_size, split_counts = await self._upload_folder_with_split(
                         collected, user_id, dataset_id, version_split, preserve_structure
                     )
-                return ((dataset_files_v1, total_size_v1, None), (v2_files, v2_size, split_counts))
+                return ((dataset_files_v1, total_size_v1, None), (v2_files, v2_size, split_counts), vision_schema)
 
             if do_split and not version_split:
                 logger.info("Folder large enough to split but version_split not set; only v1 stored")
-            return ((dataset_files_v1, total_size_v1, split_counts_existing), None)
+            return ((dataset_files_v1, total_size_v1, split_counts_existing), None, vision_schema)
 
         except zipfile.BadZipFile:
             logger.error("Invalid zip file")
@@ -1062,10 +1166,17 @@ class FileService:
         version: str = "v1",
         version_split: Optional[str] = None,
         preserve_structure: bool = True,
-    ) -> Tuple[Tuple[List[DatasetFile], int, Optional[Dict[str, int]]], Optional[Tuple[List[DatasetFile], int, Dict[str, int]]]]:
+    ) -> Tuple[
+        Tuple[List[DatasetFile], int, Optional[Dict[str, int]]],
+        Optional[Tuple[List[DatasetFile], int, Dict[str, int]]],
+        Optional[Dict[str, Any]],
+    ]:
         """
         Same as `upload_dataset_folder`, but reads a local ZIP file path.
         Intended for background ingestion jobs (ZIP already staged in object storage).
+
+        Returns:
+            ((v1_files, v1_size, split_counts|None), v2_result or None, vision_annotation_schema or None).
         """
         try:
             if not zip_path or not os.path.exists(zip_path):
@@ -1096,8 +1207,12 @@ class FileService:
 
                 # Enforce AutoML Vision contract for image datasets:
                 is_image_folder, _has_annotation = self._check_image_folder_has_annotations(collected)
+                vision_schema: Optional[Dict[str, Any]] = None
                 if is_image_folder:
                     self._validate_automl_vision_annotations(collected, filename_column="filename", label_column="label")
+                    vision_schema = self._extract_vision_annotation_schema(
+                        collected, filename_column="filename", label_column="label"
+                    )
 
                 # Detect pre-split folder structure
                 split_counts_existing: Optional[Dict[str, int]] = None
@@ -1174,9 +1289,9 @@ class FileService:
                         v2_files, v2_size, split_counts = await self._upload_folder_with_split(
                             collected, user_id, dataset_id, version_split, preserve_structure
                         )
-                    return ((dataset_files_v1, total_size_v1, None), (v2_files, v2_size, split_counts))
+                    return ((dataset_files_v1, total_size_v1, None), (v2_files, v2_size, split_counts), vision_schema)
 
-                return ((dataset_files_v1, total_size_v1, split_counts_existing), None)
+                return ((dataset_files_v1, total_size_v1, split_counts_existing), None, vision_schema)
 
         except zipfile.BadZipFile:
             logger.error("Invalid zip file")

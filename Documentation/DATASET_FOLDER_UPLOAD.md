@@ -17,8 +17,32 @@ The Data Warehouse now supports uploading multiple files as a dataset folder (ZI
 ### 2. Folder Upload (New) ✨
 - **Endpoint**: `POST /datasets/upload/folder/{user_id}`
 - **File Type**: ZIP archive containing multiple files
-- **Metadata**: Simplified (file list, sizes, types only)
-- **Use Case**: Multiple related files, complex datasets
+- **Response**: **202 Accepted** + `UploadJobResponse` (`job_id`, `dataset_id`, `status: queued`)
+- **Metadata**: Available **after the job completes** (file list; for vision, annotation columns too)
+- **Use Case**: Multiple related files, vision image ZIPs, complex datasets
+
+---
+
+## Async job visibility (uploading vs missing)
+
+Folder ZIP ingest is asynchronous. Until the job finishes, `GET /datasets/{user}/{dataset_id}` has no catalog row.
+
+| Situation | HTTP | Meaning |
+|-----------|------|---------|
+| Job still `queued` / `running` | **409** `DATASET_UPLOAD_IN_PROGRESS` (body includes `job_id`, `progress`) | Wait / poll job — not deleted |
+| Wrong id / deleted / never uploaded | **404** | Truly missing |
+| Job `completed` | **200** `DatasetResponse` | Ready for Core / AutoML |
+
+**Poll / rediscover jobs:**
+
+- `GET /datasets/upload/jobs/{job_id}` — status of one job
+- `GET /datasets/upload/jobs/{job_id}/dataset` — final metadata when completed (409 if still running)
+- `GET /datasets/upload/jobs?user_id=...&dataset_id=...&status=queued,running` — resolve by dataset id
+- `GET /datasets/{user_id}/upload/jobs?status=queued,running` — list active jobs (Dashboard refresh recovery)
+
+**Dashboard contract:** return agent action immediately with `job_id`; poll until completed; then `refresh_state`. Do not put incomplete datasets into Agentic Core / AutoML triggers. In-progress uploads do **not** appear in `GET /datasets/{user_id}`.
+
+**Vision annotation metadata (after job completes):** `columns`, `row_count`, `data_types` from the annotation CSV/JSON, plus `custom_metadata.modality=vision`, `annotation_file`, `filename_column`, `label_column`.
 
 ---
 
@@ -27,10 +51,11 @@ The Data Warehouse now supports uploading multiple files as a dataset folder (ZI
 ### Folder Upload Process
 
 1. **Create ZIP Archive** - Package your files into a ZIP
-2. **Upload via API** - Send ZIP to the folder upload endpoint
-3. **Automatic Extraction** - System extracts and uploads all files
-4. **Simplified Metadata** - Stores file list without detailed analysis
+2. **Upload via API** - Send ZIP to the folder upload endpoint → **202** + `job_id`
+3. **Background ingest** - Stage ZIP, extract, validate (vision annotations), upload to MinIO
+4. **Metadata** - Written when the job completes (vision: annotation columns included)
 5. **Version Management** - Auto-increments version (v1, v2, v3)
+6. **Poll** - Client polls job until `completed`, then reads dataset metadata
 
 ### Metadata Differences
 
@@ -47,7 +72,7 @@ The Data Warehouse now supports uploading multiple files as a dataset folder (ZI
 }
 ```
 
-**Folder Upload:**
+**Folder Upload (non-vision):**
 ```json
 {
   "is_folder": true,
@@ -56,22 +81,25 @@ The Data Warehouse now supports uploading multiple files as a dataset folder (ZI
   "columns": null,
   "row_count": null,
   "data_types": null,
-  "files": [
-    {
-      "filename": "data1.csv",
-      "file_path": "datasets/user123/dataset1/v1/data1.csv",
-      "file_size": 2048,
-      "file_type": "csv",
-      "file_hash": "abc123..."
-    },
-    {
-      "filename": "metadata.json",
-      "file_path": "datasets/user123/dataset1/v1/metadata.json",
-      "file_size": 512,
-      "file_type": "json",
-      "file_hash": "def456..."
-    }
-  ]
+  "files": [ "... file list ..." ]
+}
+```
+
+**Folder Upload (vision, after job completes):**
+```json
+{
+  "is_folder": true,
+  "columns": ["filename", "label"],
+  "row_count": 1200,
+  "data_types": {"filename": "object", "label": "object"},
+  "custom_metadata": {
+    "modality": "vision",
+    "annotation_file": "annotations.csv",
+    "filename_column": "filename",
+    "label_column": "label",
+    "file_count": 1201
+  },
+  "files": [ "... images + annotations ..." ]
 }
 ```
 

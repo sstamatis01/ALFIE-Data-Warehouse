@@ -55,10 +55,19 @@ class DatasetMetadata(BaseModel):
     files: Optional[List[DatasetFile]] = Field(None, description="List of files (for folder uploads)")
     is_folder: bool = Field(default=False, description="Whether this is a folder upload")
     
-    # Metadata extracted from file content (single file only)
-    columns: Optional[List[str]] = Field(None, description="Column names for structured data (single file)")
-    row_count: Optional[int] = Field(None, description="Number of rows for structured data (single file)")
-    data_types: Optional[Dict[str, str]] = Field(None, description="Data types for each column (single file)")
+    # Metadata extracted from file content (tabular CSV/Excel, or vision annotation CSV/JSON)
+    columns: Optional[List[str]] = Field(
+        None,
+        description="Column names for structured data (tabular file, or vision annotation file headers)",
+    )
+    row_count: Optional[int] = Field(
+        None,
+        description="Number of rows for structured data (tabular file, or vision annotation rows)",
+    )
+    data_types: Optional[Dict[str, str]] = Field(
+        None,
+        description="Data types for each column (tabular file, or vision annotation columns)",
+    )
     
     # Additional metadata
     tags: List[str] = Field(default_factory=list, description="Tags for categorization")

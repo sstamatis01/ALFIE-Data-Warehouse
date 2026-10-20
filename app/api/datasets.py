@@ -35,6 +35,63 @@ def _split_dataset_display_name(original_name: str) -> str:
     return f"{base}{SPLIT_DATASET_NAME_SUFFIX}"
 
 
+_ACTIVE_UPLOAD_STATUSES = frozenset({"queued", "running"})
+
+
+def _parse_upload_job_statuses(status: Optional[str]) -> list[str]:
+    """Parse comma-separated upload job statuses; default to active (queued,running)."""
+    if not status or not str(status).strip():
+        return ["queued", "running"]
+    parts = [p.strip().lower() for p in str(status).split(",") if p.strip()]
+    allowed = {"queued", "running", "completed", "failed"}
+    out = [p for p in parts if p in allowed]
+    return out or ["queued", "running"]
+
+
+async def _find_active_upload_job(user_id: str, dataset_id: str) -> Optional[dict]:
+    """Return newest queued/running upload job for (user_id, dataset_id), if any."""
+    from ..core.database import get_database
+
+    db = get_database()
+    return await db.upload_jobs.find_one(
+        {
+            "user_id": user_id,
+            "dataset_id": dataset_id,
+            "status": {"$in": list(_ACTIVE_UPLOAD_STATUSES)},
+        },
+        {"_id": 0},
+        sort=[("created_at", -1)],
+    )
+
+
+async def _raise_if_upload_in_progress(user_id: str, dataset_id: str) -> None:
+    """
+    If dataset metadata is missing but an upload job is still active, raise 409
+    with DATASET_UPLOAD_IN_PROGRESS so callers can distinguish uploading vs missing.
+    """
+    job = await _find_active_upload_job(user_id, dataset_id)
+    if not job:
+        return
+    progress = job.get("progress") or {}
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "DATASET_UPLOAD_IN_PROGRESS",
+            "message": "Dataset is still being uploaded",
+            "job_id": job.get("job_id"),
+            "status": job.get("status"),
+            "progress": {
+                "phase": progress.get("phase"),
+                "processed_files": progress.get("processed_files", 0),
+                "total_files": progress.get("total_files"),
+                "message": progress.get("message"),
+            },
+            "dataset_id": dataset_id,
+            "user_id": user_id,
+        },
+    )
+
+
 def _to_dataset_response(dataset: DatasetMetadata) -> DatasetResponse:
     return DatasetResponse(
         dataset_id=dataset.dataset_id,
@@ -178,13 +235,15 @@ async def _run_folder_upload_job(
                 },
             )
 
-            (dataset_files_v1, total_size_v1, split_counts_v1), v2_result = await file_service.upload_dataset_folder_from_zip_path(
-                zip_path=local_zip,
-                user_id=user_id,
-                dataset_id=dataset_id,
-                version=v1,
-                version_split=v2,
-                preserve_structure=preserve_structure,
+            (dataset_files_v1, total_size_v1, split_counts_v1), v2_result, vision_schema = (
+                await file_service.upload_dataset_folder_from_zip_path(
+                    zip_path=local_zip,
+                    user_id=user_id,
+                    dataset_id=dataset_id,
+                    version=v1,
+                    version_split=v2,
+                    preserve_structure=preserve_structure,
+                )
             )
 
         if not dataset_files_v1:
@@ -195,6 +254,21 @@ async def _run_folder_upload_job(
         custom_meta_v1 = {"file_count": len(dataset_files_v1), "preserve_structure": preserve_structure}
         if split_counts_v1:
             custom_meta_v1["split"] = split_counts_v1
+
+        # Vision folders: surface annotation CSV/JSON columns for Agentic Core / UI context
+        ann_columns = None
+        ann_row_count = None
+        ann_data_types = None
+        if vision_schema:
+            ann_columns = vision_schema.get("columns")
+            ann_row_count = vision_schema.get("row_count")
+            ann_data_types = vision_schema.get("data_types")
+            custom_meta_v1["modality"] = "vision"
+            custom_meta_v1["annotation_file"] = vision_schema.get("annotation_file")
+            if vision_schema.get("filename_column"):
+                custom_meta_v1["filename_column"] = vision_schema["filename_column"]
+            if vision_schema.get("label_column"):
+                custom_meta_v1["label_column"] = vision_schema["label_column"]
 
         dataset_metadata_v1 = DatasetMetadata(
             dataset_id=dataset_id,
@@ -208,9 +282,9 @@ async def _run_folder_upload_job(
             original_filename=os.path.basename(zip_object_name),
             files=dataset_files_v1,
             is_folder=True,
-            columns=None,
-            row_count=None,
-            data_types=None,
+            columns=ann_columns,
+            row_count=ann_row_count,
+            data_types=ann_data_types,
             tags=tags,
             custom_metadata=custom_meta_v1,
             created_at=datetime.now(tz=timezone.utc),
@@ -230,6 +304,13 @@ async def _run_folder_upload_job(
                 "preserve_structure": preserve_structure,
                 "split": split_counts,
             }
+            if vision_schema:
+                custom_meta_v2["modality"] = "vision"
+                custom_meta_v2["annotation_file"] = vision_schema.get("annotation_file")
+                if vision_schema.get("filename_column"):
+                    custom_meta_v2["filename_column"] = vision_schema["filename_column"]
+                if vision_schema.get("label_column"):
+                    custom_meta_v2["label_column"] = vision_schema["label_column"]
             dataset_metadata_v2 = DatasetMetadata(
                 dataset_id=dataset_id,
                 user_id=user_id,
@@ -242,9 +323,9 @@ async def _run_folder_upload_job(
                 original_filename=os.path.basename(zip_object_name),
                 files=dataset_files_v2,
                 is_folder=True,
-                columns=None,
-                row_count=None,
-                data_types=None,
+                columns=ann_columns,
+                row_count=ann_row_count,
+                data_types=ann_data_types,
                 tags=tags,
                 custom_metadata=custom_meta_v2,
                 created_at=datetime.now(tz=timezone.utc),
@@ -921,6 +1002,38 @@ async def upload_dataset_folder(
     )
 
 
+@router.get("/upload/jobs", response_model=List[UploadJobResponse])
+async def list_upload_jobs(
+    user_id: str = Query(..., description="Owner user id"),
+    dataset_id: Optional[str] = Query(
+        None, description="Optional dataset_id to filter (resolve in-flight upload by id)"
+    ),
+    status_filter: Optional[str] = Query(
+        None,
+        alias="status",
+        description="Comma-separated statuses (default: queued,running). "
+        "Allowed: queued,running,completed,failed",
+    ),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """
+    List upload jobs for a user (and optional dataset_id).
+
+    Use this to tell uploading-vs-missing apart when you only have dataset_id,
+    or to rediscover in-flight jobs after a Dashboard refresh.
+    """
+    from ..core.database import get_database
+
+    db = get_database()
+    statuses = _parse_upload_job_statuses(status_filter)
+    query: dict = {"user_id": user_id, "status": {"$in": statuses}}
+    if dataset_id:
+        query["dataset_id"] = dataset_id
+    cursor = db.upload_jobs.find(query, {"_id": 0}).sort("created_at", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    return [UploadJobResponse(**doc) for doc in docs]
+
+
 @router.get("/upload/jobs/{job_id}", response_model=UploadJobResponse)
 async def get_upload_job(job_id: str):
     """Get current status/progress of an upload job."""
@@ -1012,12 +1125,40 @@ async def search_datasets(
     ]
 
 
+@router.get("/{user_id}/upload/jobs", response_model=List[UploadJobResponse])
+async def list_user_upload_jobs(
+    user_id: str,
+    status_filter: Optional[str] = Query(
+        None,
+        alias="status",
+        description="Comma-separated statuses (default: queued,running)",
+    ),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """List upload jobs for a user — Dashboard refresh recovery without stored job ids."""
+    from ..core.database import get_database
+
+    db = get_database()
+    statuses = _parse_upload_job_statuses(status_filter)
+    cursor = (
+        db.upload_jobs.find(
+            {"user_id": user_id, "status": {"$in": statuses}},
+            {"_id": 0},
+        )
+        .sort("created_at", -1)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    return [UploadJobResponse(**doc) for doc in docs]
+
+
 @router.get("/{user_id}/{dataset_id}", response_model=DatasetResponse)
 async def get_dataset(user_id: str, dataset_id: str):
     """Get latest dataset metadata by user_id and dataset_id"""
     dataset = await metadata_service.get_latest_dataset(dataset_id, user_id)
     
     if not dataset:
+        await _raise_if_upload_in_progress(user_id, dataset_id)
         raise HTTPException(status_code=404, detail="Dataset not found")
     
     return _to_dataset_response(dataset)
@@ -1117,6 +1258,7 @@ async def download_dataset(
     """
     dataset = await metadata_service.get_latest_dataset(dataset_id, user_id)
     if not dataset:
+        await _raise_if_upload_in_progress(user_id, dataset_id)
         raise HTTPException(status_code=404, detail="Dataset not found")
 
     if dataset.is_folder:
@@ -1171,6 +1313,7 @@ async def download_dataset_by_version(
     """
     dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
     if not dataset:
+        await _raise_if_upload_in_progress(user_id, dataset_id)
         raise HTTPException(status_code=404, detail="Dataset version not found")
 
     if dataset.is_folder:
@@ -1259,7 +1402,8 @@ async def list_dataset_files(
 async def get_dataset_versions(user_id: str, dataset_id: str):
     """Get all versions of a dataset"""
     datasets = await metadata_service.get_dataset_versions(dataset_id, user_id)
-    
+    if not datasets:
+        await _raise_if_upload_in_progress(user_id, dataset_id)
     return [_to_dataset_response(dataset) for dataset in datasets]
 
 
@@ -1268,6 +1412,7 @@ async def get_dataset_by_version(user_id: str, dataset_id: str, version: str):
     """Get a specific version of a dataset"""
     dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
     if not dataset:
+        await _raise_if_upload_in_progress(user_id, dataset_id)
         raise HTTPException(status_code=404, detail="Dataset not found")
     return _to_dataset_response(dataset)
 
