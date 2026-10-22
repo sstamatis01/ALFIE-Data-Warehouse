@@ -182,7 +182,115 @@ def _infer_pos_label(y: pd.Series, explicit: Any = None) -> Any:
     return non_null.value_counts().index[0]
 
 
-def representation(df: pd.DataFrame, col: str) -> dict[str, Any]:
+# Cap for treating a target as discrete for fairness crosstabs / AIF360.
+# Continuous scores (e.g. 564 unique accessibility_score values) must not expand
+# into language × score contingency tables (multi-MB reports that crash agents).
+_FAIRNESS_MAX_DISCRETE_CLASSES = 15
+
+# Agent / UI friendly caps for classification fairness payloads.
+_FAIRNESS_MAX_GROUPS_PER_ATTR = 10
+_FAIRNESS_MAX_INTERSECTION_GROUPS = 20
+_FAIRNESS_MAX_PAIRWISE = 8
+_FAIRNESS_MAX_GROUPS_UNDER_30 = 8
+_FAIRNESS_OTHER_LABEL = "__other__"
+
+
+def is_discrete_fairness_target(y: pd.Series) -> bool:
+    """
+    True when target is suitable for classification-style fairness (DI/SPD, crosstabs).
+
+    Continuous / high-cardinality numeric targets return False.
+    """
+    if y is None or y.empty:
+        return False
+    try:
+        from .class_imbalance import is_discrete_classification_target
+
+        if is_discrete_classification_target(y):
+            return True
+    except Exception:
+        pass
+    nunique = int(y.nunique(dropna=True))
+    if nunique < 2 or nunique > _FAIRNESS_MAX_DISCRETE_CLASSES:
+        return False
+    if pd.api.types.is_object_dtype(y) or pd.api.types.is_categorical_dtype(y):
+        return True
+    if pd.api.types.is_bool_dtype(y):
+        return True
+    if pd.api.types.is_integer_dtype(y):
+        return nunique <= _FAIRNESS_MAX_DISCRETE_CLASSES
+    # Floats with few unique values can be ordinal labels; many uniques → continuous
+    if pd.api.types.is_numeric_dtype(y):
+        return nunique <= min(_FAIRNESS_MAX_DISCRETE_CLASSES, max(2, int(len(y) * 0.05) + 1))
+    return False
+
+
+def _continuous_target_summary(y: pd.Series) -> dict[str, Any]:
+    """Compact stats for regression / continuous targets (no per-value counts)."""
+    s = pd.to_numeric(y, errors="coerce").dropna()
+    out: dict[str, Any] = {
+        "n_rows": int(len(y)),
+        "n_non_null": int(len(s)),
+        "n_unique": int(y.nunique(dropna=True)),
+        "kind": "continuous",
+    }
+    if s.empty:
+        return out
+    out.update(
+        {
+            "mean": float(s.mean()),
+            "std": float(s.std()) if len(s) > 1 else 0.0,
+            "min": float(s.min()),
+            "max": float(s.max()),
+            "median": float(s.median()),
+            "p25": float(s.quantile(0.25)),
+            "p75": float(s.quantile(0.75)),
+        }
+    )
+    return out
+
+
+def _topk_collapse_series(
+    series: pd.Series,
+    max_groups: int = _FAIRNESS_MAX_GROUPS_PER_ATTR,
+    *,
+    other_label: str = _FAIRNESS_OTHER_LABEL,
+) -> Tuple[pd.Series, dict[str, Any]]:
+    """
+    Keep the top-``max_groups`` values by frequency; map the rest to ``other_label``.
+    Returns (collapsed_series, truncation_meta).
+    """
+    filled = series.fillna("<NA>").astype(str)
+    vc = filled.value_counts(dropna=False)
+    n_orig = int(len(vc))
+    if n_orig <= max_groups:
+        return filled, {
+            "truncated": False,
+            "n_groups_original": n_orig,
+            "n_groups_kept": n_orig,
+            "kept_groups": [str(x) for x in vc.index.tolist()],
+            "other_count": 0,
+        }
+    kept = [str(x) for x in vc.head(max_groups).index.tolist()]
+    keep_set = set(kept)
+    collapsed = filled.where(filled.isin(keep_set), other_label)
+    other_count = int((~filled.isin(keep_set)).sum())
+    return collapsed, {
+        "truncated": True,
+        "n_groups_original": n_orig,
+        "n_groups_kept": max_groups,
+        "kept_groups": kept,
+        "other_label": other_label,
+        "other_count": other_count,
+    }
+
+
+def representation(
+    df: pd.DataFrame,
+    col: str,
+    *,
+    max_groups_under_30: int = _FAIRNESS_MAX_GROUPS_UNDER_30,
+) -> dict[str, Any]:
     vc = df[col].fillna("<NA>").astype(str).value_counts(dropna=False)
     total = int(len(df))
     groups = {
@@ -190,33 +298,44 @@ def representation(df: pd.DataFrame, col: str) -> dict[str, Any]:
         for k, v in vc.items()
     }
     counts = [g["count"] for g in groups.values()]
+    under_30 = [k for k, g in groups.items() if g["count"] < 30]
+    under_30_omitted = max(0, len(under_30) - max_groups_under_30)
     return {
         "groups": groups,
         "n_groups": len(groups),
         "largest_group": max(groups, key=lambda k: groups[k]["count"]) if groups else None,
         "smallest_group": min(groups, key=lambda k: groups[k]["count"]) if groups else None,
         "max_min_ratio": round(max(counts) / max(min(counts), 1), 3) if counts else None,
-        "groups_under_30": [k for k, g in groups.items() if g["count"] < 30],
+        "groups_under_30": under_30[:max_groups_under_30],
+        "groups_under_30_omitted": under_30_omitted,
     }
 
 
-def target_by_attribute(df: pd.DataFrame, attr: str, target: str, pos_label: Any) -> dict[str, Any]:
+def target_by_attribute(
+    df: pd.DataFrame,
+    attr: str,
+    target: str,
+    pos_label: Any,
+    *,
+    include_col_percent: bool = False,
+) -> dict[str, Any]:
+    """
+    Compact crosstab: counts + row % + positive rates.
+    ``col_percent_within_label`` is omitted by default (often doubles payload size).
+    """
     crosstab = pd.crosstab(
         df[attr].fillna("<NA>").astype(str),
         df[target].fillna("<NA>").astype(str),
         dropna=False,
     )
-    counts = {r: {c: int(crosstab.loc[r, c]) for c in crosstab.columns} for r in crosstab.index}
+    counts = {
+        str(r): {str(c): int(crosstab.loc[r, c]) for c in crosstab.columns}
+        for r in crosstab.index
+    }
     row_pct: dict[str, dict[str, Optional[float]]] = {}
     for r, cols in counts.items():
         row_total = sum(cols.values())
         row_pct[r] = {c: _pct(n, row_total) for c, n in cols.items()}
-    col_pct: dict[str, dict[str, Optional[float]]] = {}
-    for c in crosstab.columns:
-        col_total = int(crosstab[c].sum())
-        col_pct[str(c)] = {
-            str(r): _pct(int(crosstab.loc[r, c]), col_total) for r in crosstab.index
-        }
     pos_rates: dict[str, Optional[float]] = {}
     pos_key = None
     for c in crosstab.columns:
@@ -228,25 +347,57 @@ def target_by_attribute(df: pd.DataFrame, attr: str, target: str, pos_label: Any
             row_total = int(crosstab.loc[r].sum())
             pos = int(crosstab.loc[r, pos_key])
             pos_rates[str(r)] = _pct(pos, row_total)
-    return {
+    out: dict[str, Any] = {
         "counts": counts,
         "row_percent_within_group": row_pct,
-        "col_percent_within_label": col_pct,
         "positive_rate_by_group": pos_rates,
     }
+    if include_col_percent:
+        col_pct: dict[str, dict[str, Optional[float]]] = {}
+        for c in crosstab.columns:
+            col_total = int(crosstab[c].sum())
+            col_pct[str(c)] = {
+                str(r): _pct(int(crosstab.loc[r, c]), col_total) for r in crosstab.index
+            }
+        out["col_percent_within_label"] = col_pct
+    return out
 
 
 def intersection_representation(
-    df: pd.DataFrame, attrs: list[str], target: str, pos_label: Any
+    df: pd.DataFrame,
+    attrs: list[str],
+    target: str,
+    pos_label: Any,
+    *,
+    max_groups: int = _FAIRNESS_MAX_INTERSECTION_GROUPS,
 ) -> dict[str, Any]:
     if len(attrs) < 2:
         return {}
     tmp = df.copy()
     tmp["_intersection"] = tmp[attrs].fillna("<NA>").astype(str).agg(" | ".join, axis=1)
+    collapsed, trunc = _topk_collapse_series(tmp["_intersection"], max_groups)
+    tmp["_intersection"] = collapsed
+    n_orig = int(trunc.get("n_groups_original") or 0)
+    if n_orig > max_groups * 3:
+        # Extremely combinatorial — skip heavy crosstab; keep compact representation only
+        return {
+            "attributes": attrs,
+            "skipped_crosstab": True,
+            "reason": (
+                f"Intersection has {n_orig} groups; crosstab skipped to keep the report "
+                f"agent-friendly (max={max_groups})."
+            ),
+            "representation": representation(tmp, "_intersection"),
+            "truncation": trunc,
+            "target_by_intersection": {},
+        }
     return {
         "attributes": attrs,
         "representation": representation(tmp, "_intersection"),
-        "target_by_intersection": target_by_attribute(tmp, "_intersection", target, pos_label),
+        "truncation": trunc,
+        "target_by_intersection": target_by_attribute(
+            tmp, "_intersection", target, pos_label, include_col_percent=False
+        ),
     }
 
 
@@ -393,10 +544,16 @@ def compute_aif360_metrics(
 
         if priv is not None:
             pairwise = []
-            for g in sorted(prot.unique()):
-                if str(g) == str(priv):
-                    continue
-                mask = prot.isin([priv, g])
+            # Prefer larger unprivileged groups; cap list for agent-friendly payloads
+            group_sizes = prot.astype(str).value_counts()
+            candidates = [
+                g
+                for g in group_sizes.index.tolist()
+                if str(g) != str(priv) and str(g) != _FAIRNESS_OTHER_LABEL
+            ]
+            omitted_pw = max(0, len(candidates) - _FAIRNESS_MAX_PAIRWISE)
+            for g in candidates[:_FAIRNESS_MAX_PAIRWISE]:
+                mask = prot.astype(str).isin([str(priv), str(g)])
                 y_sub = y[mask].copy()
                 p_sub = prot[mask].astype(str)
                 try:
@@ -425,6 +582,8 @@ def compute_aif360_metrics(
                         {"privileged": priv, "unprivileged": str(g), "error": str(e)}
                     )
             entry["pairwise_vs_privileged"] = pairwise
+            if omitted_pw:
+                entry["pairwise_omitted"] = omitted_pw
 
         out["per_attribute"][attr] = entry
 
@@ -599,22 +758,125 @@ def build_fairness_profile(
         )
 
     y = df[target]
+
+    # Continuous / high-cardinality targets: representation only (no AIF360 crosstabs).
+    # Treating every distinct float score as a class produces multi-MB reports and
+    # invalid DI/SPD (e.g. accessibility_score with hundreds of unique values).
+    if not is_discrete_fairness_target(y):
+        n_unique = int(y.nunique(dropna=True))
+        logger.info(
+            "Fairness profile: target '%s' is continuous/high-cardinality "
+            "(n_unique=%s); skipping AIF360 crosstabs (representation only)",
+            target,
+            n_unique,
+        )
+        skip_reason = (
+            f"Target '{target}' looks continuous or has too many distinct values "
+            f"(n_unique={n_unique}, max_discrete={_FAIRNESS_MAX_DISCRETE_CLASSES}). "
+            "Classification-style fairness (DI/SPD, label crosstabs) was skipped. "
+            "Regression group fairness is not implemented yet."
+        )
+        df_rep = df.copy()
+        trunc_cont: dict[str, Any] = {}
+        for a in attrs:
+            collapsed, meta = _topk_collapse_series(df_rep[a], _FAIRNESS_MAX_GROUPS_PER_ATTR)
+            df_rep[a] = collapsed
+            trunc_cont[a] = meta
+        rep = {a: representation(df_rep, a) for a in attrs}
+        heur = resolved.get("heuristic_candidates") or []
+        if isinstance(heur, list) and len(heur) > 10:
+            heur = heur[:10]
+        return OrderedDict(
+            [
+                (
+                    "config",
+                    {
+                        "target_column": target,
+                        "pos_label": None,
+                        "protected_attributes": attrs,
+                        "privileged_groups": privileged,
+                        "source": source,
+                        "heuristic_candidates": heur,
+                        "target_kind": "continuous",
+                        "fairness_mode": "representation_only",
+                        "truncation": trunc_cont,
+                    },
+                ),
+                (
+                    "global_target_balance",
+                    {
+                        "summary": _continuous_target_summary(y),
+                        "counts": None,
+                        "comment": skip_reason,
+                    },
+                ),
+                ("representation", rep),
+                ("target_by_attribute", {}),
+                ("intersection", {}),
+                (
+                    "aif360_metrics",
+                    {
+                        "skipped": True,
+                        "reason": skip_reason,
+                        "library": "aif360",
+                    },
+                ),
+                ("alerts", build_alerts(rep, {"per_attribute": {}})),
+            ]
+        )
+
     pos = _infer_pos_label(y, pos_label)
     try:
         pos_out: Any = pos.item() if hasattr(pos, "item") else pos
     except Exception:
         pos_out = pos
-    total = int(len(df))
-    target_vc = y.value_counts(dropna=False)
+
+    # Collapse high-cardinality protected attrs (and rare labels) so crosstabs stay small
+    df_f = df.copy()
+    truncation: dict[str, Any] = {}
+    for a in attrs:
+        collapsed, meta = _topk_collapse_series(
+            df_f[a], _FAIRNESS_MAX_GROUPS_PER_ATTR
+        )
+        df_f[a] = collapsed
+        truncation[a] = meta
+    y_f = df_f[target]
+    y_collapsed, y_trunc = _topk_collapse_series(
+        y_f, _FAIRNESS_MAX_DISCRETE_CLASSES
+    )
+    if y_trunc.get("truncated"):
+        df_f[target] = y_collapsed
+        y_f = y_collapsed
+        truncation[target] = y_trunc
+        # Re-infer pos_label if the original positive class was collapsed away
+        if pos_out is not None and str(pos_out) not in set(y_f.unique().astype(str)):
+            pos = _infer_pos_label(y_f, None)
+            try:
+                pos_out = pos.item() if hasattr(pos, "item") else pos
+            except Exception:
+                pos_out = pos
+
+    total = int(len(df_f))
+    target_vc = y_f.value_counts(dropna=False)
     target_balance = {
         str(k): {"count": int(v), "percent": _pct(int(v), total)}
         for k, v in target_vc.items()
     }
-    rep = {a: representation(df, a) for a in attrs}
-    tba = {a: target_by_attribute(df, a, target, pos) for a in attrs}
-    inter = intersection_representation(df, attrs, target, pos)
-    aif = compute_aif360_metrics(df, target, attrs, privileged, pos)
+    rep = {a: representation(df_f, a) for a in attrs}
+    tba = {
+        a: target_by_attribute(
+            df_f, a, target, pos, include_col_percent=False
+        )
+        for a in attrs
+    }
+    inter = intersection_representation(df_f, attrs, target, pos)
+    aif = compute_aif360_metrics(df_f, target, attrs, privileged, pos)
     alerts = build_alerts(rep, aif)
+
+    # Keep heuristic candidate list short in the payload
+    heur = resolved.get("heuristic_candidates") or []
+    if isinstance(heur, list) and len(heur) > 10:
+        heur = heur[:10]
 
     return OrderedDict(
         [
@@ -626,7 +888,17 @@ def build_fairness_profile(
                     "protected_attributes": attrs,
                     "privileged_groups": privileged,
                     "source": source,
-                    "heuristic_candidates": resolved.get("heuristic_candidates") or [],
+                    "heuristic_candidates": heur,
+                    "target_kind": "discrete",
+                    "fairness_mode": "classification",
+                    "truncation": truncation,
+                    "payload_limits": {
+                        "max_groups_per_attribute": _FAIRNESS_MAX_GROUPS_PER_ATTR,
+                        "max_discrete_classes": _FAIRNESS_MAX_DISCRETE_CLASSES,
+                        "max_intersection_groups": _FAIRNESS_MAX_INTERSECTION_GROUPS,
+                        "max_pairwise": _FAIRNESS_MAX_PAIRWISE,
+                        "col_percent_within_label": False,
+                    },
                 },
             ),
             (
@@ -635,7 +907,8 @@ def build_fairness_profile(
                     "counts": target_balance,
                     "comment": (
                         "Overall label balance; use representation / target_by_attribute "
-                        "for subgroup skew that global counts hide."
+                        "for subgroup skew that global counts hide. High-cardinality "
+                        "groups may be collapsed into '__other__'."
                     ),
                 },
             ),
