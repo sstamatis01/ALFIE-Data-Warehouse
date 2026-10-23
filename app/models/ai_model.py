@@ -272,6 +272,19 @@ class DeploymentInstructionsResponse(BaseModel):
         ...,
         description="Where text was resolved from: metadata | minio | zip | bundled",
     )
+    training_dataset: Optional[str] = Field(
+        None, description="Dataset id linked on the model (if any)"
+    )
+    mitigation_applied: bool = Field(
+        False,
+        description="True when bias-mitigator transformation details were appended",
+    )
+    mitigated_dataset_version: Optional[str] = Field(
+        None, description="Dataset version that received mitigation (e.g. v3)"
+    )
+    transformation_report_id: Optional[str] = Field(
+        None, description="Mongo id of the transformation report, when found"
+    )
 
     model_config = ConfigDict(protected_namespaces=())
 

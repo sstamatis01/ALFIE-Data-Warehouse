@@ -68,6 +68,26 @@ class TransformationReportService:
             updated_at=_ensure_datetime(doc["updated_at"]),
         )
 
+    async def get_latest_report_for_dataset(
+        self, user_id: str, dataset_id: str
+    ) -> Optional[TransformationReportResponse]:
+        """Most recently updated transformation report for a dataset (any version)."""
+        doc = await self.collection.find_one(
+            {"user_id": user_id, "dataset_id": dataset_id},
+            sort=[("updated_at", -1), ("created_at", -1)],
+        )
+        if not doc:
+            return None
+        return TransformationReportResponse(
+            id=str(doc.get("_id")) if doc.get("_id") else None,
+            user_id=doc["user_id"],
+            dataset_id=doc["dataset_id"],
+            version=doc["version"],
+            report=doc["report"],
+            created_at=_ensure_datetime(doc["created_at"]),
+            updated_at=_ensure_datetime(doc["updated_at"]),
+        )
+
     async def delete_report(self, user_id: str, dataset_id: str, version: str) -> bool:
         """Delete a transformation report"""
         result = await self.collection.delete_one({"user_id": user_id, "dataset_id": dataset_id, "version": version})

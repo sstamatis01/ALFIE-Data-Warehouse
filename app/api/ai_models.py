@@ -13,10 +13,12 @@ from ..services.ai_model_service import ai_model_service
 from ..services.kafka_service import kafka_producer_service
 from ..services.metadata_service import metadata_service
 from ..services.deployment_instructions import (
+    append_mitigation_section,
     bundled_fallback,
     extract_from_text_file,
     is_deployment_instructions_filename,
     modality_from_model_type,
+    resolve_mitigation_for_model,
 )
 from ..core.database import get_database
 
@@ -544,6 +546,10 @@ async def get_model_deployment_instructions(
       1. Cached text on the model Mongo document (set at upload from ZIP)
       2. ``*_deployment_instructions.md`` file already in MinIO for this version
       3. Bundled AutoDW fallback under ``static_docs/deployment/`` by modality
+
+    When the model has ``training_dataset`` and bias mitigation ran for that
+    dataset, a summary of logged transformations (plus illustrative snippets)
+    is appended to ``instructions``.
     """
     try:
         db = get_database()
@@ -566,86 +572,102 @@ async def get_model_deployment_instructions(
         modality = model.get("deployment_instructions_modality") or modality_from_model_type(
             model.get("model_type")
         )
+        training_dataset = model.get("training_dataset")
+
+        instructions: Optional[str] = None
+        filename: Optional[str] = None
+        source: Optional[str] = None
+        resolved_modality = modality
 
         # 1) Mongo cache
         cached = (model.get("deployment_instructions") or "").strip()
         if cached:
-            return DeploymentInstructionsResponse(
-                user_id=user_id,
-                model_id=model_id,
-                version=resolved_version,
-                instructions=cached,
-                modality=modality,
-                filename=model.get("deployment_instructions_filename"),
-                source="metadata",
-            )
-
-        # 2) MinIO file listed on the model
-        files = model.get("files") or []
-        found = None
-        for f in files:
-            filename = f.get("filename") if isinstance(f, dict) else getattr(f, "filename", None)
-            file_path = f.get("file_path") if isinstance(f, dict) else getattr(f, "file_path", None)
-            if not filename or not file_path:
-                continue
-            if not is_deployment_instructions_filename(filename):
-                continue
-            try:
-                raw = await ai_model_service.download_model_file(file_path)
-                found = extract_from_text_file(filename, raw)
-                if found:
-                    found["source"] = "minio"
-                    break
-            except Exception as e:
-                logger.warning("Failed reading %s for deployment instructions: %s", file_path, e)
-        if found:
-            # Lazy backfill so subsequent calls hit Mongo
-            try:
-                await collection.update_one(
-                    {"user_id": user_id, "model_id": model_id, "version": resolved_version},
-                    {
-                        "$set": {
-                            "deployment_instructions": found["instructions"],
-                            "deployment_instructions_filename": found.get("filename"),
-                            "deployment_instructions_modality": found.get("modality") or modality,
-                            "updated_at": datetime.now(tz=timezone.utc),
-                        }
-                    },
+            instructions = cached
+            filename = model.get("deployment_instructions_filename")
+            source = "metadata"
+        else:
+            # 2) MinIO file listed on the model
+            files = model.get("files") or []
+            found = None
+            for f in files:
+                fname = f.get("filename") if isinstance(f, dict) else getattr(f, "filename", None)
+                file_path = f.get("file_path") if isinstance(f, dict) else getattr(f, "file_path", None)
+                if not fname or not file_path:
+                    continue
+                if not is_deployment_instructions_filename(fname):
+                    continue
+                try:
+                    raw = await ai_model_service.download_model_file(file_path)
+                    found = extract_from_text_file(fname, raw)
+                    if found:
+                        found["source"] = "minio"
+                        break
+                except Exception as e:
+                    logger.warning(
+                        "Failed reading %s for deployment instructions: %s", file_path, e
+                    )
+            if found:
+                try:
+                    await collection.update_one(
+                        {
+                            "user_id": user_id,
+                            "model_id": model_id,
+                            "version": resolved_version,
+                        },
+                        {
+                            "$set": {
+                                "deployment_instructions": found["instructions"],
+                                "deployment_instructions_filename": found.get("filename"),
+                                "deployment_instructions_modality": found.get("modality")
+                                or modality,
+                                "updated_at": datetime.now(tz=timezone.utc),
+                            }
+                        },
+                    )
+                except Exception as e:
+                    logger.warning("Could not backfill deployment instructions: %s", e)
+                instructions = found["instructions"]
+                filename = found.get("filename")
+                resolved_modality = found.get("modality") or modality
+                source = "minio"
+            else:
+                # 3) Bundled static fallback (no AutoML host dependency)
+                bundled = bundled_fallback(modality) or (
+                    bundled_fallback("tabular") if modality is None else None
                 )
-            except Exception as e:
-                logger.warning("Could not backfill deployment instructions: %s", e)
-            return DeploymentInstructionsResponse(
-                user_id=user_id,
-                model_id=model_id,
-                version=resolved_version,
-                instructions=found["instructions"],
-                modality=found.get("modality") or modality,
-                filename=found.get("filename"),
-                source="minio",
+                if bundled:
+                    instructions = bundled["instructions"]
+                    filename = bundled.get("filename")
+                    resolved_modality = bundled.get("modality") or modality
+                    source = "bundled"
+
+        if not instructions or not source:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No deployment instructions found for this model. "
+                    "Expected tabular_deployment_instructions.md or "
+                    "vision_deployment_instructions.md in the model artifact."
+                ),
             )
 
-        # 3) Bundled static fallback (no AutoML host dependency)
-        bundled = bundled_fallback(modality) or (
-            bundled_fallback("tabular") if modality is None else None
+        mitigation = await resolve_mitigation_for_model(user_id, training_dataset)
+        instructions = append_mitigation_section(
+            instructions, mitigation.get("markdown")
         )
-        if bundled:
-            return DeploymentInstructionsResponse(
-                user_id=user_id,
-                model_id=model_id,
-                version=resolved_version,
-                instructions=bundled["instructions"],
-                modality=bundled.get("modality") or modality,
-                filename=bundled.get("filename"),
-                source="bundled",
-            )
 
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "No deployment instructions found for this model. "
-                "Expected tabular_deployment_instructions.md or "
-                "vision_deployment_instructions.md in the model artifact."
-            ),
+        return DeploymentInstructionsResponse(
+            user_id=user_id,
+            model_id=model_id,
+            version=resolved_version,
+            instructions=instructions,
+            modality=resolved_modality,
+            filename=filename,
+            source=source,
+            training_dataset=mitigation.get("training_dataset") or training_dataset,
+            mitigation_applied=bool(mitigation.get("mitigation_applied")),
+            mitigated_dataset_version=mitigation.get("mitigated_dataset_version"),
+            transformation_report_id=mitigation.get("transformation_report_id"),
         )
     except HTTPException:
         raise
