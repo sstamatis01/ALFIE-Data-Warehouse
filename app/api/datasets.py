@@ -38,6 +38,57 @@ def _split_dataset_display_name(original_name: str) -> str:
 _ACTIVE_UPLOAD_STATUSES = frozenset({"queued", "running"})
 
 
+async def _stream_folder_download(
+    dataset: DatasetMetadata,
+    *,
+    subfolder: Optional[str],
+    archive_basename: str,
+) -> StreamingResponse:
+    """
+    Prefer streaming a pre-built MinIO archive (fast path for large vision splits).
+    Fall back to on-the-fly ZIP assembly when no archive exists yet.
+    """
+    folder_path = resolve_storage_path(dataset, dataset.file_path)
+    prebuilt = file_service.resolve_prebuilt_archive(
+        folder_path,
+        subfolder,
+        archive_basename=archive_basename,
+    )
+    if prebuilt:
+        headers = {
+            "Content-Disposition": f"attachment; filename={prebuilt['filename']}",
+            "X-AutoDW-Archive": "prebuilt",
+        }
+        if prebuilt.get("size"):
+            headers["Content-Length"] = str(prebuilt["size"])
+        logger.info(
+            "Streaming pre-built archive %s (%s bytes)",
+            prebuilt["object_key"],
+            prebuilt.get("size"),
+        )
+        return StreamingResponse(
+            file_service.iter_object_chunks(prebuilt["object_key"]),
+            media_type=prebuilt["media_type"],
+            headers=headers,
+        )
+
+    file_data, download_name, media_type = await file_service.download_folder_subset(
+        folder_path,
+        subfolder_prefix=subfolder,
+        archive_basename=archive_basename,
+        prefer_prebuilt=False,
+        store_archive_if_missing=True,
+    )
+    return StreamingResponse(
+        BytesIO(file_data),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f"attachment; filename={download_name}",
+            "X-AutoDW-Archive": "onthefly",
+        },
+    )
+
+
 def _parse_upload_job_statuses(status: Optional[str]) -> list[str]:
     """Parse comma-separated upload job statuses; default to active (queued,running)."""
     if not status or not str(status).strip():
@@ -1278,15 +1329,10 @@ async def download_dataset(
         subfolder = None
         if split and split in ("train", "test", "drift") and (dataset.custom_metadata or {}).get("split"):
             subfolder = split
-        file_data, download_name, media_type = await file_service.download_folder_subset(
-            resolve_storage_path(dataset, dataset.file_path),
-            subfolder_prefix=subfolder,
+        return await _stream_folder_download(
+            dataset,
+            subfolder=subfolder,
             archive_basename=f"{dataset_id}_{dataset.version}",
-        )
-        return StreamingResponse(
-            BytesIO(file_data),
-            media_type=media_type,
-            headers={"Content-Disposition": f"attachment; filename={download_name}"},
         )
     file_data = await file_service.download_file(
         resolve_storage_path(dataset, dataset.file_path)
@@ -1310,6 +1356,7 @@ async def download_dataset_by_version(
     Download a specific version of a dataset file or folder.
     Use split=train|test|drift to download only that subset when the dataset has a split.
     Tabular split subsets with one file return a ZIP containing that file (AutoML Tabular expects one file per archive).
+    Large vision splits prefer a pre-built ``archives/{split}.zip`` streamed from MinIO.
     """
     dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
     if not dataset:
@@ -1333,15 +1380,10 @@ async def download_dataset_by_version(
         subfolder = None
         if split and split in ("train", "test", "drift") and (dataset.custom_metadata or {}).get("split"):
             subfolder = split
-        file_data, download_name, media_type = await file_service.download_folder_subset(
-            resolve_storage_path(dataset, dataset.file_path),
-            subfolder_prefix=subfolder,
+        return await _stream_folder_download(
+            dataset,
+            subfolder=subfolder,
             archive_basename=f"{dataset_id}_{version}",
-        )
-        return StreamingResponse(
-            BytesIO(file_data),
-            media_type=media_type,
-            headers={"Content-Disposition": f"attachment; filename={download_name}"},
         )
     file_data = await file_service.download_file(
         resolve_storage_path(dataset, dataset.file_path)
@@ -1351,6 +1393,64 @@ async def download_dataset_by_version(
         media_type='application/octet-stream',
         headers={"Content-Disposition": f"attachment; filename={dataset.original_filename}"}
     )
+
+
+@router.post("/{user_id}/{dataset_id}/version/{version}/build-archives")
+async def build_dataset_download_archives(
+    user_id: str,
+    dataset_id: str,
+    version: str,
+    force: bool = Query(
+        False,
+        description="Rebuild archives even if they already exist",
+    ),
+    splits: Optional[str] = Query(
+        None,
+        description="Comma-separated splits to build (default: train,test,drift when dataset has a split; else full)",
+    ),
+):
+    """
+    Pre-build download ZIPs under ``.../archives/`` for a folder dataset version.
+
+    Use this once for existing large vision datasets so subsequent
+    ``GET .../download?split=train`` streams a single MinIO object instead of
+    zipping thousands of images on each request.
+    """
+    dataset = await metadata_service.get_dataset_by_version(dataset_id, user_id, version)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset version not found")
+    if not dataset.is_folder:
+        raise HTTPException(
+            status_code=400,
+            detail="build-archives applies to folder datasets only",
+        )
+
+    folder_path = resolve_storage_path(dataset, dataset.file_path)
+    has_split = bool((dataset.custom_metadata or {}).get("split"))
+    if splits and str(splits).strip():
+        split_list = tuple(
+            s.strip() for s in str(splits).split(",") if s.strip() in ("train", "test", "drift")
+        )
+        if not split_list:
+            raise HTTPException(status_code=400, detail="No valid splits in query")
+        result = await file_service.ensure_split_archives(
+            folder_path, splits=split_list, force=force
+        )
+    elif has_split:
+        result = await file_service.ensure_split_archives(folder_path, force=force)
+    else:
+        built = await file_service.build_and_store_folder_archive(
+            folder_path, None, force=force
+        )
+        result = {"full": built}
+
+    return {
+        "user_id": user_id,
+        "dataset_id": dataset_id,
+        "version": version,
+        "folder_path": folder_path,
+        "archives": result,
+    }
 
 
 @router.get("/{user_id}/{dataset_id}/files", response_model=List[DatasetFile])

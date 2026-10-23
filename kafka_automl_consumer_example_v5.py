@@ -91,6 +91,24 @@ if AUTOML_ENGINE_HOST == "localhost" and "kafka" in os.getenv("KAFKA_BOOTSTRAP_S
 
 # Large dataset downloads from DW (ZIP) can take many minutes; default 2h, override with env.
 DW_DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("AUTOML_DW_DOWNLOAD_TIMEOUT_SECONDS", str(2 * 60 * 60)))
+# Metadata used to share the download timeout (was hardcoded 30s and caused false AutoML failures).
+DW_METADATA_TIMEOUT_SECONDS = int(
+    os.getenv("AUTOML_DW_METADATA_TIMEOUT_SECONDS", str(min(300, DW_DOWNLOAD_TIMEOUT_SECONDS)))
+)
+
+# Dataset access: http (API download), minio (direct S3 to prebuilt archives), auto (minio then http).
+DATASET_ACCESS_MODE = (os.getenv("DATASET_ACCESS_MODE") or "auto").strip().lower()
+MINIO_ENDPOINT = (os.getenv("MINIO_ENDPOINT") or "").strip()
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", os.getenv("MINIO_ROOT_USER", "minioadmin"))
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", os.getenv("MINIO_ROOT_PASSWORD", "minioadmin"))
+MINIO_SECURE = (os.getenv("MINIO_SECURE") or "false").strip().lower() in ("1", "true", "yes")
+MINIO_BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "data-warehouse")
+# Vision: skip consumer-side DW ZIP download (engine fetches from DW itself). Default on.
+AUTOML_VISION_SKIP_DW_DOWNLOAD = (os.getenv("AUTOML_VISION_SKIP_DW_DOWNLOAD") or "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 AUTOML_429_MAX_WAIT_SECONDS = int(os.getenv("AUTOML_429_MAX_WAIT_SECONDS", "900"))  # 15 min
 AUTOML_429_BASE_SLEEP_SECONDS = float(os.getenv("AUTOML_429_BASE_SLEEP_SECONDS", "5"))
@@ -127,10 +145,14 @@ def compute_request_timeouts(time_budget_seconds: int) -> tuple[float, float]:
 # Helpful startup diagnostics (esp. vision + large ZIP training)
 _c_demo, _r_demo = compute_request_timeouts(10)
 logger.info(
-    "AutoML HTTP timeouts: DW download read timeout=%ss, example AutoML read timeout (time_budget=10s)=%ss "
-    "(override read with AUTOML_HTTP_READ_TIMEOUT_SECONDS; override DW download with AUTOML_DW_DOWNLOAD_TIMEOUT_SECONDS)",
+    "AutoML HTTP timeouts: DW download=%ss metadata=%ss, example AutoML read (time_budget=10s)=%ss; "
+    "DATASET_ACCESS_MODE=%s MINIO_ENDPOINT=%s VISION_SKIP_DW_DOWNLOAD=%s",
     DW_DOWNLOAD_TIMEOUT_SECONDS,
+    DW_METADATA_TIMEOUT_SECONDS,
     int(_r_demo),
+    DATASET_ACCESS_MODE,
+    MINIO_ENDPOINT or "(unset)",
+    AUTOML_VISION_SKIP_DW_DOWNLOAD,
 )
 
 def normalize_tabular_task_type(task_type: str | None) -> str | None:
@@ -289,9 +311,64 @@ def fetch_dataset_metadata(user_id: str, dataset_id: str, version: str = None) -
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}"
     else:
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}"
-    r = requests.get(url, timeout=30)
+    r = requests.get(url, timeout=DW_METADATA_TIMEOUT_SECONDS)
     r.raise_for_status()
     return r.json()
+
+
+def _minio_client():
+    if not MINIO_ENDPOINT:
+        return None
+    try:
+        from minio import Minio
+    except ImportError:
+        logger.warning("minio package not installed; cannot use DATASET_ACCESS_MODE=minio/auto")
+        return None
+    return Minio(
+        MINIO_ENDPOINT,
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        secure=MINIO_SECURE,
+    )
+
+
+def _minio_archive_object_key(user_id: str, dataset_id: str, version: str, split: str | None) -> str:
+    name = f"{split}.zip" if split in ("train", "test", "drift") else "full.zip"
+    return f"datasets/{user_id}/{dataset_id}/{version}/archives/{name}"
+
+
+def download_dataset_via_minio(
+    user_id: str, dataset_id: str, version: str, split: str | None = None
+) -> bytes | None:
+    """
+    Fetch a pre-built archive directly from MinIO (same Docker network as AutoDW).
+
+    Returns None if MinIO is unset, the object is missing, or the read fails — caller
+    should fall back to the HTTP download API.
+    """
+    client = _minio_client()
+    if client is None:
+        return None
+    ver = version or "v1"
+    object_key = _minio_archive_object_key(user_id, dataset_id, ver, split)
+    try:
+        client.stat_object(MINIO_BUCKET_NAME, object_key)
+    except Exception:
+        logger.info("MinIO archive not found at %s; will fall back to HTTP if needed", object_key)
+        return None
+    try:
+        logger.info("Downloading dataset via MinIO: s3://%s/%s", MINIO_BUCKET_NAME, object_key)
+        response = client.get_object(MINIO_BUCKET_NAME, object_key)
+        try:
+            data = response.read()
+        finally:
+            response.close()
+            response.release_conn()
+        logger.info("MinIO download OK: %s bytes", len(data))
+        return data
+    except Exception as e:
+        logger.warning("MinIO download failed for %s: %s", object_key, e)
+        return None
 
 
 def read_csv_with_encoding(file_data: bytes) -> pd.DataFrame:
@@ -381,8 +458,10 @@ def load_tabular_dataframe(file_bytes: bytes) -> pd.DataFrame:
         raise ValueError(f"Could not load tabular dataframe from downloaded bytes: {e}")
 
 
-def download_dataset_file(user_id: str, dataset_id: str, version: str = None, split: str = None) -> bytes:
-    """Download dataset file (single file or folder as ZIP). If split is 'train', 'test', or 'drift', download only that subset (for split datasets)."""
+def download_dataset_file_http(
+    user_id: str, dataset_id: str, version: str = None, split: str = None
+) -> bytes:
+    """HTTP download via AutoDW API (works across machines; serves prebuilt archive when present)."""
     if version:
         url = f"{API_BASE}/datasets/{user_id}/{dataset_id}/version/{version}/download"
     else:
@@ -393,6 +472,29 @@ def download_dataset_file(user_id: str, dataset_id: str, version: str = None, sp
     r.raise_for_status()
     return r.content
 
+
+def download_dataset_file(
+    user_id: str, dataset_id: str, version: str = None, split: str = None
+) -> bytes:
+    """
+    Download dataset file (single file or folder as ZIP).
+
+    MODE (DATASET_ACCESS_MODE):
+      - minio: MinIO prebuilt archive only (error if missing)
+      - http: AutoDW GET download only
+      - auto: try MinIO archive first, then HTTP (default when co-located)
+    """
+    mode = DATASET_ACCESS_MODE
+    if mode in ("minio", "auto") and version:
+        data = download_dataset_via_minio(user_id, dataset_id, version, split)
+        if data is not None:
+            return data
+        if mode == "minio":
+            raise FileNotFoundError(
+                f"MinIO archive missing for {user_id}/{dataset_id}/{version} split={split}. "
+                "Run POST .../build-archives on AutoDW first, or set DATASET_ACCESS_MODE=http|auto."
+            )
+    return download_dataset_file_http(user_id, dataset_id, version, split)
 
 def extract_dataset_folder(zip_bytes: bytes, extract_to: str = "temp_dataset") -> list:
     """
@@ -760,7 +862,9 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
         logger.info(f"  Task category: {task_category}")
         logger.info(f"  Time budget: {time_budget} seconds")
         
-        # Step 1: Fetch dataset metadata and download file (for validation/preprocessing)
+        # Step 1: Fetch dataset metadata; download bytes only when the consumer needs them
+        # (tabular validation). Vision skips the ZIP pull — the engine downloads from DW.
+        file_bytes = None
         try:
             logger.info(f"Fetching dataset metadata from: {API_BASE}")
             metadata = fetch_dataset_metadata(user_id, dataset_id, dataset_version)
@@ -777,16 +881,31 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
             download_split = "train" if has_split else None
             if download_split:
                 logger.info(
-                    f"Dataset has train/test/drift split; downloading '{download_split}' split for {task_category} AutoML"
+                    f"Dataset has train/test/drift split; will use '{download_split}' split for {task_category} AutoML"
                 )
             
             logger.info(f"Dataset type: {'FOLDER' if is_folder else 'SINGLE FILE'}")
             if is_folder:
                 logger.info(f"File count: {file_count}")
-            
-            logger.info(f"Downloading dataset file from: {API_BASE}")
-            file_bytes = download_dataset_file(user_id, dataset_id, dataset_version, split=download_split)
-            logger.info(f"Dataset downloaded: {len(file_bytes)} bytes")
+
+            skip_download = (
+                task_category == "vision" and AUTOML_VISION_SKIP_DW_DOWNLOAD
+            )
+            if skip_download:
+                logger.info(
+                    "Skipping consumer DW dataset download for vision "
+                    "(AUTOML_VISION_SKIP_DW_DOWNLOAD=true); engine will fetch from DW"
+                )
+            else:
+                logger.info(
+                    "Downloading dataset (mode=%s) via %s",
+                    DATASET_ACCESS_MODE,
+                    "MinIO/HTTP" if DATASET_ACCESS_MODE != "http" else API_BASE,
+                )
+                file_bytes = download_dataset_file(
+                    user_id, dataset_id, dataset_version, split=download_split
+                )
+                logger.info(f"Dataset downloaded: {len(file_bytes)} bytes")
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout while fetching dataset from {API_BASE}")
             logger.error(f"   Error: {e}")

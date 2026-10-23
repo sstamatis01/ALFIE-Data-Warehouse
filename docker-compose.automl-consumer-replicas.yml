@@ -25,6 +25,13 @@ services:
       API_BASE: http://api:8000
       DW_HOST: api
       DW_PORT: 8000
+      DATASET_ACCESS_MODE: auto
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: "false"
+      MINIO_BUCKET_NAME: data-warehouse
+      AUTOML_VISION_SKIP_DW_DOWNLOAD: "true"
       AUTOML_ENGINE_HOST: host.docker.internal
       AUTOML_ENGINE_PORT: "8001"
       TABULAR_AUTOML_HOST: host.docker.internal

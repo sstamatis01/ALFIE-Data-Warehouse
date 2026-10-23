@@ -21,6 +21,8 @@ SPLIT_TRAIN_RATIO = 0.70
 SPLIT_TEST_RATIO = 0.15
 SPLIT_DRIFT_RATIO = 0.15
 SPLIT_SUBFOLDERS = ("train", "test", "drift")
+# Pre-built download archives live beside split folders (not inside train/test/drift).
+ARCHIVE_DIRNAME = "archives"
 
 
 def stratified_train_test_drift_indices(
@@ -117,6 +119,189 @@ class FileService:
     ) -> str:
         """Generate path with train/test/drift subfolder. Format: datasets/user1/dataset_id/v1/train/filename.csv"""
         return f"datasets/{user_id}/{dataset_id}/{version}/{subfolder}/{filename}"
+
+    @staticmethod
+    def dataset_version_folder_path(user_id: str, dataset_id: str, version: str) -> str:
+        return f"datasets/{user_id}/{dataset_id}/{version}/"
+
+    @staticmethod
+    def archive_object_key(folder_path: str, split: Optional[str] = None) -> str:
+        """
+        Object key for a pre-built download ZIP.
+
+        Examples:
+          datasets/u/d/v2/archives/train.zip
+          datasets/u/d/v1/archives/full.zip
+        """
+        base = (folder_path or "").rstrip("/")
+        name = f"{split}.zip" if split else "full.zip"
+        return f"{base}/{ARCHIVE_DIRNAME}/{name}"
+
+    def object_exists(self, object_name: str) -> bool:
+        try:
+            self.client.stat_object(self.bucket_name, object_name)
+            return True
+        except S3Error:
+            return False
+        except Exception:
+            return False
+
+    def iter_object_chunks(self, object_name: str, *, chunk_size: int = 1024 * 1024):
+        """Yield bytes from a MinIO object (for StreamingResponse)."""
+        response = self.client.get_object(self.bucket_name, object_name)
+        try:
+            for chunk in response.stream(chunk_size):
+                if chunk:
+                    yield chunk
+        finally:
+            try:
+                response.close()
+            finally:
+                response.release_conn()
+
+    def _list_folder_member_objects(
+        self, folder_path: str, subfolder_prefix: Optional[str] = None
+    ) -> List[Tuple[str, str]]:
+        """
+        List (object_name, zip_entry_name) under a folder, excluding ``archives/``.
+        """
+        prefix = folder_path if not subfolder_prefix else (
+            f"{folder_path.rstrip('/')}/{subfolder_prefix}/"
+        )
+        archive_marker = f"/{ARCHIVE_DIRNAME}/"
+        pairs: List[Tuple[str, str]] = []
+        for obj in self.client.list_objects(
+            self.bucket_name, prefix=prefix, recursive=True
+        ):
+            name = obj.object_name or ""
+            if not name or name.endswith("/"):
+                continue
+            if archive_marker in f"/{name}" or name.rstrip("/").endswith(f"/{ARCHIVE_DIRNAME}"):
+                continue
+            zip_path = name.replace(prefix, "", 1).lstrip("/")
+            if zip_path:
+                pairs.append((name, zip_path))
+        return pairs
+
+    def _build_zip_file_from_objects(
+        self,
+        members: List[Tuple[str, str]],
+        dest_path: str,
+        *,
+        compression: int = zipfile.ZIP_STORED,
+    ) -> int:
+        """
+        Write members (object_name, zip_entry) into dest_path. Returns member count.
+
+        Uses ZIP_STORED by default — vision payloads are usually already compressed
+        (JPEG/PNG), and STORED is much faster for 10k+ files.
+        """
+        if not members:
+            raise HTTPException(status_code=404, detail="No files found in folder")
+        with zipfile.ZipFile(dest_path, "w", compression=compression) as zf:
+            for object_name, zip_path in members:
+                response = self.client.get_object(self.bucket_name, object_name)
+                try:
+                    # Stream object into the zip entry to limit peak RAM
+                    with zf.open(zip_path, "w") as dest:
+                        for chunk in response.stream(1024 * 1024):
+                            if chunk:
+                                dest.write(chunk)
+                finally:
+                    try:
+                        response.close()
+                    finally:
+                        response.release_conn()
+        return len(members)
+
+    async def build_and_store_folder_archive(
+        self,
+        folder_path: str,
+        subfolder_prefix: Optional[str] = None,
+        *,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Build a ZIP of the folder (or split subfolder) and store it under ``archives/``.
+
+        Safe to call after upload/split so later downloads are a single object GET.
+        """
+        object_key = self.archive_object_key(folder_path, subfolder_prefix)
+        if not force and self.object_exists(object_key):
+            try:
+                st = self.client.stat_object(self.bucket_name, object_key)
+                size = getattr(st, "size", None)
+            except Exception:
+                size = None
+            return {
+                "object_key": object_key,
+                "split": subfolder_prefix,
+                "built": False,
+                "size": size,
+            }
+
+        def _work() -> Dict[str, Any]:
+            members = self._list_folder_member_objects(folder_path, subfolder_prefix)
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                count = self._build_zip_file_from_objects(members, tmp_path)
+                file_size = os.path.getsize(tmp_path)
+                # Blocking MinIO put — run inside worker thread via anyio
+                self.client.fput_object(
+                    self.bucket_name,
+                    object_key,
+                    tmp_path,
+                    content_type="application/zip",
+                )
+                return {
+                    "object_key": object_key,
+                    "split": subfolder_prefix,
+                    "built": True,
+                    "size": file_size,
+                    "file_count": count,
+                }
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        result = await anyio.to_thread.run_sync(_work)
+        logger.info(
+            "Stored download archive %s (built=%s size=%s files=%s)",
+            result.get("object_key"),
+            result.get("built"),
+            result.get("size"),
+            result.get("file_count"),
+        )
+        return result
+
+    async def ensure_split_archives(
+        self,
+        folder_path: str,
+        splits: Tuple[str, ...] = SPLIT_SUBFOLDERS,
+        *,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Ensure train/test/drift (or given) archives exist under folder_path."""
+        out: Dict[str, Any] = {}
+        for split_name in splits:
+            try:
+                out[split_name] = await self.build_and_store_folder_archive(
+                    folder_path, split_name, force=force
+                )
+            except HTTPException as e:
+                logger.warning(
+                    "Skip archive for %s/%s: %s", folder_path, split_name, e.detail
+                )
+                out[split_name] = {"error": str(e.detail), "split": split_name}
+            except Exception as e:
+                logger.warning(
+                    "Failed building archive for %s/%s: %s", folder_path, split_name, e
+                )
+                out[split_name] = {"error": str(e), "split": split_name}
+        return out
 
     async def copy_prefix(
         self,
@@ -1143,6 +1328,15 @@ class FileService:
 
             if do_split and not version_split:
                 logger.info("Folder large enough to split but version_split not set; only v1 stored")
+            if split_counts_existing is not None:
+                try:
+                    await self.ensure_split_archives(
+                        self.dataset_version_folder_path(user_id, dataset_id, version)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Pre-building archives for pre-split upload failed: %s", e
+                    )
             return ((dataset_files_v1, total_size_v1, split_counts_existing), None, vision_schema)
 
         except zipfile.BadZipFile:
@@ -1291,6 +1485,15 @@ class FileService:
                         )
                     return ((dataset_files_v1, total_size_v1, None), (v2_files, v2_size, split_counts), vision_schema)
 
+                if split_counts_existing is not None:
+                    try:
+                        await self.ensure_split_archives(
+                            self.dataset_version_folder_path(user_id, dataset_id, version)
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Pre-building archives for pre-split ZIP-path upload failed: %s", e
+                        )
                 return ((dataset_files_v1, total_size_v1, split_counts_existing), None, vision_schema)
 
         except zipfile.BadZipFile:
@@ -1358,6 +1561,12 @@ class FileService:
             logger.info(f"Uploaded split file: {minio_path}")
 
         logger.info(f"Folder split into train={split_counts['train']}, test={split_counts['test']}, drift={split_counts['drift']}")
+        try:
+            await self.ensure_split_archives(
+                self.dataset_version_folder_path(user_id, dataset_id, version)
+            )
+        except Exception as e:
+            logger.warning("Pre-building split archives after folder split failed: %s", e)
         return dataset_files, total_size, split_counts
 
     async def _upload_vision_folder_with_split(
@@ -1624,6 +1833,12 @@ class FileService:
             image_split_counts["drift"],
             len(image_relpaths),
         )
+        try:
+            await self.ensure_split_archives(
+                self.dataset_version_folder_path(user_id, dataset_id, version)
+            )
+        except Exception as e:
+            logger.warning("Pre-building split archives after vision split failed: %s", e)
         return dataset_files, total_size, image_split_counts
     
     async def delete_folder_files(self, folder_path: str) -> int:
@@ -1663,109 +1878,143 @@ class FileService:
             return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         return "application/octet-stream"
 
+    def resolve_prebuilt_archive(
+        self,
+        folder_path: str,
+        subfolder_prefix: Optional[str] = None,
+        *,
+        archive_basename: str = "dataset",
+    ) -> Optional[Dict[str, Any]]:
+        """If a pre-built archive exists, return stream metadata for the download API."""
+        object_key = self.archive_object_key(folder_path, subfolder_prefix)
+        if not self.object_exists(object_key):
+            return None
+        try:
+            st = self.client.stat_object(self.bucket_name, object_key)
+            size = int(getattr(st, "size", 0) or 0)
+        except Exception:
+            size = None
+        zip_name = archive_basename + (
+            f"_{subfolder_prefix}" if subfolder_prefix else ""
+        ) + ".zip"
+        return {
+            "object_key": object_key,
+            "filename": zip_name,
+            "media_type": "application/zip",
+            "size": size,
+            "source": "prebuilt_archive",
+        }
+
     async def download_folder_subset(
         self,
         folder_path: str,
         subfolder_prefix: Optional[str] = None,
         *,
         archive_basename: str = "dataset",
+        prefer_prebuilt: bool = True,
+        store_archive_if_missing: bool = True,
     ) -> Tuple[bytes, str, str]:
         """
         Download objects under a folder prefix.
 
-        When exactly one file exists (typical for tabular train/test/drift splits),
-        return a ZIP containing that single file so AutoML Tabular (expects one file per
-        archive) and multi-file folder downloads stay consistent. Otherwise return a ZIP.
+        Prefers pre-built ``archives/{split}.zip`` when present. Otherwise builds on
+        the fly (and optionally caches that archive for the next request).
+
+        When exactly one file exists (typical tabular split), return a ZIP with that
+        one file so AutoML Tabular stays consistent.
 
         Returns:
             (data, download_filename, media_type)
         """
-        prefix = folder_path
-        if subfolder_prefix:
-            prefix = f"{folder_path.rstrip('/')}/{subfolder_prefix}/"
+        zip_name = archive_basename + (
+            f"_{subfolder_prefix}" if subfolder_prefix else ""
+        ) + ".zip"
 
-        object_names: List[str] = []
+        if prefer_prebuilt:
+            prebuilt = self.resolve_prebuilt_archive(
+                folder_path,
+                subfolder_prefix,
+                archive_basename=archive_basename,
+            )
+            if prebuilt:
+                logger.info("Serving pre-built archive %s", prebuilt["object_key"])
+                data = b"".join(self.iter_object_chunks(prebuilt["object_key"]))
+                return data, prebuilt["filename"], prebuilt["media_type"]
+
         try:
-            for obj in self.client.list_objects(
-                self.bucket_name, prefix=prefix, recursive=True
-            ):
-                if not obj.object_name or obj.object_name.endswith("/"):
-                    continue
-                rel = obj.object_name.replace(prefix, "", 1).lstrip("/")
-                if rel:
-                    object_names.append(obj.object_name)
+            members = self._list_folder_member_objects(folder_path, subfolder_prefix)
         except S3Error as e:
-            logger.error(f"MinIO error listing folder {prefix}: {e}")
+            logger.error(f"MinIO error listing folder {folder_path}: {e}")
             raise HTTPException(status_code=404, detail="Folder not found") from e
 
-        if not object_names:
+        if not members:
             raise HTTPException(status_code=404, detail="No files found in folder")
 
-        if len(object_names) == 1:
-            object_name = object_names[0]
+        if len(members) == 1:
+            object_name, entry_name = members[0]
+            response = None
             try:
                 response = self.client.get_object(self.bucket_name, object_name)
                 file_data = response.read()
             except S3Error as e:
                 logger.error(f"MinIO error downloading {object_name}: {e}")
                 raise HTTPException(status_code=404, detail="File not found") from e
-            entry_name = os.path.basename(object_name)
+            finally:
+                if response is not None:
+                    try:
+                        response.close()
+                        response.release_conn()
+                    except Exception:
+                        pass
             zip_buffer = BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                zip_file.writestr(entry_name, file_data)
-            zip_name = archive_basename + (
-                f"_{subfolder_prefix}" if subfolder_prefix else ""
-            ) + ".zip"
+                zip_file.writestr(os.path.basename(entry_name), file_data)
             return zip_buffer.getvalue(), zip_name, "application/zip"
 
         zip_data = await self.download_folder_as_zip(
             folder_path, subfolder_prefix=subfolder_prefix
         )
-        zip_name = archive_basename + (
-            f"_{subfolder_prefix}" if subfolder_prefix else ""
-        ) + ".zip"
+        if store_archive_if_missing:
+            try:
+                await self.build_and_store_folder_archive(
+                    folder_path, subfolder_prefix, force=True
+                )
+            except Exception as e:
+                logger.warning("Could not cache on-the-fly zip as archive: %s", e)
         return zip_data, zip_name, "application/zip"
 
     async def download_folder_as_zip(
         self, folder_path: str, subfolder_prefix: Optional[str] = None
     ) -> bytes:
         """
-        Download all files in a folder as a zip archive.
+        Download all files in a folder as a zip archive (excludes ``archives/``).
 
-        Args:
-            folder_path: Path to folder in MinIO (e.g., "datasets/user1/dataset1/v1/")
-            subfolder_prefix: If set (e.g. "train", "test", "drift"), only include objects
-                under folder_path + subfolder_prefix + "/". Use for split datasets.
-                Zip entries are relative to that subfolder (e.g. "file.csv" not "drift/file.csv").
-
-        Returns:
-            ZIP archive as bytes
+        Prefer ``resolve_prebuilt_archive`` + streaming for large vision splits.
         """
         try:
-            prefix = folder_path
-            if subfolder_prefix:
-                prefix = f"{folder_path.rstrip('/')}/{subfolder_prefix}/"
-            objects = self.client.list_objects(self.bucket_name, prefix=prefix, recursive=True)
+            members = self._list_folder_member_objects(folder_path, subfolder_prefix)
+            if not members:
+                raise HTTPException(status_code=404, detail="No files found in folder")
 
-            zip_buffer = BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                has_files = False
-                for obj in objects:
-                    file_data = self.client.get_object(self.bucket_name, obj.object_name)
-                    # Entry name: strip prefix so we get relative path (e.g. "file.csv" or "subdir/file.csv")
-                    zip_path = obj.object_name.replace(prefix, "")
-                    if zip_path:
-                        zip_file.writestr(zip_path, file_data.read())
-                        has_files = True
-                if not has_files:
-                    raise HTTPException(status_code=404, detail="No files found in folder")
-            zip_buffer.seek(0)
-            return zip_buffer.getvalue()
+            def _work() -> bytes:
+                with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                    tmp_path = tmp.name
+                try:
+                    self._build_zip_file_from_objects(members, tmp_path)
+                    with open(tmp_path, "rb") as f:
+                        return f.read()
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+            return await anyio.to_thread.run_sync(_work)
+        except HTTPException:
+            raise
         except S3Error as e:
             logger.error(f"MinIO error during folder zip download: {e}")
             raise HTTPException(status_code=404, detail="Folder not found")
-        except HTTPException:
-            raise
         except Exception as e:
             logger.error(f"Unexpected error during folder zip download: {e}")
             raise HTTPException(status_code=500, detail="Folder zip download failed")
