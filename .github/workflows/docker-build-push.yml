@@ -29,19 +29,29 @@ jobs:
         id: version
         run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      # ubuntu-latest keeps several GB of unused SDKs. The AutoGluon/torch
+      # image is ~10 GB; exporting it with a full disk sits on "exporting layers".
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup \
+            /opt/hostedtoolcache
+          df -h
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Pushes e.g. .../alfie/autodw:1.0.0 and .../alfie/autodw:latest
+      # amd64 only: the deploy hosts are x86_64. arm64 is built under QEMU and
+      # the second copy is what makes "exporting layers" hang for over an hour.
+      # provenance/sbom off: BuildKit attestation export hangs on this image size.
       - name: Build and push autodw
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
           push: true
           tags: |
             ${{ env.IMAGE_PREFIX }}:${{ steps.version.outputs.tag }}
