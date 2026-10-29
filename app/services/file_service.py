@@ -9,6 +9,7 @@ from fastapi import UploadFile, HTTPException
 from ..core.minio_client import minio_client
 from ..models.dataset import DatasetMetadata, DatasetFile
 import logging
+import shutil
 import tempfile
 import zipfile
 import json
@@ -419,6 +420,45 @@ class FileService:
                 )
 
         await anyio.to_thread.run_sync(_upload)
+
+    def _claim_spooled_upload_sync(self, upload: UploadFile, dest_path: str) -> None:
+        """
+        Keep Starlette's already-written spool after the request ends.
+
+        Large multipart bodies are on disk before the endpoint runs. On Linux that
+        file is unnamed (O_TMPFILE), so linking ``/proc/self/fd`` is a rename-sized
+        handoff. Otherwise the bytes are copied once, in this thread, after the
+        202 has already been sent.
+        """
+        parent = os.path.dirname(dest_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        spool = upload.file
+        fileno = getattr(spool, "fileno", None)
+        if os.name == "posix" and callable(fileno):
+            try:
+                os.link(f"/proc/self/fd/{fileno()}", dest_path)
+                logger.info("Linked upload spool to %s", dest_path)
+                return
+            except OSError as link_err:
+                logger.info("Could not link upload spool (%s); copying instead", link_err)
+                try:
+                    os.remove(dest_path)
+                except OSError:
+                    pass
+
+        try:
+            spool.seek(0)
+        except Exception:
+            pass
+        with open(dest_path, "wb") as out:
+            shutil.copyfileobj(spool, out, length=8 * 1024 * 1024)
+        logger.info("Copied upload spool to %s (%s bytes)", dest_path, os.path.getsize(dest_path))
+
+    async def claim_spooled_upload(self, upload: UploadFile, dest_path: str) -> None:
+        """Detach an UploadFile spool onto dest_path without blocking the event loop."""
+        await anyio.to_thread.run_sync(self._claim_spooled_upload_sync, upload, dest_path)
 
     async def put_object_from_upload_file(
         self,
@@ -1367,7 +1407,7 @@ class FileService:
     ]:
         """
         Same as `upload_dataset_folder`, but reads a local ZIP file path.
-        Intended for background ingestion jobs (ZIP already staged in object storage).
+        Intended for background ingestion jobs (ZIP already on a local path).
 
         Returns:
             ((v1_files, v1_size, split_counts|None), v2_result or None, vision_annotation_schema or None).

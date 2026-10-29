@@ -51,8 +51,8 @@ Folder ZIP ingest is asynchronous. Until the job finishes, `GET /datasets/{user}
 ### Folder Upload Process
 
 1. **Create ZIP Archive** - Package your files into a ZIP
-2. **Upload via API** - Send ZIP to the folder upload endpoint → **202** + `job_id`
-3. **Background ingest** - Stage ZIP, extract, validate (vision annotations), upload to MinIO
+2. **Upload via API** - Send ZIP to the folder upload endpoint. **202** + `job_id` is returned when the body has been received (`status: queued`, `phase: upload_zip`). The ZIP is not in MinIO yet.
+3. **Background job** - Copy the received ZIP into MinIO (`phase: upload_zip`), then extract, validate (vision annotations), and upload the dataset files (`phase: ingest`)
 4. **Metadata** - Written when the job completes (vision: annotation columns included)
 5. **Version Management** - Auto-increments version (v1, v2, v3)
 6. **Poll** - Client polls job until `completed`, then reads dataset metadata

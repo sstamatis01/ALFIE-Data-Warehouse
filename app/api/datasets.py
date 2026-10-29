@@ -1,6 +1,6 @@
 from typing import List, Optional
 from datetime import datetime, timezone
-from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, Query, Form
+from fastapi import APIRouter, BackgroundTasks, File, UploadFile, Depends, HTTPException, Query, Form
 from fastapi import status
 from fastapi.responses import StreamingResponse
 from io import BytesIO
@@ -257,10 +257,11 @@ async def _run_folder_upload_job(
     preserve_structure: bool,
     tags: list[str],
     zip_object_name: str,
+    local_zip_path: str,
     v1: str,
     v2: str,
 ) -> None:
-    """Background ingestion task. Downloads staged ZIP and performs extraction + upload + optional split."""
+    """Background ingestion. Copies the received ZIP to MinIO, then extracts and uploads files."""
     from ..core.database import get_database
     db = get_database()
 
@@ -270,32 +271,34 @@ async def _run_folder_upload_job(
             {
                 "status": "running",
                 "updated_at": UploadJobResponse.now(),
-                "progress": {"phase": "download_zip", "processed_files": 0, "message": "Downloading ZIP from object storage"},
+                "progress": {"phase": "upload_zip", "processed_files": 0, "message": "Staging ZIP in object storage"},
+            },
+        )
+        await file_service._put_object_from_path(
+            object_name=zip_object_name,
+            file_path=local_zip_path,
+            file_size=os.path.getsize(local_zip_path),
+            content_type="application/zip",
+        )
+
+        await _update_upload_job(
+            job_id,
+            {
+                "updated_at": UploadJobResponse.now(),
+                "progress": {"phase": "ingest", "processed_files": 0, "message": "Extracting and uploading dataset files"},
             },
         )
 
-        with tempfile.TemporaryDirectory() as td:
-            local_zip = os.path.join(td, "staged.zip")
-            await file_service.download_object_to_path(object_name=zip_object_name, dest_path=local_zip)
-
-            await _update_upload_job(
-                job_id,
-                {
-                    "updated_at": UploadJobResponse.now(),
-                    "progress": {"phase": "ingest", "processed_files": 0, "message": "Extracting and uploading dataset files"},
-                },
+        (dataset_files_v1, total_size_v1, split_counts_v1), v2_result, vision_schema = (
+            await file_service.upload_dataset_folder_from_zip_path(
+                zip_path=local_zip_path,
+                user_id=user_id,
+                dataset_id=dataset_id,
+                version=v1,
+                version_split=v2,
+                preserve_structure=preserve_structure,
             )
-
-            (dataset_files_v1, total_size_v1, split_counts_v1), v2_result, vision_schema = (
-                await file_service.upload_dataset_folder_from_zip_path(
-                    zip_path=local_zip,
-                    user_id=user_id,
-                    dataset_id=dataset_id,
-                    version=v1,
-                    version_split=v2,
-                    preserve_structure=preserve_structure,
-                )
-            )
+        )
 
         if not dataset_files_v1:
             raise HTTPException(status_code=400, detail="No valid files found in ZIP")
@@ -438,6 +441,75 @@ async def _run_folder_upload_job(
                 "progress": {"phase": "failed", "processed_files": 0, "message": "Upload failed"},
             },
         )
+    finally:
+        try:
+            os.remove(local_zip_path)
+        except FileNotFoundError:
+            pass
+        except OSError as cleanup_err:
+            logger.warning("Could not remove staged ZIP %s: %s", local_zip_path, cleanup_err)
+
+
+async def _detach_received_zip_and_start_job(
+    *,
+    upload: UploadFile,
+    local_zip_path: str,
+    job_id: str,
+    user_id: str,
+    dataset_id: str,
+    name: str,
+    description: str | None,
+    preserve_structure: bool,
+    tags: list[str],
+    zip_object_name: str,
+    v1: str,
+    v2: str,
+) -> None:
+    """
+    Runs after the 202 is written, while Starlette still holds the spool open.
+
+    The handoff must finish before this function returns. The MinIO copy and
+    ingest then run on their own task so the request can close.
+    """
+    try:
+        await file_service.claim_spooled_upload(upload, local_zip_path)
+    except Exception as e:
+        logger.exception("Failed to keep uploaded ZIP for job %s", job_id)
+        await _update_upload_job(
+            job_id,
+            {
+                "status": "failed",
+                "updated_at": UploadJobResponse.now(),
+                "error": str(e),
+                "progress": {"phase": "failed", "processed_files": 0, "message": "Could not keep the uploaded ZIP"},
+            },
+        )
+        return
+
+    task = asyncio.create_task(
+        _run_folder_upload_job(
+            job_id=job_id,
+            user_id=user_id,
+            dataset_id=dataset_id,
+            name=name,
+            description=description,
+            preserve_structure=preserve_structure,
+            tags=tags,
+            zip_object_name=zip_object_name,
+            local_zip_path=local_zip_path,
+            v1=v1,
+            v2=v2,
+        )
+    )
+    task.add_done_callback(_log_folder_upload_task_error)
+
+
+def _log_folder_upload_task_error(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Folder upload job task failed", exc_info=exc)
 
 
 async def _get_next_dataset_name(user_id: str) -> str:
@@ -944,6 +1016,7 @@ async def import_public_dataset_to_user(
 )
 async def upload_dataset_folder(
     user_id: str,
+    background_tasks: BackgroundTasks,
     zip_file: UploadFile = File(...),
     dataset_id: Optional[str] = Form(None),  # Made optional
     name: Optional[str] = Form(None),  # Made optional
@@ -952,8 +1025,12 @@ async def upload_dataset_folder(
     tags: Optional[str] = Form(None)
 ):
     """
-    Upload a folder of dataset files (as zip)
-    
+    Upload a folder of dataset files (as zip).
+
+    Returns 202 as soon as the body has been received. FastAPI has already
+    spilled the ZIP to a temp file by then. The MinIO copy runs afterwards
+    on the job (phase upload_zip), then extraction and file upload (phase ingest).
+
     For folder uploads:
     - Generate dataset_id (UUID) if not provided
     - Generate dataset_name if not provided (user_uploaded_dataset_1, user_uploaded_dataset_2, etc.)
@@ -961,11 +1038,10 @@ async def upload_dataset_folder(
     - Extracts and uploads all files
     - Simplified metadata (no column/row analysis)
     - Lists all files with sizes and types
-    
+
     dataset_id is optional - if not provided, a UUID will be generated automatically.
     dataset_name is optional - if not provided, an automatic name will be generated.
     """
-    # Async upload: stage ZIP → return job_id → ingest in background
     if not zip_file.filename or not zip_file.filename.endswith(".zip"):
         raise HTTPException(status_code=400, detail="File must be a ZIP archive")
 
@@ -1005,37 +1081,33 @@ async def upload_dataset_folder(
         "v2": v2,
         "created_at": now,
         "updated_at": now,
-        "progress": {"phase": "upload_zip", "processed_files": 0, "message": "Staging ZIP in object storage"},
+        "progress": {
+            "phase": "upload_zip",
+            "processed_files": 0,
+            "message": "Upload received; staging ZIP in object storage",
+        },
         "result": None,
         "error": None,
         "metadata": {"original_filename": zip_file.filename},
     }
     await db.upload_jobs.insert_one(job_doc)
 
-    # Stage ZIP in MinIO (multipart, unknown length)
-    await file_service.put_object_from_upload_file(object_name=zip_object_name, upload=zip_file, content_type="application/zip")
-
-    await _update_upload_job(
-        job_id,
-        {
-            "updated_at": UploadJobResponse.now(),
-            "progress": {"phase": "queued", "processed_files": 0, "message": "ZIP staged; ingestion queued"},
-        },
-    )
-
-    asyncio.create_task(
-        _run_folder_upload_job(
-            job_id=job_id,
-            user_id=user_id,
-            dataset_id=dataset_id,
-            name=name,
-            description=description,
-            preserve_structure=preserve_structure,
-            tags=tag_list,
-            zip_object_name=zip_object_name,
-            v1=v1,
-            v2=v2,
-        )
+    staging_dir = os.path.join(tempfile.gettempdir(), "autodw-folder-uploads")
+    local_zip_path = os.path.join(staging_dir, f"{job_id}.zip")
+    background_tasks.add_task(
+        _detach_received_zip_and_start_job,
+        upload=zip_file,
+        local_zip_path=local_zip_path,
+        job_id=job_id,
+        user_id=user_id,
+        dataset_id=dataset_id,
+        name=name,
+        description=description,
+        preserve_structure=preserve_structure,
+        tags=tag_list,
+        zip_object_name=zip_object_name,
+        v1=v1,
+        v2=v2,
     )
 
     return UploadJobResponse(
