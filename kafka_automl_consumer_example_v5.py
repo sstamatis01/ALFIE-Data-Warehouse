@@ -674,6 +674,180 @@ def _extract_scores_from_leaderboard(leaderboard: str) -> dict[str, float | None
     return scores
 
 
+_LEADERBOARD_SECTION_RE = re.compile(
+    r"(?ms)^###\s+(Test metrics|Emissions)\s*$"
+)
+_LEADERBOARD_BULLET_RE = re.compile(
+    r"^\s*-\s+\*\*([^*]+)\*\*\s*:\s*(.+?)\s*$"
+)
+
+
+def _coerce_metadata_value(raw: str):
+    """Coerce bullet values to int/float when possible; otherwise keep stripped string."""
+    text = (raw or "").strip()
+    if not text:
+        return text
+    as_float = _coerce_metric_float(text)
+    if as_float is None:
+        return text
+    # Preserve ints when the literal has no fractional part (e.g. "10.0" stays float).
+    if re.fullmatch(r"[+-]?\d+", text):
+        return int(as_float)
+    return as_float
+
+
+def _parse_markdown_bullet_section(section_text: str) -> dict:
+    out: dict = {}
+    for line in (section_text or "").splitlines():
+        m = _LEADERBOARD_BULLET_RE.match(line)
+        if not m:
+            continue
+        key = m.group(1).strip()
+        out[key] = _coerce_metadata_value(m.group(2))
+    return out
+
+
+def split_leaderboard_blob(leaderboard: str | None) -> dict:
+    """
+    Split AutoML 'leaderboard' blobs that append markdown sections after the table:
+
+      <markdown table>
+
+      ### Test metrics
+      - **accuracy**: 0.93
+      ...
+
+      ### Emissions
+      - **emissions_kg**: 1e-5
+      ...
+
+    Returns:
+      {
+        "leaderboard": "<table only>",
+        "test_metrics": {...} | None,
+        "emissions": {...} | None,
+        "changed": bool,
+      }
+    """
+    result = {
+        "leaderboard": leaderboard,
+        "test_metrics": None,
+        "emissions": None,
+        "changed": False,
+    }
+    if not leaderboard or not isinstance(leaderboard, str):
+        return result
+    if "### Test metrics" not in leaderboard and "### Emissions" not in leaderboard:
+        return result
+
+    matches = list(_LEADERBOARD_SECTION_RE.finditer(leaderboard))
+    if not matches:
+        return result
+
+    table_part = leaderboard[: matches[0].start()].rstrip()
+    sections: dict[str, str] = {}
+    for i, match in enumerate(matches):
+        name = match.group(1).strip().lower()
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(leaderboard)
+        sections[name] = leaderboard[start:end].strip()
+
+    test_metrics = _parse_markdown_bullet_section(sections.get("test metrics", ""))
+    emissions = _parse_markdown_bullet_section(sections.get("emissions", ""))
+
+    result["leaderboard"] = table_part
+    result["test_metrics"] = test_metrics or None
+    result["emissions"] = emissions or None
+    result["changed"] = True
+    return result
+
+
+def get_model_metadata_from_dw(user_id: str, model_id: str, version: str = "v1") -> dict:
+    """GET /ai-models/{user_id}/{model_id}?version=..."""
+    url = f"{API_BASE}/ai-models/{user_id}/{model_id}"
+    r = requests.get(url, params={"version": version}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def organize_saved_model_leaderboard_metadata(
+    user_id: str,
+    model_id: str,
+    version: str,
+) -> dict | None:
+    """
+    After AutoML saves a model, fetch its DW metadata and split appended
+    Test metrics / Emissions out of custom_metadata.leaderboard into dedicated fields.
+    """
+    model = get_model_metadata_from_dw(user_id, model_id, version)
+    custom = dict(model.get("custom_metadata") or {})
+    raw_leaderboard = custom.get("leaderboard")
+    split = split_leaderboard_blob(raw_leaderboard)
+
+    already_split = isinstance(custom.get("test_metrics"), dict) or isinstance(
+        custom.get("emissions"), dict
+    )
+    if not split["changed"] and already_split:
+        logger.info(
+            "   Model %s %s leaderboard already organized (test_metrics/emissions present)",
+            model_id,
+            version,
+        )
+        return model
+    if not split["changed"]:
+        logger.info(
+            "   Model %s %s leaderboard has no Test metrics/Emissions sections to split",
+            model_id,
+            version,
+        )
+        return model
+
+    custom["leaderboard"] = split["leaderboard"]
+    if split["test_metrics"]:
+        custom["test_metrics"] = split["test_metrics"]
+        # Promote a few commonly queried metrics for convenience / backward compat.
+        if "f1_macro" in split["test_metrics"]:
+            custom["test_f1_macro"] = split["test_metrics"]["f1_macro"]
+        if "f1_weighted" in split["test_metrics"]:
+            custom["test_f1_weighted"] = split["test_metrics"]["f1_weighted"]
+    if split["emissions"]:
+        custom["emissions"] = split["emissions"]
+
+    payload_kwargs = {
+        "custom_metadata": custom,
+    }
+    # Optionally sync top-level accuracy from parsed test metrics when missing/stale.
+    tm = split["test_metrics"] or {}
+    if "accuracy" in tm and model.get("test_accuracy") is None:
+        payload_kwargs["test_accuracy"] = tm["accuracy"]
+
+    try:
+        updated = update_model_metadata_in_dw(
+            user_id,
+            model_id,
+            version,
+            **payload_kwargs,
+        )
+    except requests.HTTPError as e:
+        # DW returns 400 when $set makes no document change; treat as already organized.
+        if e.response is not None and e.response.status_code == 400:
+            logger.info(
+                "   Model %s %s metadata unchanged after organize attempt (already up to date)",
+                model_id,
+                version,
+            )
+            return model
+        raise
+    logger.info(
+        "   Organized model metadata for %s %s (test_metrics=%d keys, emissions=%d keys)",
+        model_id,
+        version,
+        len(split["test_metrics"] or {}),
+        len(split["emissions"] or {}),
+    )
+    return updated
+
+
 def _parse_automl_response_metrics(response_data: dict) -> dict:
     """
     Extract metrics from AutoML tabular response for DW metadata update.
@@ -708,6 +882,20 @@ def _parse_automl_response_metrics(response_data: dict) -> dict:
         else:
             out["custom_metadata"]["best_score"] = best_score
 
+    # Newer AutoML engines append ### Test metrics / ### Emissions after the table.
+    # Split them into dedicated custom_metadata fields and keep leaderboard as the table only.
+    if out["leaderboard"]:
+        split = split_leaderboard_blob(out["leaderboard"])
+        out["leaderboard"] = split["leaderboard"]
+        if split["test_metrics"]:
+            out["custom_metadata"]["test_metrics"] = split["test_metrics"]
+            if out["test_f1_macro"] is None and "f1_macro" in split["test_metrics"]:
+                out["test_f1_macro"] = _coerce_metric_float(split["test_metrics"]["f1_macro"])
+            if out["test_accuracy"] is None and "accuracy" in split["test_metrics"]:
+                out["test_accuracy"] = _coerce_metric_float(split["test_metrics"]["accuracy"])
+        if split["emissions"]:
+            out["custom_metadata"]["emissions"] = split["emissions"]
+
     if out["leaderboard"] and (
         out["test_accuracy"] is None
         or out["validation_accuracy"] is None
@@ -728,6 +916,8 @@ def _parse_automl_response_metrics(response_data: dict) -> dict:
         out["custom_metadata"]["leaderboard"] = out["leaderboard"]
     if out["test_f1_macro"] is not None:
         out["custom_metadata"]["test_f1_macro"] = out["test_f1_macro"]
+    if out["custom_metadata"].get("test_metrics", {}).get("f1_weighted") is not None:
+        out["custom_metadata"]["test_f1_weighted"] = out["custom_metadata"]["test_metrics"]["f1_weighted"]
     # Engine-provided imbalance / per-class detail (pass through into custom_metadata)
     for key in (
         "per_class_metrics",
@@ -738,8 +928,10 @@ def _parse_automl_response_metrics(response_data: dict) -> dict:
         "imbalance_handling",
         "fallback_trainer",
         "extreme_imbalance",
+        "test_metrics",
+        "emissions",
     ):
-        if key in response_data and response_data[key] is not None:
+        if key in response_data and response_data[key] is not None and key not in out["custom_metadata"]:
             out["custom_metadata"][key] = response_data[key]
     return out
 
@@ -1116,6 +1308,20 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                         metrics["training_accuracy"],
                         metrics.get("test_f1_macro"),
                     )
+                # Post-save cleanup: if engine already wrote a combined leaderboard blob
+                # into DW metadata, split Test metrics / Emissions into dedicated fields.
+                if model_id_to_update and version_to_update:
+                    try:
+                        organize_saved_model_leaderboard_metadata(
+                            user_id, model_id_to_update, version_to_update
+                        )
+                    except Exception as org_e:
+                        logger.warning(
+                            "   Could not organize leaderboard extras for %s %s: %s",
+                            model_id_to_update,
+                            version_to_update,
+                            org_e,
+                        )
             except Exception as meta_e:
                 logger.warning(f"   Could not update model metadata with AutoML metrics: {meta_e}")
             
@@ -1236,6 +1442,18 @@ async def process_automl_trigger(event: dict, producer: AIOKafkaProducer = None)
                         metrics["validation_accuracy"],
                         metrics["training_accuracy"],
                     )
+                if model_id_to_update and version_to_update:
+                    try:
+                        organize_saved_model_leaderboard_metadata(
+                            user_id, model_id_to_update, version_to_update
+                        )
+                    except Exception as org_e:
+                        logger.warning(
+                            "   Could not organize leaderboard extras for %s %s: %s",
+                            model_id_to_update,
+                            version_to_update,
+                            org_e,
+                        )
             except Exception as meta_e:
                 logger.warning(f"   Could not update model metadata with Vision AutoML metrics: {meta_e}")
         else:
