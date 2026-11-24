@@ -1,0 +1,4 @@
+pytest>=7
+pypdf>=4
+# FastAPI 0.104 / Starlette 0.27 TestClient passes app= into httpx.Client.
+httpx>=0.24,<0.28

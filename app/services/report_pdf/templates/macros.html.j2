@@ -1,0 +1,28 @@
+{% macro chip(sev, text=None) -%}
+{%- set s = SEV[sev] -%}
+<span class="chip" style="background:{{ s[3] }};color:{{ C.warn_text if sev == 'medium' else s[2] }};border-color:{{ s[2] }}"><span class="ic" style="background:{{ s[2] }}">{{ s[1] }}</span>{{ text or s[0] }}</span>
+{%- endmacro %}
+{% macro card_head(title, right='') -%}
+<table class="card-h"><tr><td><h3>{{ title }}</h3></td><td class="r">{{ right }}</td></tr></table>
+{%- endmacro %}
+{% macro src(paths) -%}
+{% if cfg.show_source_paths %}<div class="src">Data: {% for p in paths %}<code>{{ p }}</code>{% if not loop.last %} · {% endif %}{% endfor %}</div>{% endif %}
+{%- endmacro %}
+{% macro meaning(text) -%}
+{% if text %}<div class="mean"><div class="mean-h"><span class="bulb">i</span>What this means for you</div>{{ text }}</div>{% endif %}
+{%- endmacro %}
+{% macro na(what, field=None) -%}
+<div class="na-box"><b>{{ what }}: not available.</b>{% if field %} Requires field <code>{{ field }}</code>.{% endif %}</div>
+{%- endmacro %}
+{% macro header(kind, title, sub, meta) -%}
+<table class="hdr"><tr><td><div class="kicker">{{ kind }}</div><h1>{{ title }}</h1><div class="sub">{{ sub }}</div></td>
+<td style="width:78mm"><table class="meta">{% for row in meta|batch(2) %}<tr>{% for k, v in row %}<td class="k">{{ k }}</td><td><b>{{ v }}</b></td>{% endfor %}</tr>{% endfor %}</table></td></tr></table>
+{%- endmacro %}
+{% macro status_banner(level, icon, title, subtitle, counts) -%}
+{%- set col = {'high': C.high, 'medium': C.warn, 'ok': C.ok}[level] -%}
+<table class="status {{ level }}"><tr>
+<td style="width:14mm"><div class="st-ic" style="background:{{ col }}">{{ icon }}</div></td>
+<td><div class="st-t">{{ title }}</div><div class="st-s">{{ subtitle }}</div></td>
+<td style="text-align:right;white-space:nowrap">{% for key, n, label in counts %}<div class="cnt" style="border-top-color:{{ SEV[key][2] }}"><b style="color:{{ SEV[key][2] }}">{{ n }}</b><span>{{ label }}</span></div>{% endfor %}</td>
+</tr></table>
+{%- endmacro %}

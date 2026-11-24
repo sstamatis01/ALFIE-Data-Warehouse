@@ -1,0 +1,938 @@
+{
+  "id": "6b043d22fbd60a8d9d9af25d",
+  "user_id": "c3d20b5b-f851-4afb-a36d-57de92188e13",
+  "dataset_id": "d9fab2b6-303d-4716-8414-c5d3e0a3eb42",
+  "dataset_version": "v2",
+  "report": {
+    "target_column": "label",
+    "shape": [
+      1999,
+      9
+    ],
+    "columns": [
+      "label",
+      "ethnicity",
+      "facial_hair",
+      "glasses",
+      "gender",
+      "left_eye_ar",
+      "right_eye_ar",
+      "eye_ar_mean",
+      "mouth_aspect_ratio"
+    ],
+    "dtypes": {
+      "label": "int64",
+      "ethnicity": "object",
+      "facial_hair": "object",
+      "glasses": "bool",
+      "gender": "object",
+      "left_eye_ar": "float64",
+      "right_eye_ar": "float64",
+      "eye_ar_mean": "float64",
+      "mouth_aspect_ratio": "float64"
+    },
+    "memory_usage_MB": 0.39808082580566406,
+    "summary_statistics": {
+      "label": {
+        "count": 1999,
+        "mean": 0.5002501250625313,
+        "std": 0.5001250468945397,
+        "min": 0,
+        "25%": 0,
+        "50%": 1,
+        "75%": 1,
+        "max": 1
+      },
+      "left_eye_ar": {
+        "count": 1989,
+        "mean": 0.3417021148020865,
+        "std": 0.14691753725833837,
+        "min": 0.0110172762,
+        "25%": 0.2408763854,
+        "50%": 0.3273318594,
+        "75%": 0.4362880057,
+        "max": 1.51697843
+      },
+      "right_eye_ar": {
+        "count": 1989,
+        "mean": 0.3066830926190196,
+        "std": 0.1341927233347441,
+        "min": 0.00620279175,
+        "25%": 0.2272836689,
+        "50%": 0.2963073304,
+        "75%": 0.3849346437,
+        "max": 1.669005106
+      },
+      "eye_ar_mean": {
+        "count": 1989,
+        "mean": 0.32419260371171943,
+        "std": 0.13387579784771236,
+        "min": 0.0128526795,
+        "25%": 0.2369321075,
+        "50%": 0.3136288957,
+        "75%": 0.4103856862,
+        "max": 1.18972276
+      },
+      "mouth_aspect_ratio": {
+        "count": 1989,
+        "mean": 130.88140677968903,
+        "std": 202.61219616188959,
+        "min": 0.5240123752,
+        "25%": 7.34596421,
+        "50%": 76.71672571,
+        "75%": 171.7203872,
+        "max": 2696.260321
+      }
+    },
+    "missing_values": {
+      "facial_hair": {
+        "count": 1,
+        "percent": 0.0005002501250625312
+      },
+      "left_eye_ar": {
+        "count": 10,
+        "percent": 0.0050025012506253125
+      },
+      "right_eye_ar": {
+        "count": 10,
+        "percent": 0.0050025012506253125
+      },
+      "eye_ar_mean": {
+        "count": 10,
+        "percent": 0.0050025012506253125
+      },
+      "mouth_aspect_ratio": {
+        "count": 10,
+        "percent": 0.0050025012506253125
+      }
+    },
+    "unique_values": {
+      "label": 2,
+      "facial_hair": 5,
+      "glasses": 2,
+      "left_eye_ar": 1796,
+      "right_eye_ar": 1796,
+      "eye_ar_mean": 1796,
+      "mouth_aspect_ratio": 1796
+    },
+    "duplicate_rows_count": 121,
+    "sample_duplicate_rows": [
+      {
+        "label": 0,
+        "ethnicity": "Middle Eastern",
+        "facial_hair": false,
+        "glasses": false,
+        "gender": "Female",
+        "left_eye_ar": 0.1630323704,
+        "right_eye_ar": 0.2056684746,
+        "eye_ar_mean": 0.1843504225,
+        "mouth_aspect_ratio": 6.101133321
+      },
+      {
+        "label": 0,
+        "ethnicity": "Middle Eastern",
+        "facial_hair": false,
+        "glasses": true,
+        "gender": "Male",
+        "left_eye_ar": 0.4772043184,
+        "right_eye_ar": 0.3574703172,
+        "eye_ar_mean": 0.4173373178,
+        "mouth_aspect_ratio": 98.18629488
+      },
+      {
+        "label": 0,
+        "ethnicity": "Middle Eastern",
+        "facial_hair": false,
+        "glasses": true,
+        "gender": "Male",
+        "left_eye_ar": 0.4772043184,
+        "right_eye_ar": 0.3574703172,
+        "eye_ar_mean": 0.4173373178,
+        "mouth_aspect_ratio": 98.18629488
+      },
+      {
+        "label": 0,
+        "ethnicity": "Middle Eastern",
+        "facial_hair": false,
+        "glasses": false,
+        "gender": "Female",
+        "left_eye_ar": 0.1915414307,
+        "right_eye_ar": 0.1787546143,
+        "eye_ar_mean": 0.1851480225,
+        "mouth_aspect_ratio": 31.55293676
+      },
+      {
+        "label": 0,
+        "ethnicity": "Middle Eastern",
+        "facial_hair": false,
+        "glasses": true,
+        "gender": "Female",
+        "left_eye_ar": 0.4212059353,
+        "right_eye_ar": 0.2024654468,
+        "eye_ar_mean": 0.311835691,
+        "mouth_aspect_ratio": 7.34596421
+      }
+    ],
+    "correlation_matrix": {
+      "label": {
+        "label": 1,
+        "left_eye_ar": 0.073,
+        "right_eye_ar": 0.056,
+        "eye_ar_mean": 0.068,
+        "mouth_aspect_ratio": 0.077
+      },
+      "left_eye_ar": {
+        "label": 0.073,
+        "left_eye_ar": 1,
+        "right_eye_ar": 0.814,
+        "eye_ar_mean": 0.957,
+        "mouth_aspect_ratio": -0.189
+      },
+      "right_eye_ar": {
+        "label": 0.056,
+        "left_eye_ar": 0.814,
+        "right_eye_ar": 1,
+        "eye_ar_mean": 0.948,
+        "mouth_aspect_ratio": -0.123
+      },
+      "eye_ar_mean": {
+        "label": 0.068,
+        "left_eye_ar": 0.957,
+        "right_eye_ar": 0.948,
+        "eye_ar_mean": 1,
+        "mouth_aspect_ratio": -0.165
+      },
+      "mouth_aspect_ratio": {
+        "label": 0.077,
+        "left_eye_ar": -0.189,
+        "right_eye_ar": -0.123,
+        "eye_ar_mean": -0.165,
+        "mouth_aspect_ratio": 1
+      }
+    },
+    "distribution_statistics": {
+      "label": {
+        "mean": 0.5002501250625313,
+        "median": 1,
+        "std": 0.5001250468945397,
+        "min": 0,
+        "max": 1,
+        "skew": -0.001001251846512277,
+        "kurtosis": -2.0020030045067596
+      },
+      "left_eye_ar": {
+        "mean": 0.3417021148020865,
+        "median": 0.3273318594,
+        "std": 0.14691753725833837,
+        "min": 0.0110172762,
+        "max": 1.51697843,
+        "skew": 0.7674994748815045,
+        "kurtosis": 3.217910558699978
+      },
+      "right_eye_ar": {
+        "mean": 0.3066830926190196,
+        "median": 0.2963073304,
+        "std": 0.1341927233347441,
+        "min": 0.00620279175,
+        "max": 1.669005106,
+        "skew": 1.031844336760278,
+        "kurtosis": 6.976960969717837
+      },
+      "eye_ar_mean": {
+        "mean": 0.32419260371171943,
+        "median": 0.3136288957,
+        "std": 0.13387579784771236,
+        "min": 0.0128526795,
+        "max": 1.18972276,
+        "skew": 0.5113092573801717,
+        "kurtosis": 1.607646606278244
+      },
+      "mouth_aspect_ratio": {
+        "mean": 130.88140677968903,
+        "median": 76.71672571,
+        "std": 202.61219616188959,
+        "min": 0.5240123752,
+        "max": 2696.260321,
+        "skew": 4.787173298412169,
+        "kurtosis": 37.118205965452255
+      }
+    },
+    "categorical_value_counts": {
+      "facial_hair": {
+        "False": 1171,
+        "True": 528,
+        "FALSE": 199,
+        "TRUE": 99,
+        "None": 1
+      }
+    },
+    "outlier_detection": {
+      "label": {
+        "count": 0,
+        "percent": 0
+      },
+      "left_eye_ar": {
+        "count": 16,
+        "percent": 0.80040020010005
+      },
+      "right_eye_ar": {
+        "count": 29,
+        "percent": 1.4507253626813406
+      },
+      "eye_ar_mean": {
+        "count": 13,
+        "percent": 0.6503251625812907
+      },
+      "mouth_aspect_ratio": {
+        "count": 110,
+        "percent": 5.502751375687844
+      }
+    },
+    "class_imbalance": {
+      "target_column": "label",
+      "modality": "tabular_classification",
+      "n_rows": 1999,
+      "n_classes": 2,
+      "class_counts": {
+        "0": 999,
+        "1": 1000
+      },
+      "class_percentages": {
+        "0": 49.975,
+        "1": 50.025
+      },
+      "majority_label": "1",
+      "minority_label": "0",
+      "imbalance_ratio": 1.001,
+      "minority_share": 0.49975,
+      "extreme_imbalance": false,
+      "text_feature_columns": [],
+      "thresholds": {
+        "imbalance_ratio_alert": 20,
+        "minority_share_alert": 0.01
+      },
+      "alerts": [],
+      "fairness_profile_note": "Demographic fairness_profile requires protected-attribute columns; class imbalance alone is learning bias toward the majority label."
+    },
+    "data_drift": {
+      "index": [
+        998
+      ],
+      "value": [
+        1
+      ],
+      "column_analyzed": "label"
+    },
+    "fairness_profile": {
+      "config": {
+        "target_column": "label",
+        "pos_label": 1,
+        "protected_attributes": [
+          "ethnicity",
+          "gender"
+        ],
+        "privileged_groups": {
+          "ethnicity": "Caucasian",
+          "gender": "Male"
+        },
+        "source": "heuristic",
+        "heuristic_candidates": [
+          {
+            "column": "ethnicity",
+            "category": "ethnicity_race",
+            "pattern": "(?i)(^|[_ -])(ethn(icity)?|race|racial|nationality|origin)($|[_ -])"
+          },
+          {
+            "column": "gender",
+            "category": "sex_gender",
+            "pattern": "(?i)(^|[_ -])(sex|gender|gend)($|[_ -])"
+          }
+        ],
+        "target_kind": "discrete",
+        "fairness_mode": "classification",
+        "truncation": {
+          "ethnicity": {
+            "truncated": false,
+            "n_groups_original": 7,
+            "n_groups_kept": 7,
+            "kept_groups": [
+              "Caucasian",
+              "Middle Eastern",
+              "Indian",
+              "Asian",
+              "Other",
+              "African",
+              "Unknown"
+            ],
+            "other_count": 0
+          },
+          "gender": {
+            "truncated": false,
+            "n_groups_original": 2,
+            "n_groups_kept": 2,
+            "kept_groups": [
+              "Male",
+              "Female"
+            ],
+            "other_count": 0
+          }
+        },
+        "payload_limits": {
+          "max_groups_per_attribute": 10,
+          "max_discrete_classes": 15,
+          "max_intersection_groups": 20,
+          "max_pairwise": 8,
+          "col_percent_within_label": false
+        }
+      },
+      "global_target_balance": {
+        "counts": {
+          "0": {
+            "count": 999,
+            "percent": 0.49975
+          },
+          "1": {
+            "count": 1000,
+            "percent": 0.50025
+          }
+        },
+        "comment": "Overall label balance; use representation / target_by_attribute for subgroup skew that global counts hide. High-cardinality groups may be collapsed into '__other__'."
+      },
+      "representation": {
+        "ethnicity": {
+          "groups": {
+            "Caucasian": {
+              "count": 812,
+              "percent": 0.406203
+            },
+            "Middle Eastern": {
+              "count": 504,
+              "percent": 0.252126
+            },
+            "Indian": {
+              "count": 375,
+              "percent": 0.187594
+            },
+            "Asian": {
+              "count": 129,
+              "percent": 0.064532
+            },
+            "Other": {
+              "count": 86,
+              "percent": 0.043022
+            },
+            "African": {
+              "count": 63,
+              "percent": 0.031516
+            },
+            "Unknown": {
+              "count": 30,
+              "percent": 0.015008
+            }
+          },
+          "n_groups": 7,
+          "largest_group": "Caucasian",
+          "smallest_group": "Unknown",
+          "max_min_ratio": 27.067,
+          "groups_under_30": [],
+          "groups_under_30_omitted": 0
+        },
+        "gender": {
+          "groups": {
+            "Male": {
+              "count": 1263,
+              "percent": 0.631816
+            },
+            "Female": {
+              "count": 736,
+              "percent": 0.368184
+            }
+          },
+          "n_groups": 2,
+          "largest_group": "Male",
+          "smallest_group": "Female",
+          "max_min_ratio": 1.716,
+          "groups_under_30": [],
+          "groups_under_30_omitted": 0
+        }
+      },
+      "target_by_attribute": {
+        "ethnicity": {
+          "counts": {
+            "African": {
+              "0": 26,
+              "1": 37
+            },
+            "Asian": {
+              "0": 51,
+              "1": 78
+            },
+            "Caucasian": {
+              "0": 524,
+              "1": 288
+            },
+            "Indian": {
+              "0": 131,
+              "1": 244
+            },
+            "Middle Eastern": {
+              "0": 217,
+              "1": 287
+            },
+            "Other": {
+              "0": 29,
+              "1": 57
+            },
+            "Unknown": {
+              "0": 21,
+              "1": 9
+            }
+          },
+          "row_percent_within_group": {
+            "African": {
+              "0": 0.412698,
+              "1": 0.587302
+            },
+            "Asian": {
+              "0": 0.395349,
+              "1": 0.604651
+            },
+            "Caucasian": {
+              "0": 0.64532,
+              "1": 0.35468
+            },
+            "Indian": {
+              "0": 0.349333,
+              "1": 0.650667
+            },
+            "Middle Eastern": {
+              "0": 0.430556,
+              "1": 0.569444
+            },
+            "Other": {
+              "0": 0.337209,
+              "1": 0.662791
+            },
+            "Unknown": {
+              "0": 0.7,
+              "1": 0.3
+            }
+          },
+          "positive_rate_by_group": {
+            "African": 0.587302,
+            "Asian": 0.604651,
+            "Caucasian": 0.35468,
+            "Indian": 0.650667,
+            "Middle Eastern": 0.569444,
+            "Other": 0.662791,
+            "Unknown": 0.3
+          }
+        },
+        "gender": {
+          "counts": {
+            "Female": {
+              "0": 378,
+              "1": 358
+            },
+            "Male": {
+              "0": 621,
+              "1": 642
+            }
+          },
+          "row_percent_within_group": {
+            "Female": {
+              "0": 0.513587,
+              "1": 0.486413
+            },
+            "Male": {
+              "0": 0.491686,
+              "1": 0.508314
+            }
+          },
+          "positive_rate_by_group": {
+            "Female": 0.486413,
+            "Male": 0.508314
+          }
+        }
+      },
+      "intersection": {
+        "attributes": [
+          "ethnicity",
+          "gender"
+        ],
+        "representation": {
+          "groups": {
+            "Caucasian | Male": {
+              "count": 494,
+              "percent": 0.247124
+            },
+            "Caucasian | Female": {
+              "count": 318,
+              "percent": 0.15908
+            },
+            "Indian | Male": {
+              "count": 301,
+              "percent": 0.150575
+            },
+            "Middle Eastern | Female": {
+              "count": 292,
+              "percent": 0.146073
+            },
+            "Middle Eastern | Male": {
+              "count": 212,
+              "percent": 0.106053
+            },
+            "Asian | Male": {
+              "count": 86,
+              "percent": 0.043022
+            },
+            "Other | Male": {
+              "count": 85,
+              "percent": 0.042521
+            },
+            "Indian | Female": {
+              "count": 74,
+              "percent": 0.037019
+            },
+            "African | Male": {
+              "count": 61,
+              "percent": 0.030515
+            },
+            "Asian | Female": {
+              "count": 43,
+              "percent": 0.021511
+            },
+            "Unknown | Male": {
+              "count": 24,
+              "percent": 0.012006
+            },
+            "Unknown | Female": {
+              "count": 6,
+              "percent": 0.003002
+            },
+            "African | Female": {
+              "count": 2,
+              "percent": 0.001001
+            },
+            "Other | Female": {
+              "count": 1,
+              "percent": 0.0005
+            }
+          },
+          "n_groups": 14,
+          "largest_group": "Caucasian | Male",
+          "smallest_group": "Other | Female",
+          "max_min_ratio": 494,
+          "groups_under_30": [
+            "Unknown | Male",
+            "Unknown | Female",
+            "African | Female",
+            "Other | Female"
+          ],
+          "groups_under_30_omitted": 0
+        },
+        "truncation": {
+          "truncated": false,
+          "n_groups_original": 14,
+          "n_groups_kept": 14,
+          "kept_groups": [
+            "Caucasian | Male",
+            "Caucasian | Female",
+            "Indian | Male",
+            "Middle Eastern | Female",
+            "Middle Eastern | Male",
+            "Asian | Male",
+            "Other | Male",
+            "Indian | Female",
+            "African | Male",
+            "Asian | Female",
+            "Unknown | Male",
+            "Unknown | Female",
+            "African | Female",
+            "Other | Female"
+          ],
+          "other_count": 0
+        },
+        "target_by_intersection": {
+          "counts": {
+            "African | Female": {
+              "0": 0,
+              "1": 2
+            },
+            "African | Male": {
+              "0": 26,
+              "1": 35
+            },
+            "Asian | Female": {
+              "0": 13,
+              "1": 30
+            },
+            "Asian | Male": {
+              "0": 38,
+              "1": 48
+            },
+            "Caucasian | Female": {
+              "0": 235,
+              "1": 83
+            },
+            "Caucasian | Male": {
+              "0": 289,
+              "1": 205
+            },
+            "Indian | Female": {
+              "0": 24,
+              "1": 50
+            },
+            "Indian | Male": {
+              "0": 107,
+              "1": 194
+            },
+            "Middle Eastern | Female": {
+              "0": 101,
+              "1": 191
+            },
+            "Middle Eastern | Male": {
+              "0": 116,
+              "1": 96
+            },
+            "Other | Female": {
+              "0": 0,
+              "1": 1
+            },
+            "Other | Male": {
+              "0": 29,
+              "1": 56
+            },
+            "Unknown | Female": {
+              "0": 5,
+              "1": 1
+            },
+            "Unknown | Male": {
+              "0": 16,
+              "1": 8
+            }
+          },
+          "row_percent_within_group": {
+            "African | Female": {
+              "0": 0,
+              "1": 1
+            },
+            "African | Male": {
+              "0": 0.42623,
+              "1": 0.57377
+            },
+            "Asian | Female": {
+              "0": 0.302326,
+              "1": 0.697674
+            },
+            "Asian | Male": {
+              "0": 0.44186,
+              "1": 0.55814
+            },
+            "Caucasian | Female": {
+              "0": 0.738994,
+              "1": 0.261006
+            },
+            "Caucasian | Male": {
+              "0": 0.58502,
+              "1": 0.41498
+            },
+            "Indian | Female": {
+              "0": 0.324324,
+              "1": 0.675676
+            },
+            "Indian | Male": {
+              "0": 0.355482,
+              "1": 0.644518
+            },
+            "Middle Eastern | Female": {
+              "0": 0.34589,
+              "1": 0.65411
+            },
+            "Middle Eastern | Male": {
+              "0": 0.54717,
+              "1": 0.45283
+            },
+            "Other | Female": {
+              "0": 0,
+              "1": 1
+            },
+            "Other | Male": {
+              "0": 0.341176,
+              "1": 0.658824
+            },
+            "Unknown | Female": {
+              "0": 0.833333,
+              "1": 0.166667
+            },
+            "Unknown | Male": {
+              "0": 0.666667,
+              "1": 0.333333
+            }
+          },
+          "positive_rate_by_group": {
+            "African | Female": 1,
+            "African | Male": 0.57377,
+            "Asian | Female": 0.697674,
+            "Asian | Male": 0.55814,
+            "Caucasian | Female": 0.261006,
+            "Caucasian | Male": 0.41498,
+            "Indian | Female": 0.675676,
+            "Indian | Male": 0.644518,
+            "Middle Eastern | Female": 0.65411,
+            "Middle Eastern | Male": 0.45283,
+            "Other | Female": 1,
+            "Other | Male": 0.658824,
+            "Unknown | Female": 0.166667,
+            "Unknown | Male": 0.333333
+          }
+        }
+      },
+      "aif360_metrics": {
+        "library": "aif360",
+        "api": "aif360.sklearn.metrics",
+        "backend": "aif360",
+        "note": "Dataset-level metrics: y_true = labels, no y_pred. DI/SPD use privileged vs rest; smoothed_edf is multi-group.",
+        "per_attribute": {
+          "ethnicity": {
+            "privileged_group": "Caucasian",
+            "functions": {
+              "base_rate_overall": {
+                "value": 0.5002501250625313,
+                "meaning": "P(Y=pos_label) overall"
+              },
+              "disparate_impact_ratio": {
+                "value": 1.6911916128428344,
+                "ideal": 1,
+                "rule_of_thumb": "Often flagged if < 0.8 or > 1.25",
+                "meaning": "P(Y=pos|unprivileged) / P(Y=pos|privileged)",
+                "aif360": "aif360.sklearn.metrics.disparate_impact_ratio"
+              },
+              "statistical_parity_difference": {
+                "value": 0.24515170504770478,
+                "ideal": 0,
+                "meaning": "P(Y=pos|unprivileged) - P(Y=pos|privileged)",
+                "aif360": "aif360.sklearn.metrics.statistical_parity_difference"
+              },
+              "smoothed_edf": {
+                "value": 0.7685722350273718,
+                "ideal": 0,
+                "meaning": "Max smoothed log-ratio gap across groups; lower is fairer",
+                "aif360": "aif360.sklearn.metrics.smoothed_edf"
+              }
+            },
+            "pairwise_vs_privileged": [
+              {
+                "privileged": "Caucasian",
+                "unprivileged": "Middle Eastern",
+                "disparate_impact_ratio": 1.6055169753086418,
+                "statistical_parity_difference": 0.21476464148877938,
+                "n": 1316
+              },
+              {
+                "privileged": "Caucasian",
+                "unprivileged": "Indian",
+                "disparate_impact_ratio": 1.8345185185185182,
+                "statistical_parity_difference": 0.2959868637110016,
+                "n": 1187
+              },
+              {
+                "privileged": "Caucasian",
+                "unprivileged": "Asian",
+                "disparate_impact_ratio": 1.7047803617571058,
+                "statistical_parity_difference": 0.2499713598350326,
+                "n": 941
+              },
+              {
+                "privileged": "Caucasian",
+                "unprivileged": "Other",
+                "disparate_impact_ratio": 1.8687015503875968,
+                "statistical_parity_difference": 0.3081108947187535,
+                "n": 898
+              },
+              {
+                "privileged": "Caucasian",
+                "unprivileged": "African",
+                "disparate_impact_ratio": 1.6558641975308641,
+                "statistical_parity_difference": 0.2326217843459223,
+                "n": 875
+              },
+              {
+                "privileged": "Caucasian",
+                "unprivileged": "Unknown",
+                "disparate_impact_ratio": 0.8458333333333333,
+                "statistical_parity_difference": -0.05467980295566505,
+                "n": 842
+              }
+            ]
+          },
+          "gender": {
+            "privileged_group": "Male",
+            "functions": {
+              "base_rate_overall": {
+                "value": 0.5002501250625313,
+                "meaning": "P(Y=pos_label) overall"
+              },
+              "disparate_impact_ratio": {
+                "value": 0.9569153799268589,
+                "ideal": 1,
+                "rule_of_thumb": "Often flagged if < 0.8 or > 1.25",
+                "meaning": "P(Y=pos|unprivileged) / P(Y=pos|privileged)",
+                "aif360": "aif360.sklearn.metrics.disparate_impact_ratio"
+              },
+              "statistical_parity_difference": {
+                "value": -0.021900495714138213,
+                "ideal": 0,
+                "meaning": "P(Y=pos|unprivileged) - P(Y=pos|privileged)",
+                "aif360": "aif360.sklearn.metrics.statistical_parity_difference"
+              },
+              "smoothed_edf": {
+                "value": 0.04398947421223365,
+                "ideal": 0,
+                "meaning": "Max smoothed log-ratio gap across groups; lower is fairer",
+                "aif360": "aif360.sklearn.metrics.smoothed_edf"
+              }
+            },
+            "pairwise_vs_privileged": [
+              {
+                "privileged": "Male",
+                "unprivileged": "Female",
+                "disparate_impact_ratio": 0.9569153799268589,
+                "statistical_parity_difference": -0.021900495714138213,
+                "n": 1999
+              }
+            ]
+          }
+        },
+        "intersectional": {
+          "attributes": [
+            "ethnicity",
+            "gender"
+          ],
+          "smoothed_edf": {
+            "value": null,
+            "ideal": 0,
+            "aif360": "aif360.sklearn.metrics.smoothed_edf(prot_attr=[...])",
+            "meaning": "Intersectional smoothed EDF across protected-attribute cells"
+          },
+          "n_observed_cells": 14
+        },
+        "import_errors": []
+      },
+      "alerts": [
+        "ethnicity: largest/smallest group ratio 27.067 (>= 3.0) - representation skew",
+        "ethnicity: disparate_impact_ratio=1.6912 outside [0.8, 1.25] (privileged=Caucasian)",
+        "ethnicity: statistical_parity_difference=0.2452 (|SPD| >= 0.1)"
+      ]
+    },
+    "mitigation": {
+      "mitigation_performed": true,
+      "mitigated_dataset_version": "v3",
+      "transformation_report_id": "6b043d25fbd60a8d9d9af26b",
+      "transformation_count": 18
+    }
+  },
+  "transformation_report_id": "6b043d25fbd60a8d9d9af26b",
+  "created_at": "2026-11-23T13:18:26.827000",
+  "updated_at": "2026-11-23T13:18:29.094000"
+}

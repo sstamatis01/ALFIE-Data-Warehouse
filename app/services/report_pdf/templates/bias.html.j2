@@ -1,0 +1,149 @@
+{# ============================ PAGE 1: AT A GLANCE ============================ #}
+<section class="page first">
+{{ header('AutoDW · Bias report', 'Bias report — dataset ' ~ meta.version, 'Automatically generated from the AutoDW bias analysis. Every number comes from the stored bias report.',
+   [('Dataset', meta.dataset_id[:8] ~ '…'), ('Version', meta.version), ('Target', meta.target), ('Created', meta.created)]) }}
+{{ status_banner(status.level, status.icon, status.title, status.subtitle,
+   [('high', status.counts[0][1], '✕ High'), ('medium', status.counts[1][1], '▲ Medium'), ('notice', status.counts[2][1], 'i Notices')]) }}
+<div class="tiles">
+{% for k, v, e in tiles %}<div class="tile"><span>{{ k }}</span><b>{{ v }}</b>{% if e %}<em>{{ e }}</em>{% endif %}</div>{% endfor %}
+{% if mit_tile %}<div class="tile ok"><span>Mitigation</span><b>{{ mit_tile[0] }}</b><em>{{ mit_tile[1] }}</em></div>
+{% else %}<div class="tile"><span>Mitigation</span><b>—</b><em>not performed</em></div>{% endif %}
+</div>
+<div class="h2">Alerts, in plain language</div>
+{% if alerts %}
+<table class="alerts">{% for a in alerts %}<tr><td style="width:22mm">{{ chip(a.sev) }}</td><td style="width:20mm"><b>{{ a.attr }}</b></td><td>{{ a.plain }}<div class="raw">{{ a.raw }}</div></td></tr>{% endfor %}</table>
+{% else %}<p class="plain">{{ chip('ok', 'No alerts') }} AutoDW raised no bias alerts for this dataset.</p>{% endif %}
+<div class="h2">All checks</div>
+<table class="checks">
+{% for row in checks|batch(2) %}<tr>{% for name, sev, val in row %}<td style="width:24%">{{ name }}</td><td style="width:11%">{{ chip(sev) }}</td><td class="chk-v" style="width:15%">{{ val }}</td>{% endfor %}</tr>{% endfor %}
+</table>
+{{ meaning(overview_meaning) }}
+<div class="legend">Severity: {{ chip('high') }} fairness metric outside its threshold · {{ chip('medium') }} representation / imbalance alert · {{ chip('notice') }} data-quality observation (not an alert) · {{ chip('ok') }} within threshold · {{ chip('na') }}</div>
+</section>
+
+{# ============================ PAGE 2: WHO IS IN THE DATA ============================ #}
+<section class="page">
+<div class="sec"><span class="no">1</span><h2>Who is in the data?</h2></div>
+{% if class_balance %}
+<div class="card">
+{{ card_head('Target classes: ' ~ meta.target, chip('medium', 'Imbalanced') if class_balance.alerts else chip('ok', 'Balanced')) }}
+{{ class_balance.chart|safe }}
+<p class="plain">The majority class has <b>{{ class_balance.ratio }}×</b> the rows of the minority class.
+{% if class_balance.thresholds.imbalance_ratio_alert %}An alert is raised at a ratio of {{ class_balance.thresholds.imbalance_ratio_alert }}{% if class_balance.thresholds.minority_share_alert %} or a minority share below {{ '%g'|format(class_balance.thresholds.minority_share_alert * 100) }}%{% endif %}.{% endif %}
+{% if not class_balance.alerts %}<b>No class-imbalance problem.</b>{% endif %}</p>
+{{ src(['class_imbalance.class_counts', 'class_percentages', 'imbalance_ratio', 'thresholds', 'alerts']) }}
+</div>
+{% else %}{{ na('Class balance', 'report.class_imbalance') }}{% endif %}
+{% if attributes %}
+{% for a in attributes %}
+<div class="card">
+{{ card_head('Representation by ' ~ a.name, chip(a.rep_sev, 'Representation skew' if a.rep_sev != 'ok' else 'Within threshold')) }}
+{{ a.rep_chart|safe }}
+{% if a.rep_ratio is not none %}<p class="plain">The largest group ({{ a.largest }}) is <b>{{ a.rep_ratio }}×</b> the smallest ({{ a.smallest }}); the alert threshold is {{ '%g'|format(rep_thr) }}×.{% if a.small %} Groups under {{ cfg.small_group_n }} rows: {{ a.small|join(', ') }}.{% endif %}</p>{% endif %}
+{{ src(['fairness_profile.representation.' ~ a.name]) }}
+</div>
+{% endfor %}
+{{ meaning('Overall label balance and representation of groups are different questions: a dataset can have balanced labels but very small groups. The next page shows whether the label is also distributed differently across groups.') }}
+{% else %}{{ na('Representation of protected groups', 'report.fairness_profile') }}{% endif %}
+</section>
+
+{# ============================ PAGE 3: LABEL SHARE + SCORECARD ============================ #}
+{% if attributes %}
+<section class="page">
+<div class="sec"><span class="no">2</span><h2>Is the label shared fairly across groups?</h2></div>
+{% for a in attributes %}{% if a.prb %}
+<div class="card">
+{{ card_head('Share of label = 1 within each ' ~ a.name ~ ' group', chip('high', 'Disparity') if 'high' in [a.di_sev, a.spd_sev] else chip('ok', 'Within threshold')) }}
+{{ a.stacked|safe }}
+{% if base_rate is not none %}<p class="plain">The dashed line is the overall rate ({{ '%.1f'|format(base_rate * 100) }}%). Lowest: <b>{{ a.rate_extremes[0][0] }}</b> ({{ '%.1f'|format(a.rate_extremes[0][1] * 100) }}%), highest: <b>{{ a.rate_extremes[1][0] }}</b> ({{ '%.1f'|format(a.rate_extremes[1][1] * 100) }}%). Groups under {{ cfg.small_group_n }} rows are hatched.</p>{% endif %}
+{{ src(['fairness_profile.target_by_attribute.' ~ a.name ~ '.positive_rate_by_group']) }}
+</div>
+{% endif %}{% endfor %}
+<div class="card">
+{{ card_head('Fairness scorecard (privileged group vs. everyone else)', '<span class="tiny muted">green band = accepted range</span>'|safe) }}
+<div class="gauges">
+{% for a in attributes %}
+<div><div class="g-h">Disparate impact · {{ a.name }} <span class="muted">(ref. {{ a.priv }})</span> {{ chip(a.di_sev) }}</div>{{ (a.gauges.di or '<p class="tiny muted">not available</p>')|safe }}</div>
+<div><div class="g-h">Statistical parity difference · {{ a.name }} {{ chip(a.spd_sev) }}</div>{{ (a.gauges.spd or '<p class="tiny muted">not available</p>')|safe }}</div>
+{% endfor %}
+</div>
+<p class="plain"><b>Disparate impact</b> = label = 1 rate of the other groups ÷ rate of the reference group (ideal 1). <b>Parity difference</b> = the same two rates subtracted (ideal 0).
+{% for a in attributes if a.rest_rate is not none and 'high' in [a.di_sev, a.spd_sev] %} {{ a.name|capitalize }}: about {{ '%.0f'|format(a.rest_rate * 100) }}% vs {{ '%.0f'|format(a.priv_rate * 100) }}%.{% endfor %}</p>
+{{ src(['aif360_metrics.per_attribute.*.functions.disparate_impact_ratio', 'statistical_parity_difference', 'rule_of_thumb']) }}
+</div>
+</section>
+
+{# ============================ PAGE 4: PAIRWISE + INTERSECTION ============================ #}
+<section class="page">
+{% for a in attributes if a.pairwise %}
+<div class="card">
+{{ card_head('Each ' ~ a.name ~ ' group compared with the reference group (' ~ a.priv ~ ')', chip('high' if a.n_out else 'ok', a.n_out ~ ' of ' ~ a.pw_rows|length ~ ' outside range')) }}
+{{ a.pairwise|safe }}
+<p class="plain">✕ = outside the accepted {{ '%g'|format(di_band[0]) }}–{{ '%g'|format(di_band[1]) }} range, ● = inside. <span class="muted">(n = rows in the pair being compared.)</span></p>
+{{ src(['aif360_metrics.per_attribute.' ~ a.name ~ '.pairwise_vs_privileged[]']) }}
+</div>
+{% endfor %}
+<div class="two-col">
+<div class="card">
+{% if intersection %}
+{{ card_head(intersection.attrs|join(' × ') ~ ': share of label = 1', chip('notice', intersection.small|length ~ ' small cells') if intersection.small else '') }}
+<table class="ix"><tr><th></th>{% for c in intersection.cols %}<th>{{ c }}</th>{% endfor %}</tr>
+{% for rname, row in intersection.grid %}<tr><th class="rl">{{ rname }}</th>{% for cell in row %}
+{% if cell %}<td class="{{ 'low' if cell.low }}" style="background:{{ cell.bg }};color:{{ cell.fg }}"><b>{{ '%.0f'|format(cell.p * 100) }}%</b><span>n={{ cell.n }}{{ ' ⚠' if cell.low }}</span></td>{% else %}<td style="background:#F6F7F9;color:#8A919C">—</td>{% endif %}
+{% endfor %}</tr>{% endfor %}</table>
+<div class="tiny muted" style="margin-top:2mm">Darker = more label = 1. ⚠ = fewer than {{ cfg.small_group_n }} rows: rates from a handful of rows are not meaningful.</div>
+{{ src(['intersection.target_by_intersection.positive_rate_by_group', 'intersection.representation.groups']) }}
+{% else %}{{ card_head('Intersection of protected attributes') }}<p class="tiny muted">Not available (requires <code>fairness_profile.intersection</code> with two attributes).</p>{% endif %}
+</div>
+<div class="card">
+{{ card_head('Multi-group gap (smoothed EDF)') }}
+{% for k, v in edf %}<div class="edf {{ 'na' if v is none }}"><span>{{ k }}</span><b>{{ 'null' if v is none else '%.3f'|format(v) }}</b></div>{% endfor %}
+{% if iedf %}<div class="edf {{ 'na' if iedf.smoothed_edf.value is none }}"><span>{{ (iedf.attributes or [])|join(' × ') }}</span><b>{{ 'null' if iedf.smoothed_edf.value is none else '%.3f'|format(iedf.smoothed_edf.value) }}</b></div>{% endif %}
+<p class="plain small">Lower is fairer (ideal 0). The report gives no threshold, so these values are shown <b>without a colour judgement</b>.{% if iedf and iedf.smoothed_edf.value is none %} The intersectional value was not computed ({{ iedf.n_observed_cells }} cells observed).{% endif %}</p>
+{{ src(['…functions.smoothed_edf', 'aif360_metrics.intersectional']) }}
+</div>
+</div>
+</section>
+{% endif %}
+
+{# ============================ PAGE 5: DATA QUALITY ============================ #}
+<section class="page">
+<div class="sec"><span class="no">3</span><h2>Data quality</h2></div>
+<div class="tiny muted" style="margin:-1mm 0 3mm">These are observations from the report, not alerts raised by AutoDW. They are shown as {{ chip('notice') }}.</div>
+<div class="two-col">
+<div class="card">{{ card_head('Missing values', chip('notice', dq.missing_cells ~ ' cells') if dq.missing else '') }}{{ (dq.missing or '<p class="tiny muted">No missing values reported.</p>')|safe }}{{ src(['missing_values']) }}</div>
+<div class="card">{{ card_head('Duplicate rows', chip('notice', '%.1f%%'|format(dq.dup.pct)) if dq.dup else '') }}
+{% if dq.dup %}<table class="donut"><tr><td style="width:30mm">{{ dq.dup.chart|safe }}</td><td class="small">{{ dq.dup.n }} rows are exact copies of another row. Duplicates make some examples count twice and can leak between training and test data.{% if dq.dup.samples %} {{ dq.dup.samples }} examples are listed in technical details.{% endif %}</td></tr></table>{% else %}<p class="tiny muted">Not available.</p>{% endif %}
+{{ src(['duplicate_rows_count', 'sample_duplicate_rows']) }}</div>
+</div>
+<div class="two-col">
+<div class="card">{{ card_head('Outliers (% of rows)', chip('notice', dq.outliers_worst[0] ~ ' ' ~ '%.1f'|format(dq.outliers_worst[1]) ~ '%') if dq.outliers else '') }}{{ (dq.outliers or '<p class="tiny muted">Not available.</p>')|safe }}{{ src(['outlier_detection']) }}</div>
+<div class="card">{{ card_head('Skewness |skew|', chip('notice', dq.high_skew|length ~ ' columns > ' ~ '%g'|format(cfg.skew_notice_abs)) if dq.high_skew else '') }}{{ (dq.skew or '<p class="tiny muted">Not available.</p>')|safe }}{{ src(['distribution_statistics.*.skew']) }}</div>
+</div>
+<div class="two-col">
+{% for c in (dq.categorical or [])[:1] %}
+<div class="card">{{ card_head(c.col ~ ' values', chip('notice', 'Inconsistent spelling') if c.inconsistent else '') }}{{ c.chart|safe }}
+{% if c.inconsistent %}<div class="plain small">Some values differ only in upper/lower case (e.g. “False” and “FALSE”), so they are counted as different categories.</div>{% endif %}
+{{ src(['categorical_value_counts.' ~ c.col]) }}</div>
+{% else %}<div class="card">{{ card_head('Categorical values') }}<p class="tiny muted">Not available.</p></div>{% endfor %}
+<div class="card">{{ card_head('Correlations (numeric columns)') }}{{ (dq.corr or '<p class="tiny muted">Not available.</p>')|safe }}
+{% if dq.get('corr_max_pair') is not none %}<div class="plain small">Strongest correlation between features: {{ '%.2f'|format(dq.corr_max_pair) }}.{% if dq.get('corr_max_target') is not none %} Strongest correlation with the target: {{ '%.2f'|format(dq.corr_max_target) }}.{% endif %}</div>{% endif %}
+{{ src(['correlation_matrix']) }}</div>
+</div>
+{% for c in (dq.categorical or [])[1:] %}<div class="card">{{ card_head(c.col ~ ' values', chip('notice', 'Inconsistent spelling') if c.inconsistent else '') }}{{ c.chart|safe }}</div>{% endfor %}
+</section>
+
+{# ============================ PAGE 6: TECHNICAL ============================ #}
+<section class="page">
+<div class="sec"><span class="no">4</span><h2>Technical details <span class="muted small">(for experts)</span></h2></div>
+{% if tech.cols %}<div class="tech"><div class="tech-h">Columns &amp; types</div>
+<table class="tbl"><tr><th>Column</th><th>Type</th><th class="r">Unique</th><th class="r">Missing</th><th>Role</th></tr>
+{% for c in tech.cols %}<tr><td>{{ c.name }}</td><td>{{ c.dtype }}</td><td class="r">{{ c.unique }}</td><td class="r">{{ c.missing }}</td><td>{{ c.role }}</td></tr>{% endfor %}</table>
+<div class="tiny muted">* not in <code>unique_values</code>; taken from <code>fairness_profile.representation.*.n_groups</code>.</div></div>{% endif %}
+{% if tech.stats %}<div class="tech"><div class="tech-h">Summary &amp; distribution statistics</div>
+<table class="tbl small"><tr><th>Column</th><th class="r">Count</th><th class="r">Mean</th><th class="r">Std</th><th class="r">Min</th><th class="r">25%</th><th class="r">50%</th><th class="r">75%</th><th class="r">Max</th><th class="r">Skew</th><th class="r">Kurt.</th></tr>
+{% for r in tech.stats %}<tr>{% for v in r %}<td class="{{ 'r' if not loop.first }}">{{ v }}</td>{% endfor %}</tr>{% endfor %}</table></div>{% endif %}
+{% if tech.dups %}<div class="tech"><div class="tech-h">Sample duplicate rows</div>
+<table class="tbl tiny"><tr>{% for k in tech.dups[0].keys() %}<th>{{ k }}</th>{% endfor %}</tr>{% for r in tech.dups %}<tr>{% for v in r.values() %}<td>{{ v }}</td>{% endfor %}</tr>{% endfor %}</table></div>{% endif %}
+{% if tech.kv %}<div class="tech"><div class="tech-h">Fairness configuration &amp; drift</div><div class="kv">{% for k, v in tech.kv %}<div><span>{{ k }}</span><b>{{ v }}</b></div>{% endfor %}</div></div>{% endif %}
+</section>

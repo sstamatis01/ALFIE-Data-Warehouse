@@ -10,6 +10,10 @@ RUN apt-get update && apt-get install -y \
     gfortran \
     libblas-dev \
     liblapack-dev \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libharfbuzz-subset0 \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies.
@@ -21,6 +25,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
 # Verify critical packages
 RUN python -c "import aiohttp; print('aiohttp version:', aiohttp.__version__)" && \
     python -c "import fastapi; import uvicorn; import pandas; import numpy" && \
+    python -c "import weasyprint; print('weasyprint version:', weasyprint.__version__)" && \
     echo "All critical packages verified successfully"
 
 # Copy application code

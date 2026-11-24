@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     # Bundled static project documents (PDFs in image under /app/static_docs)
     static_docs_dir: Optional[str] = None
 
+    # Timezone used when rendering bias/transformation PDFs (IANA name, e.g. Europe/Bucharest)
+    report_timezone: str = "UTC"
+
     class Config:
         env_file = ".env"
         case_sensitive = False

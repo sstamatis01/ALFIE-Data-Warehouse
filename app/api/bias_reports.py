@@ -1,5 +1,7 @@
-from fastapi import APIRouter, HTTPException, Header, Query
+from fastapi import APIRouter, HTTPException, Header, Query, Response
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import anyio
 import logging
 from ..models.bias_report import (
     BiasReportCreate,
@@ -12,6 +14,8 @@ from ..services.bias_report_service import bias_report_service
 from ..services.kafka_service import kafka_producer_service
 from ..services.transformation_report_service import transformation_report_service
 from ..services.fairness_profile import detect_protected_attribute_candidates
+from ..services.report_pdf import ReportConfig, build_report_pdf
+from ..core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +103,86 @@ async def create_or_update_bias_report(
         raise HTTPException(status_code=500, detail=f"Failed to save bias report: {str(e)}")
 
 
+def _bias_not_found(dataset_id: str, version: Optional[str]) -> HTTPException:
+    version_msg = f" version {version}" if version else ""
+    return HTTPException(
+        status_code=404,
+        detail=f"Bias report not found for dataset {dataset_id}{version_msg}",
+    )
+
+
+async def _resolve_transformation(user_id: str, dataset_id: str, report: BiasReportResponse):
+    """
+    Find the transformation report for a bias report.
+
+    1. mitigation.mitigated_dataset_version → get_report(user, dataset, version)
+    2. else transformation_report_id → get_report_by_id
+    3. else none
+    """
+    inner = report.report if isinstance(report.report, dict) else {}
+    mitigation = inner.get("mitigation") if isinstance(inner, dict) else None
+    version = None
+    if isinstance(mitigation, dict):
+        version = mitigation.get("mitigated_dataset_version")
+    if version:
+        found = await transformation_report_service.get_report(user_id, dataset_id, version)
+        if found:
+            return found
+    if report.transformation_report_id:
+        return await transformation_report_service.get_report_by_id(report.transformation_report_id)
+    return None
+
+
+@router.get(
+    "/{user_id}/{dataset_id}/pdf",
+    response_class=Response,
+    responses={200: {"content": {"application/pdf": {}}}},
+)
+async def get_bias_report_pdf(
+    user_id: str,
+    dataset_id: str,
+    version: Optional[str] = Query(None, description="Dataset version of the bias report (default: latest)"),
+    include_transformation: bool = Query(True, description="Merge the transformation report when one can be resolved"),
+    tz: Optional[str] = Query(None, description="IANA timezone for displayed timestamps (default: REPORT_TIMEZONE)"),
+    download: bool = Query(False, description="true = download attachment; false = inline"),
+):
+    """
+    Render the stored bias report (and its transformation report, when present) as one PDF.
+    """
+    report = await bias_report_service.get_report(user_id, dataset_id, version)
+    if not report:
+        raise _bias_not_found(dataset_id, version)
+
+    zone = tz or settings.report_timezone
+    try:
+        ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        raise HTTPException(status_code=400, detail=f"Unknown timezone: {zone}")
+
+    transformation = None
+    if include_transformation:
+        transformation = await _resolve_transformation(user_id, dataset_id, report)
+
+    bias_doc = report.model_dump()
+    transformation_doc = transformation.model_dump() if transformation else None
+    config = ReportConfig(timezone=zone)
+    try:
+        pdf = await anyio.to_thread.run_sync(
+            lambda: build_report_pdf(bias_doc, transformation_doc, config=config)
+        )
+    except Exception as e:
+        logger.error(f"Failed to render bias report PDF: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to render bias report PDF")
+
+    fname = f"bias_report_{dataset_id}_{report.dataset_version}.pdf"
+    disposition = "attachment" if download else "inline"
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'{disposition}; filename="{fname}"'},
+    )
+
+
 @router.get("/{user_id}/{dataset_id}", response_model=BiasReportResponse)
 async def get_bias_report(
     user_id: str, 
@@ -108,8 +192,7 @@ async def get_bias_report(
     """Get bias report for a dataset (specific version or latest)"""
     report = await bias_report_service.get_report(user_id, dataset_id, version)
     if not report:
-        version_msg = f" version {version}" if version else ""
-        raise HTTPException(status_code=404, detail=f"Bias report not found for dataset {dataset_id}{version_msg}")
+        raise _bias_not_found(dataset_id, version)
     return report
 
 

@@ -211,6 +211,16 @@ GET /datasets/{user_id}/{dataset_id}/download
 GET /datasets/search/{user_id}?query=heart&tags=medical&file_type=csv
 ```
 
+### Bias report PDF
+
+```http
+GET /bias-reports/{user_id}/{dataset_id}/pdf?version=v2&include_transformation=true&download=false
+```
+
+Returns one PDF of the stored bias report and, when mitigation produced one, the matching transformation report. The front end should embed or download this response. Query `tz` overrides the display timezone (`REPORT_TIMEZONE`, default UTC). Unknown `tz` is 400; a missing bias report is 404.
+
+See [Documentation/BIAS_REPORT_PDF.md](Documentation/BIAS_REPORT_PDF.md).
+
 ### User-files (chatbot attachments)
 - `POST /user-files/upload/{user_id}` – Upload file (multipart: file, optional name, description, project_id)
 - `GET /user-files/{user_id}` – List files (query: project_id, skip, limit)

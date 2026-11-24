@@ -1,0 +1,9 @@
+{% from "macros.html.j2" import chip, card_head, src, meaning, na, header, status_banner with context %}
+<!doctype html><html><head><meta charset="utf-8"><title>AutoDW report</title><style>{{ css|safe }}</style></head><body>
+
+{% include "bias.html.j2" %}
+{% if transformation %}{% include "transformation.html.j2" %}
+{% elif mitigation_without_report %}
+<section class="page"><div class="na-box"><b>Transformation report: not available.</b> The bias report says mitigation was performed, but the transformation report could not be loaded.</div></section>
+{% endif %}
+</body></html>

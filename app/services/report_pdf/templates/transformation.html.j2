@@ -1,0 +1,87 @@
+{% set T = transformation %}
+{% set stc = {'applied': C.ok, 'skipped': C.na, 'info': C.info} %}
+{% set sti = {'applied': '✓', 'skipped': '–', 'info': 'i'} %}
+<section class="page">
+{{ header('AutoDW · Transformation report', 'Transformation report', 'How AutoDW’s bias mitigator prepared the data before training. Every number comes from the stored transformation report.',
+   [('Dataset', T.meta.dataset_id[:8] ~ '…'), ('From → to', T.meta.from_version ~ ' → ' ~ T.meta.version), ('Report id', T.meta.report_id[:10] ~ '…'), ('Created', T.meta.created)]) }}
+{% set sub %}{{ T.timeline|selectattr('status', 'equalto', 'applied')|map(attribute='name')|join(', ') }}.{% if T.unaddressed_fairness %} <b>None of the {{ T.total }} steps targets the fairness alerts</b> from the bias report.{% endif %}{% endset %}
+<table class="status ok"><tr>
+<td style="width:14mm"><div class="st-ic" style="background:{{ C.ok }}">✓</div></td>
+<td><div class="st-t">{{ T.total }} steps logged</div><div class="st-s">{{ sub }}</div></td>
+<td style="text-align:right;white-space:nowrap">
+<div class="cnt" style="border-top-color:{{ C.ok }}"><b style="color:{{ C.ok }}">{{ T.counts.applied }}</b><span>✓ Applied</span></div><div class="cnt" style="border-top-color:{{ C.na }}"><b style="color:{{ C.na }}">{{ T.counts.skipped }}</b><span>– Skipped</span></div><div class="cnt" style="border-top-color:{{ C.info }}"><b style="color:{{ C.info }}">{{ T.counts.info }}</b><span>i Info</span></div>
+</td></tr></table>
+<div class="h2">Pipeline, in the order it ran</div>
+<div class="timeline">
+{% for s in T.timeline %}<div class="step {{ s.status }}"><table class="step-t"><tr><td><div class="sn">{{ s.idx }}. {{ s.name }}</div></td><td style="width:6mm;text-align:right"><div class="dot" style="background:{{ stc[s.status] }}">{{ sti[s.status] }}</div></td></tr></table><div class="sc">{{ s.n }}× · {{ s.cols }}</div></div>{% endfor %}
+</div>
+{% if T.links %}<div class="card">
+{{ card_head('Link to bias-report findings') }}
+<table class="tbl"><tr><th>Bias-report finding</th><th>Addressed by</th><th>Status</th></tr>
+{% for f, by, sev in T.links %}<tr><td>{{ f }}</td><td>{{ by }}</td><td>{{ chip(sev, 'Addressed' if sev == 'ok' else ('Unclear' if sev == 'na' else 'Not addressed')) }}</td></tr>{% endfor %}
+</table>
+<div class="tiny muted" style="margin-top:2mm">Whether the fairness metrics changed in {{ T.meta.version }} is not known: it <b>requires a bias report run on {{ T.meta.version }}</b> (or <code>fairness_after</code> fields in the transformation report).</div>
+</div>{% endif %}
+{{ meaning('Your data was cleaned and made easier for the model to learn from.' ~ (' The cleaning did <b>not</b> rebalance the protected groups, so the fairness warnings from the bias report probably still apply to the trained model. Check the model’s results per group.'|safe if T.unaddressed_fairness else '')) }}
+</section>
+
+<section class="page">
+<div class="sec"><span class="no">A</span><h2>Before → after, step by step</h2></div>
+{% if T.fills %}<div class="card">
+{{ card_head(T.step_no.missing_value_fill ~ '. Missing values filled', chip('ok', T.fills|length ~ ' columns')) }}
+<table class="tbl"><tr><th>Column</th><th>Method</th><th class="r">Before</th><th></th><th class="r">After</th><th class="r">Fill value</th><th class="r">Missing in full {{ T.meta.from_version }}</th></tr>
+{% for r in T.fills %}<tr><td><b>{{ r.col }}</b></td><td>{{ r.method }}</td><td class="r">{{ r.before }}</td><td class="arrow">→</td><td class="r">0 missing*</td><td class="r mono">{{ r.fill }}</td><td class="r muted">{{ r.full if r.full is not none else '—' }}</td></tr>{% endfor %}</table>
+<div class="tiny muted" style="margin-top:1.5mm">* “0 missing” is implied by the fill. If “Before” differs from the full-dataset count, the mitigation ran on a subset (e.g. the training split).</div>
+{{ src(['report[].original_missing_values | original_value', 'report[].modified_value']) }}
+</div>{% endif %}
+<div class="two-col">
+{% for r in T.dups %}<div class="card">{{ card_head(T.step_no.duplicate_removal ~ '. Duplicates removed', chip('ok')) }}
+<table class="ba"><tr><td><span>Before</span><b>{{ r.before }}</b></td><td class="arrow">→</td><td><span>After</span><b>{{ r.after }}</b></td></tr></table>
+<div class="tiny muted">Rows before/after: <span class="req">requires field <code>rows_before</code>, <code>rows_after</code></span></div></div>{% endfor %}
+{% for r in T.task %}<div class="card">{{ card_head(T.step_no.task_inference ~ '. Task type detected', chip('notice', 'Info')) }}
+<table class="ba"><tr><td><span>{{ r.col }}</span><b>{{ r.before }}</b></td><td class="arrow">→</td><td><span>task</span><b>{{ r.after }}</b></td></tr></table>
+<div class="tiny muted">Method: {{ r.method }}. No data changed.</div></div>{% endfor %}
+</div>
+{% if T.enc or T.enc_skipped %}<div class="card">
+{{ card_head((T.step_no.encoding ~ '. ' if T.step_no.encoding else '') ~ 'Categories encoded', (chip('ok', T.enc|length ~ ' columns') if T.enc else '') ~ ' ' ~ (chip('na', T.enc_skipped|length ~ ' skipped') if T.enc_skipped else '')) }}
+{% for r in T.enc %}<table class="enc"><tr><td style="width:30mm" class="enc-l"><b>{{ r.col }}</b><span>{{ r.before }} categories</span></td><td style="width:26mm" class="arrow">→ {{ r.method }} →</td><td>{% if r.pills %}{% for p in r.pills %}<span class="pill">{{ p }}</span>{% endfor %}{% else %}{{ r.after }}{% endif %}</td></tr></table>{% endfor %}
+<div class="tiny muted">{% if T.enc %}Column names on the right are illustrative (category names from the bias report). {% endif %}{% if T.enc_skipped %}Skipped: {% for r in T.enc_skipped %}{{ r.col }} ({{ r.before }}, {{ r.after }}){{ ', ' if not loop.last }}{% endfor %}.{% endif %}</div>
+</div>{% endif %}
+{% if T.skew %}<div class="card">
+{{ card_head(T.step_no.skew_correction ~ '. Skew corrected', chip('ok')) }}
+{{ T.skew|safe }}
+<p class="plain">Orange = skew before, green = after (method shown in the raw log).</p>
+</div>{% endif %}
+</section>
+
+<section class="page">
+<div class="two-col">
+{% for o in T.ovs %}<div class="card">
+{{ card_head('Oversampling (SMOTE): ' ~ o.status, chip('na', 'Skipped') if o.status == 'skipped' else chip('ok')) }}
+{{ (o.chart or '')|safe }}
+<p class="plain small">{% if o.counts %}Class counts at this step: {% for k, v in o.counts.items() %}{{ k }}: {{ v }}{{ ' vs ' if not loop.last }}{% endfor %} (minority/majority = {{ '%.3f'|format(o.min_maj) }}). {% endif %}{{ o.text }}.</p>
+<div class="tiny muted">Threshold that triggers SMOTE: <span class="req">requires field <code>threshold</code></span>.{% if o.total and T.rows and o.total != T.rows %} {{ '{:,}'.format(o.total) }} rows ≠ {{ '{:,}'.format(T.rows) }}: these counts appear to come from the training split.{% endif %}</div>
+</div>{% endfor %}
+{% if T.drift %}<div class="card">
+{{ card_head(T.step_no.drift_mitigation ~ '. Feature scaling (drift mitigation)', chip('ok', T.drift|length ~ ' columns')) }}
+<table class="tbl"><tr><th>Column</th><th>Method</th><th class="r">Before</th><th class="r">After</th></tr>
+{% for r in T.drift %}<tr><td>{{ r.col }}</td><td>{{ r.method }}</td><td class="r">{{ r.before }}</td><td class="r">{{ r.after }}</td></tr>{% endfor %}</table>
+{% if T.drift_all_zero %}<p class="plain small">The before/after values are all 0, so no chart can be drawn. <span class="req">Requires fields such as <code>mean_before/after</code>, <code>std_before/after</code> or a drift statistic</span>.</p>{% endif %}
+</div>{% endif %}
+</div>
+{% if T.other %}<div class="card">{{ card_head('Other steps') }}
+<table class="tbl"><tr><th>Column</th><th>Transformation</th><th>Method</th><th>Before</th><th>After</th></tr>
+{% for r in T.other %}<tr><td>{{ r.col }}</td><td>{{ r.t }}</td><td>{{ r.method }}</td><td>{{ r.before }}</td><td>{{ r.after }}</td></tr>{% endfor %}</table></div>{% endif %}
+<div class="card">
+{{ card_head('Charts that need extra fields', chip('na', 'Requires field')) }}
+<div class="ph-grid">
+<div class="ph"><b>Class balance before vs after</b><span>needs <code>class_counts_before/after</code> on the full dataset</span></div>
+<div class="ph"><b>Fairness before vs after (DI, SPD)</b><span>needs a {{ T.meta.version }} bias report or <code>fairness_after</code></span></div>
+<div class="ph"><b>Rows / columns before vs after</b><span>needs <code>shape_before</code>, <code>shape_after</code></span></div>
+<div class="ph"><b>Distribution before/after (histograms)</b><span>needs <code>histogram_before/after</code> (bins + counts)</span></div>
+</div>
+</div>
+<div class="tech"><div class="tech-h">Raw transformation log (all {{ T.total }} entries)</div>
+<table class="tbl tiny"><tr><th>#</th><th>Column</th><th>Transformation</th><th>Method</th><th>Original</th><th>Modified</th></tr>
+{% for r in T.raw %}<tr><td>{{ r.i }}</td><td>{{ r.col }}</td><td>{{ r.t }}</td><td>{{ r.method }}</td><td>{{ r.before }}</td><td>{{ r.after }}</td></tr>{% endfor %}</table></div>
+</section>
