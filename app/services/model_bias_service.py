@@ -96,7 +96,10 @@ def _score_extracted_model(root: Path, features: pd.DataFrame, positive_label: A
     if predictor_files:
         from autogluon.tabular import TabularPredictor
 
-        predictor = TabularPredictor.load(str(predictor_files[0].parent))
+        predictor = TabularPredictor.load(
+            str(predictor_files[0].parent),
+            require_py_version_match=False,
+        )
         if hasattr(predictor, "predict_proba"):
             proba = predictor.predict_proba(features)
             column = _positive_proba_column(proba, positive_label)
@@ -270,6 +273,10 @@ class ModelBiasService:
         else:
             notes.insert(0, "Predictions were scored on the full dataset table.")
         notes.insert(1, "Aequitas compares prediction rates across groups. It does not read model weights.")
+        if scorer.startswith("autogluon"):
+            notes.append(
+                "The predictor Python-version check was skipped so a model saved on Python 3.12 can be scored by this API's Python 3.11."
+            )
 
         now = datetime.now(tz=timezone.utc)
         doc = {
