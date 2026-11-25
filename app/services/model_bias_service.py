@@ -80,9 +80,19 @@ def _read_csv_bytes(data: bytes) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(data))
 
 
+def _predictor_dirs(root: Path) -> list[Path]:
+    """Prefer the saved predictor over AutoGluon's ``-clone-opt`` copy."""
+    found = [
+        path
+        for path in root.rglob("predictor.pkl")
+        if "-clone-opt" not in path.parts
+    ]
+    return sorted(found, key=lambda path: (len(path.parts), str(path)))
+
+
 def _score_extracted_model(root: Path, features: pd.DataFrame, positive_label: Any) -> tuple[pd.Series, str]:
     unpack_model_archives(root)
-    predictor_files = list(root.rglob("predictor.pkl"))
+    predictor_files = _predictor_dirs(root)
     if predictor_files:
         from autogluon.tabular import TabularPredictor
 
@@ -102,9 +112,10 @@ def _score_extracted_model(root: Path, features: pd.DataFrame, positive_label: A
     if len(pickles) == 1:
         return _score_sklearn_file(pickles[0], features, positive_label)
     if not pickles:
+        top = sorted(path.name for path in root.iterdir())[:20]
         raise ValueError(
             "This model archive has no AutoGluon predictor.pkl and no single sklearn .pkl/.joblib file. "
-            "Aequitas needs predictions, and this artifact type is not loaded yet."
+            f"Top-level entries after unpack: {top}."
         )
     raise ValueError(
         "This model archive has several pickle files and no AutoGluon predictor.pkl, so it is not clear which one to score."
