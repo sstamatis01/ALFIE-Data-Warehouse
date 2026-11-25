@@ -36,7 +36,7 @@ weasyprint>=66,<71
 Jinja2>=3.1
 tzdata
 # For concept drift consumer (AutoGluon tabular retraining; backends needed to load saved predictors)
-autogluon.tabular>=1.0.0,<1.2
+autogluon.tabular>=1.4,<1.5
 catboost>=1.0.0
 lightgbm>=4.0.0
 xgboost>=2.0.0

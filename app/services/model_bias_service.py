@@ -238,7 +238,7 @@ class ModelBiasService:
                 features,
                 positive,
             )
-        except ValueError as exc:
+        except (ValueError, AssertionError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         audit_input = pd.DataFrame(
