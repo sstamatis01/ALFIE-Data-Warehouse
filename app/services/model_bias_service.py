@@ -26,6 +26,7 @@ from ..models.model_bias import ModelBiasAuditRequest, ModelBiasAuditResponse
 from ..utils.public_dataset_link import resolve_storage_path
 from .aequitas_audit import run_aequitas_audit
 from .ai_model_service import ai_model_service
+from .model_archive import safe_extract_zip, unpack_model_archives
 from .model_bias_alerts import build_model_bias_alerts, user_audit_note
 from .model_feature_align import restore_group_columns, select_scoring_frame
 from .bias_report_service import bias_report_service
