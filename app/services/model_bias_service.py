@@ -26,6 +26,7 @@ from ..models.model_bias import ModelBiasAuditRequest, ModelBiasAuditResponse
 from ..utils.public_dataset_link import resolve_storage_path
 from .aequitas_audit import run_aequitas_audit
 from .ai_model_service import ai_model_service
+from .model_archive import safe_extract_zip, unpack_model_archives
 from .bias_report_service import bias_report_service
 from .file_service import file_service
 from .metadata_service import metadata_service
@@ -80,6 +81,7 @@ def _read_csv_bytes(data: bytes) -> pd.DataFrame:
 
 
 def _score_extracted_model(root: Path, features: pd.DataFrame, positive_label: Any) -> tuple[pd.Series, str]:
+    unpack_model_archives(root)
     predictor_files = list(root.rglob("predictor.pkl"))
     if predictor_files:
         from autogluon.tabular import TabularPredictor
@@ -346,7 +348,7 @@ class ModelBiasService:
             with tempfile.TemporaryDirectory(prefix="model-bias-") as tmp:
                 root = Path(tmp)
                 with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-                    archive.extractall(root)
+                    safe_extract_zip(archive, root)
                 return _score_extracted_model(root, features, positive_label)
 
         return await anyio.to_thread.run_sync(_run)
