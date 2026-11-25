@@ -27,6 +27,7 @@ from ..utils.public_dataset_link import resolve_storage_path
 from .aequitas_audit import run_aequitas_audit
 from .ai_model_service import ai_model_service
 from .model_archive import safe_extract_zip, unpack_model_archives
+from .model_feature_align import restore_group_columns, select_scoring_frame
 from .bias_report_service import bias_report_service
 from .file_service import file_service
 from .metadata_service import metadata_service
@@ -90,9 +91,27 @@ def _predictor_dirs(root: Path) -> list[Path]:
     return sorted(found, key=lambda path: (len(path.parts), str(path)))
 
 
-def _score_extracted_model(root: Path, features: pd.DataFrame, positive_label: Any) -> tuple[pd.Series, str]:
+def _score_frame(predictor, frame: pd.DataFrame, expected: list[str], positive_label: Any) -> tuple[pd.Series, str]:
+    features = frame.loc[:, expected]
+    if hasattr(predictor, "predict_proba"):
+        proba = predictor.predict_proba(features)
+        column = _positive_proba_column(proba, positive_label)
+        return pd.Series(proba[column].to_numpy(), index=features.index), "autogluon_tabular_proba"
+    predicted = predictor.predict(features)
+    return pd.Series(predicted.to_numpy(), index=features.index), "autogluon_tabular_predict"
+
+
+def _score_extracted_model(
+    root: Path,
+    candidates: list[tuple[str, pd.DataFrame]],
+    *,
+    target_column: str,
+    protected: list[str],
+    positive_label: Any,
+) -> tuple[pd.Series, str, str, pd.DataFrame, list[str]]:
     unpack_model_archives(root)
     predictor_files = _predictor_dirs(root)
+    requested_version, requested_frame = candidates[0]
     if predictor_files:
         from autogluon.tabular import TabularPredictor
 
@@ -100,20 +119,43 @@ def _score_extracted_model(root: Path, features: pd.DataFrame, positive_label: A
             str(predictor_files[0].parent),
             require_py_version_match=False,
         )
-        if hasattr(predictor, "predict_proba"):
-            proba = predictor.predict_proba(features)
-            column = _positive_proba_column(proba, positive_label)
-            return pd.Series(proba[column].to_numpy(), index=features.index), "autogluon_tabular_proba"
-        predicted = predictor.predict(features)
-        return pd.Series(predicted.to_numpy(), index=features.index), "autogluon_tabular_predict"
+        expected = [str(column) for column in predictor.features()]
+        selected = select_scoring_frame(candidates, expected, requested_version)
+        if selected is None:
+            available = [str(column) for column in requested_frame.columns]
+            missing = [column for column in expected if column not in requested_frame.columns]
+            raise ValueError(
+                "The evaluation table does not have the columns this model was trained on. "
+                f"Missing: {missing}. Available on {requested_version}: {available}."
+            )
+        version, frame = selected
+        if target_column not in frame.columns:
+            raise ValueError(f"Label column '{target_column}' is not in dataset {version}.")
+        frame, restored = restore_group_columns(frame, protected)
+        missing_attrs = [name for name in protected if name not in frame.columns]
+        if missing_attrs:
+            raise ValueError(
+                f"Protected attributes are not columns in dataset {version}, "
+                f"and they could not be rebuilt from one-hot columns: {missing_attrs}."
+            )
+        scores, scorer = _score_frame(predictor, frame, expected, positive_label)
+        return scores, scorer, version, frame, restored
 
+    features = requested_frame.drop(columns=[target_column])
+    requested_frame, restored = restore_group_columns(requested_frame, protected)
+    missing_attrs = [name for name in protected if name not in requested_frame.columns]
+    if missing_attrs:
+        raise ValueError(
+            f"Protected attributes are not columns in dataset {requested_version}: {missing_attrs}."
+        )
     pickles = [
         path
         for path in root.rglob("*")
         if path.suffix.lower() in {".pkl", ".joblib"} and path.is_file()
     ]
     if len(pickles) == 1:
-        return _score_sklearn_file(pickles[0], features, positive_label)
+        scores, scorer = _score_sklearn_file(pickles[0], features, positive_label)
+        return scores, scorer, requested_version, requested_frame, restored
     if not pickles:
         top = sorted(path.name for path in root.iterdir())[:20]
         raise ValueError(
@@ -224,35 +266,30 @@ class ModelBiasService:
                 status_code=422,
                 detail=f"Label column '{target_column}' is not in the evaluation table.",
             )
-        missing_attrs = [name for name in protected if name not in table.columns]
-        if missing_attrs:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Protected attributes are not columns in the evaluation table: {missing_attrs}",
-            )
-
-        features = table.drop(columns=[target_column])
+        candidates = await self._candidate_tables(request.user_id, dataset, eval_split, table)
         model_version = str(model.get("version") or "v1")
         try:
-            scores, scorer = await self._score_model(
+            scores, scorer, scored_version, scored_frame, restored_groups = await self._score_model(
                 request.user_id,
                 request.model_id,
                 model_version,
-                features,
-                positive,
+                candidates,
+                target_column=target_column,
+                protected=protected,
+                positive_label=positive,
             )
-        except (ValueError, AssertionError) as exc:
+        except (ValueError, AssertionError, KeyError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         audit_input = pd.DataFrame(
             {
-                "label_value": table[target_column].to_numpy(),
+                "label_value": scored_frame[target_column].to_numpy(),
                 "score": scores.to_numpy(),
             },
-            index=table.index,
+            index=scored_frame.index,
         )
         for name in protected:
-            audit_input[name] = table[name].to_numpy()
+            audit_input[name] = scored_frame[name].to_numpy()
 
         try:
             audited = await anyio.to_thread.run_sync(
@@ -277,6 +314,17 @@ class ModelBiasService:
             notes.append(
                 "The predictor Python-version check was skipped so a model saved on Python 3.12 can be scored by this API's Python 3.11."
             )
+        if scored_version != dataset.version:
+            notes.append(
+                f"Scored {scored_version} instead of {dataset.version} because the model was trained on the mitigated columns. "
+                "ethnicity and gender were one-hot encoded, and some numeric columns were transformed."
+            )
+        if restored_groups:
+            notes.append(
+                "Rebuilt "
+                + ", ".join(restored_groups)
+                + f" from the one-hot columns on {scored_version} so the group labels match the dataset bias report."
+            )
 
         now = datetime.now(tz=timezone.utc)
         doc = {
@@ -284,7 +332,7 @@ class ModelBiasService:
             "model_id": request.model_id,
             "model_version": model_version,
             "dataset_id": dataset.dataset_id,
-            "dataset_version": dataset.version,
+            "dataset_version": scored_version,
             "protected_attributes": audited["protected_attributes"],
             "reference_groups": audited["reference_groups"],
             "positive_label": audited["positive_label"],
@@ -352,22 +400,60 @@ class ModelBiasService:
         data = await file_service.download_file(storage_path)
         return _read_table_bytes(data, dataset.original_filename or storage_path)
 
+    async def _candidate_tables(
+        self,
+        user_id: str,
+        dataset: DatasetMetadata,
+        eval_split: Optional[str],
+        requested_table: pd.DataFrame,
+    ) -> list[tuple[str, pd.DataFrame]]:
+        candidates = [(dataset.version, requested_table)]
+        try:
+            versions = await metadata_service.get_dataset_versions(dataset.dataset_id, user_id)
+        except Exception:
+            logger.warning("Could not list dataset versions while aligning model columns", exc_info=True)
+            return candidates
+        for item in versions:
+            if item.dataset_id != dataset.dataset_id or item.version == dataset.version:
+                continue
+            try:
+                frame = await self._load_table(item, eval_split)
+            except Exception:
+                logger.warning(
+                    "Skipped dataset %s %s while aligning model columns",
+                    item.dataset_id,
+                    item.version,
+                    exc_info=True,
+                )
+                continue
+            candidates.append((item.version, frame))
+        return candidates
+
     async def _score_model(
         self,
         user_id: str,
         model_id: str,
         version: str,
-        features: pd.DataFrame,
+        candidates: list[tuple[str, pd.DataFrame]],
+        *,
+        target_column: str,
+        protected: list[str],
         positive_label: Any,
-    ) -> tuple[pd.Series, str]:
+    ) -> tuple[pd.Series, str, str, pd.DataFrame, list[str]]:
         payload = await ai_model_service.download_model_as_zip(user_id, model_id, version)
 
-        def _run() -> tuple[pd.Series, str]:
+        def _run() -> tuple[pd.Series, str, str, pd.DataFrame, list[str]]:
             with tempfile.TemporaryDirectory(prefix="model-bias-") as tmp:
                 root = Path(tmp)
                 with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                     safe_extract_zip(archive, root)
-                return _score_extracted_model(root, features, positive_label)
+                return _score_extracted_model(
+                    root,
+                    candidates,
+                    target_column=target_column,
+                    protected=protected,
+                    positive_label=positive_label,
+                )
 
         return await anyio.to_thread.run_sync(_run)
 
