@@ -16,6 +16,7 @@ from .services.file_service import file_service
 from .services.metadata_service import metadata_service
 from .services.kafka_service import kafka_producer_service
 from .services.bias_report_service import bias_report_service
+from .services.model_bias_service import model_bias_service
 from .services.concept_drift_report_service import concept_drift_report_service
 from .api import datasets, users, bias_reports, concept_drift_reports, ai_models
 from .services.transformation_report_service import transformation_report_service
@@ -58,6 +59,7 @@ async def lifespan(app: FastAPI):
         await file_service.initialize()
         await metadata_service.initialize()
         await bias_report_service.initialize()
+        await model_bias_service.initialize()
         await concept_drift_report_service.initialize()
         await transformation_report_service.initialize()
         await ai_model_service.initialize()

@@ -221,6 +221,23 @@ Returns one PDF of the stored bias report and, when mitigation produced one, the
 
 See [Documentation/BIAS_REPORT_PDF.md](Documentation/BIAS_REPORT_PDF.md).
 
+### Model bias audit (Aequitas)
+
+```http
+POST /bias-reports/model-audit
+Content-Type: application/json
+
+{
+  "user_id": "user123",
+  "model_id": "model123",
+  "dataset_id": "dataset123"
+}
+```
+
+Scores a stored tabular classification model on the dataset test split and audits the predictions with Aequitas. Protected attributes come from the dataset bias report. Vision and regression models are refused. The latest saved audit is `GET /bias-reports/model-audit/{user_id}/{model_id}`.
+
+See [Documentation/MODEL_BIAS_AEQUITAS.md](Documentation/MODEL_BIAS_AEQUITAS.md).
+
 ### User-files (chatbot attachments)
 - `POST /user-files/upload/{user_id}` – Upload file (multipart: file, optional name, description, project_id)
 - `GET /user-files/{user_id}` – List files (query: project_id, skip, limit)

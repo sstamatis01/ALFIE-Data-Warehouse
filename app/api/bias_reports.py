@@ -15,6 +15,8 @@ from ..services.kafka_service import kafka_producer_service
 from ..services.transformation_report_service import transformation_report_service
 from ..services.fairness_profile import detect_protected_attribute_candidates
 from ..services.report_pdf import ReportConfig, build_report_pdf
+from ..services.model_bias_service import model_bias_service
+from ..models.model_bias import ModelBiasAuditRequest, ModelBiasAuditResponse
 from ..core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,26 @@ async def protected_attribute_candidates(payload: ProtectedAttributeCandidatesRe
     return ProtectedAttributeCandidatesResponse(
         candidates=[ProtectedAttributeCandidate(**c) for c in found]
     )
+
+
+@router.post("/model-audit", response_model=ModelBiasAuditResponse)
+async def run_model_bias_audit(payload: ModelBiasAuditRequest):
+    """
+    Score a stored tabular classification model and audit its predictions with Aequitas.
+
+    Protected attributes default to those stored on the dataset bias report.
+    The result is saved and returned.
+    """
+    return await model_bias_service.run_audit(payload)
+
+
+@router.get("/model-audit/{user_id}/{model_id}", response_model=ModelBiasAuditResponse)
+async def get_model_bias_audit(user_id: str, model_id: str):
+    """Return the latest saved Aequitas audit for this model."""
+    found = await model_bias_service.get_latest(user_id, model_id)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Model bias audit not found for model {model_id}")
+    return found
 
 
 @router.post("/", response_model=BiasReportResponse)

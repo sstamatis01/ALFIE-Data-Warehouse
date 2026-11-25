@@ -29,6 +29,8 @@ river==0.21.0
 requests>=2.22.0
 # Bias fairness metrics (DI / SPD / smoothed EDF); worker falls back if import fails
 aif360>=0.6.0
+# Model-prediction fairness audit (group metrics + disparity tests). Core only, not aequitas[flow].
+aequitas>=1.1,<1.2
 # On-demand bias + transformation PDF (Jinja2 HTML + inline SVG, WeasyPrint)
 weasyprint>=66,<71
 Jinja2>=3.1
