@@ -1,0 +1,123 @@
+{# Model bias (Aequitas audit) section. Context: mb (model_bias_context), mb_first, mb_p (section-number prefix), cfg, C, SEV. #}
+{% macro mcell(c) -%}
+{%- if c.st == 'ref' -%}<td class="mx ref">ref.</td>
+{%- elif c.st == 'na' or c.d is none -%}<td class="mx na">—</td>
+{%- else -%}{%- set k = {'high': 'high', 'notice': 'notice', 'ok': 'ok', 'small': 'na'}[c.st] -%}{%- set s = SEV[k] -%}
+<td class="mx {{ c.st }}" style="background:{{ s[3] }};color:{{ C.warn_text if k == 'medium' else ('#5B6472' if k == 'na' else s[2]) }}"><b>{{ '%.2f'|format(c.d) }}</b><span>{{ '⚠' if c.st == 'small' else s[1] }}{% if c.sig %} •{% endif %}</span></td>
+{%- endif -%}
+{%- endmacro %}
+{% set band_txt = '%g'|format(mb.band[0]) ~ '–' ~ '%g'|format(mb.band[1]) %}
+
+{# ============================ M · OVERVIEW ============================ #}
+<section class="page{{ ' first' if mb_first }}">
+{{ header('AutoDW · Model bias report · model ' ~ mb.meta.model_version, 'Model bias check',
+   'Does the trained model treat groups differently? Checked with Aequitas on held-out test data; every number comes from the stored audit.',
+   [('Model', mb.meta.model_id[:14] ~ '…'), ('Dataset', mb.meta.dataset_id[:8] ~ '… ' ~ mb.meta.dataset_version), ('Test split', mb.meta.split), ('Created', mb.meta.created)]) }}
+{% if not mb.available %}{{ na('Model bias audit', 'report.metrics') }}{% else %}
+{{ status_banner(mb.status.level, mb.status.icon, mb.status.title, mb.status.subtitle,
+   [('high', mb.status.counts[0][1], '✕ High'), ('medium', mb.status.counts[1][1], '▲ Caution'), ('notice', mb.status.counts[2][1], 'i Notices')]) }}
+<div class="tiles">{% for k, v, e in mb.tiles %}<div class="tile"><span>{{ k }}</span><b>{{ v }}</b>{% if e %}<em>{{ e }}</em>{% endif %}</div>{% endfor %}</div>
+<div class="h2">Alerts, in plain language</div>
+{% if mb.alerts %}
+<table class="alerts">{% for a in mb.alerts %}<tr><td style="width:22mm">{{ chip(a.sev, 'Caution' if a.sev == 'medium' else None) }}</td><td style="width:20mm"><b>{{ a.attr }}</b></td><td>{{ a.plain }}<div class="raw">{{ a.raw }}</div></td></tr>{% endfor %}</table>
+{% else %}<p class="plain">{{ chip('ok', 'No alerts') }} The audit raised no model bias alerts.</p>{% endif %}
+{{ meaning(mb.meaning) }}
+<div class="legend">Severity: {{ chip('high') }} selection, true-positive or false-positive rate outside {{ band_txt }}× the reference group (group ≥ {{ cfg.model_min_group }} rows) · {{ chip('medium', 'Caution') }} group too small to judge · {{ chip('notice') }} other metric outside the range (shown, not an alert) · {{ chip('ok') }} within range</div>
+{% endif %}
+</section>
+
+{% if mb.available %}
+{# ============================ M1 · OVERALL + WHO WAS TESTED ============================ #}
+<section class="page">
+<div class="sec"><span class="no">{{ mb_p }}1</span><h2>How well does the model work, and on whom?</h2></div>
+{% if mb.overall %}
+<div class="two-col">
+<div class="card">{{ card_head('Predictions vs. true labels (all ' ~ mb.meta.n_rows ~ ' test rows)') }}<div style="width:80%">{{ mb.overall.confusion|safe }}</div>
+<p class="plain small">Green = correct, orange = wrong. The model predicted 1 for <b>{{ mb.overall.pp }}</b> rows; <b>{{ mb.overall.pos }}</b> rows really are 1.</p></div>
+<div class="card">{{ card_head('Overall metrics') }}{{ mb.overall.bars|safe }}
+<p class="plain small">These are for the whole test set. The rest of the report asks whether they hold <b>equally for every group</b>.</p></div>
+</div>
+{% endif %}
+{% for a in mb.attributes %}
+<div class="card">
+{{ card_head('Test rows per ' ~ a.name ~ ' group', chip('medium', a.small|length ~ ' small group' ~ ('s' if a.small|length != 1 else '')) if a.small else chip('ok', 'All groups ≥ ' ~ cfg.model_min_group ~ ' rows')) }}
+{{ a.size_chart|safe }}
+{% if a.small %}<p class="plain small">Grey bars have fewer than {{ cfg.model_min_group }} rows: their rates can change a lot with one or two rows, so they are shown but never alerted.</p>{% endif %}
+</div>
+{% endfor %}
+<div class="tiny muted">Group sizes are derived from the stored rates (positive predictions × share ÷ selection rate), as the audit service does; the audit does not store counts per group.</div>
+{% if mb.link %}
+<div class="card" style="margin-top:3mm">
+{{ card_head('Link to the dataset bias findings', ('<span class="tiny muted">dataset report %s · model tested on %s</span>'|format(mb.link.dataset_version|e, mb.link.model_version|e))|safe) }}
+<table class="tbl small"><tr><th>Attribute</th><th>Dataset (labels)</th><th>Model (predictions)</th><th>Verdict</th></tr>
+{% for r in mb.link.rows %}<tr><td><b>{{ r.attr }}</b></td><td>{{ chip(r.dsev, 'Disparity' if r.dsev == 'high' else 'OK') }} {{ r.dataset }}</td><td>{{ r.model }}</td><td>{{ chip(r.st[0], r.st[1]) }}</td></tr>{% endfor %}</table>
+<p class="plain small">The dataset report measures bias in the <b>labels</b>; this report measures bias in the <b>model's predictions</b>. A disparity that “persists” was in the data and is still in the model.</p>
+</div>
+{% endif %}
+</section>
+
+{# ============================ M2 · SELECTION RATE ============================ #}
+<section class="page">
+<div class="sec"><span class="no">{{ mb_p }}2</span><h2>Who does the model predict as positive?</h2></div>
+<p class="plain" style="margin-top:0">For each group: the share that really is 1 in the test labels (○) and the share the model predicts as 1 (●). Then the predicted share as a ratio to the reference group: 1 = same rate, the green band ({{ band_txt }}) is the accepted range.</p>
+{% for a in mb.attributes %}{% set d = a.disparity|selectattr('metric', 'equalto', 'pprev')|first %}
+<div class="card">
+{{ card_head(a.name|capitalize ~ ': actual → predicted positive rate', chip('high', d.n_high ~ ' alert' ~ ('s' if d.n_high != 1 else '')) if d and d.n_high else chip('ok', 'No alert')) }}
+{{ a.shift|safe }}
+{% if d %}<div class="g-h" style="margin-top:2mm">Selection rate vs. {{ a.ref }} (ratio, log scale)</div>{{ d.chart|safe }}{% endif %}
+</div>
+{% endfor %}
+{{ meaning('If the predicted share moves further apart between groups than the actual share, the model widens the gap that was already in the data. A higher selection rate is not automatically good or bad: it depends on what a prediction of 1 means for the people concerned.') }}
+</section>
+
+{# ============================ M3 · ERROR RATES ============================ #}
+<section class="page">
+<div class="sec"><span class="no">{{ mb_p }}3</span><h2>Does the model make the same mistakes for every group?</h2></div>
+<p class="plain" style="margin-top:0"><b>False-positive rate</b>: of the rows that really are 0, the share wrongly predicted as 1 (higher = worse for the group). <b>True-positive rate</b>: of the rows that really are 1, the share the model catches (lower = worse). Bars start at 1 (same as the reference group); ▸ = value beyond the axis.</p>
+{% for a in mb.attributes %}
+<div class="card">
+{% set ne = a.disparity|rejectattr('metric', 'equalto', 'pprev')|sum(attribute='n_high') %}
+{{ card_head(a.name|capitalize ~ ' (reference: ' ~ a.ref ~ ')', chip('high', ne ~ ' alert' ~ ('s' if ne != 1 else '')) if ne else chip('ok', 'No alert')) }}
+{% for d in a.disparity if d.metric != 'pprev' %}
+<div class="g-h">{{ d.name }} vs. {{ a.ref }} <span class="muted">({{ 'higher is worse' if d.kind == 'error' else 'lower is worse' }})</span></div>{{ d.chart|safe }}
+{% for n in d.dir_notes %}<div class="tiny" style="margin:-1mm 0 1.5mm 30mm;color:#5B6472">→ {{ n }}</div>{% endfor %}
+{% endfor %}
+</div>
+{% endfor %}
+<div class="tiny muted">⚠ = fewer than {{ cfg.model_min_group }} rows (grey, not judged). Values shown on the right: ratio · group rate vs. reference rate.</div>
+</section>
+
+{# ============================ M4 · MATRIX + GLOSSARY ============================ #}
+<section class="page">
+<div class="sec"><span class="no">{{ mb_p }}4</span><h2>All fairness checks at a glance</h2></div>
+<p class="plain" style="margin-top:0">Each cell is the group's value divided by the reference group's value. Inside {{ band_txt }} = {{ chip('ok') }}. Pass/fail is derived by AutoDW from this range; the audit itself stores no pass/fail verdict.</p>
+{% for a in mb.attributes %}
+<div class="card">
+{{ card_head(a.name|capitalize ~ ' (reference: ' ~ a.ref ~ ')') }}
+<table class="mxt"><tr><th class="ml"></th>{% for gv in a.groups %}<th>{{ gv }}{% if gv in a.small|map('first')|list %} ⚠{% endif %}</th>{% endfor %}</tr>
+{% for row in a.matrix %}<tr><th class="ml">{{ row.name }}{% if row.metric in cfg.model_alert_metrics %} <span class="pill">alerted</span>{% endif %}</th>{% for c in row.cells %}{{ mcell(c) }}{% endfor %}</tr>{% endfor %}</table>
+</div>
+{% endfor %}
+<div class="tiny muted" style="margin-bottom:3mm">• = Aequitas marks the difference as statistically significant (shown for information; it does not change the colour). ⚠ grey = fewer than {{ cfg.model_min_group }} rows. Share of all positive predictions (ppr) is left out: it mostly reflects group size.</div>
+<div class="card">{{ card_head('What the metrics mean', '<span class="tiny muted">all are rates within one group</span>'|safe) }}
+<table class="gls">{% for row in mb.glossary|batch(2) %}<tr>{% for k, name, kind, text in row %}<td><b>{{ name }}</b> <span class="muted">· {{ k }} · {{ {'error': 'higher = worse', 'benefit': 'lower = worse', 'neutral': 'direction depends on use'}[kind] }}</span><br>{{ text }}</td>{% endfor %}</tr>{% endfor %}</table></div>
+</section>
+
+{# ============================ M5 · TECHNICAL ============================ #}
+<section class="page">
+<div class="sec"><span class="no">{{ mb_p }}5</span><h2>Technical details <span class="muted small">(for experts)</span></h2></div>
+{% if mb.caveats %}<div class="card"><div class="tech-h">Limits of this check</div><ul class="cav">{% for c in mb.caveats %}<li>{{ c }}</li>{% endfor %}</ul></div>{% endif %}
+<div class="tech"><div class="tech-h">Group metrics (report.metrics)</div>
+<table class="tbl tiny"><tr><th>Attribute</th><th>Group</th><th class="r">n*</th>{% for h in ['acc.', 'prev', 'pprev', 'ppr', 'tpr', 'tnr', 'fpr', 'fnr', 'prec.', 'fdr', 'for', 'npv'] %}<th class="r">{{ h }}</th>{% endfor %}</tr>
+{% for r in mb.tech_metrics %}<tr><td>{{ r.attr }}</td><td>{{ r.group }}</td><td class="r">{{ r.n if r.n is not none else '—' }}</td>{% for v in r.vals %}<td class="r">{{ '—' if v is none else '%.3f'|format(v) }}</td>{% endfor %}</tr>{% endfor %}</table>
+<div class="tiny muted">* derived: performance.pp × ppr ÷ pprev.</div></div>
+<div class="tech"><div class="tech-h">Disparities vs. reference group (report.disparities) · • = significant</div>
+<table class="tbl tiny"><tr><th>Attribute</th><th>Group</th>{% for h in ['pprev', 'ppr', 'tpr', 'tnr', 'fpr', 'fnr', 'prec.', 'fdr', 'for', 'npv'] %}<th class="r">{{ h }}</th>{% endfor %}</tr>
+{% for r in mb.tech_disp %}<tr><td>{{ r.attr }}</td><td>{{ r.group }}</td>{% for v in r.vals %}<td class="r">{{ '—' if v is none else '%.2f'|format(v) }}{{ ' •' if r.sig[loop.index0] }}</td>{% endfor %}</tr>{% endfor %}</table></div>
+<div class="tech"><div class="tech-h">Audit settings &amp; overall performance</div><div class="kv">
+{% for k, v in [('Audit id', mb.meta.audit_id), ('Scorer', mb.meta.scorer), ('Label mode', mb.meta.label_mode), ('Positive label', mb.meta.positive_label),
+  ('Rows', mb.meta.n_rows), ('Fair range', band_txt), ('Min. group size', cfg.model_min_group), ('Selection-rate min. gap', '%g'|format(cfg.model_pprev_min_gap * 100) ~ ' pts'),
+  ('tp / fp / fn / tn', [mb.perf.tp, mb.perf.fp, mb.perf.fn, mb.perf.tn]|join(' / ')), ('pp / pn', [mb.perf.pp, mb.perf.pn]|join(' / '))] %}<div><span>{{ k }}</span><b>{{ v }}</b></div>{% endfor %}</div></div>
+{% if mb.notes %}<div class="tech"><div class="tech-h">Notes from the audit</div>{% for n in mb.notes %}<p class="plain small">{{ n }}</p>{% endfor %}</div>{% endif %}
+</section>
+{% endif %}

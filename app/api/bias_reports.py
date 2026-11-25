@@ -14,7 +14,7 @@ from ..services.bias_report_service import bias_report_service
 from ..services.kafka_service import kafka_producer_service
 from ..services.transformation_report_service import transformation_report_service
 from ..services.fairness_profile import detect_protected_attribute_candidates
-from ..services.report_pdf import ReportConfig, build_report_pdf
+from ..services.report_pdf import ReportConfig, build_model_bias_pdf, build_report_pdf
 from ..services.model_bias_service import model_bias_service
 from ..models.model_bias import ModelBiasAuditRequest, ModelBiasAuditResponse
 from ..core.config import settings
@@ -60,6 +60,52 @@ async def get_model_bias_audit(user_id: str, model_id: str):
     if not found:
         raise HTTPException(status_code=404, detail=f"Model bias audit not found for model {model_id}")
     return found
+
+
+def _report_zone(tz: Optional[str]) -> str:
+    zone = tz or settings.report_timezone
+    try:
+        ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        raise HTTPException(status_code=400, detail=f"Unknown timezone: {zone}")
+    return zone
+
+
+@router.get(
+    "/model-audit/{user_id}/{model_id}/pdf",
+    response_class=Response,
+    responses={200: {"content": {"application/pdf": {}}}},
+)
+async def get_model_bias_pdf(
+    user_id: str,
+    model_id: str,
+    include_dataset_bias: bool = Query(True, description="Add the 'link to dataset bias findings' card when a dataset bias report exists"),
+    tz: Optional[str] = Query(None, description="IANA timezone for displayed timestamps (default: REPORT_TIMEZONE)"),
+    download: bool = Query(False, description="true = download attachment; false = inline"),
+):
+    """Render the latest stored Aequitas model bias audit for this model as a PDF."""
+    audit = await model_bias_service.get_latest(user_id, model_id)
+    if not audit:
+        raise HTTPException(status_code=404, detail=f"No model bias audit found for model {model_id}")
+    zone = _report_zone(tz)
+
+    bias_doc = None
+    if include_dataset_bias and audit.dataset_id:
+        bias = await bias_report_service.get_report(user_id, audit.dataset_id, None)   # latest version
+        bias_doc = bias.model_dump() if bias else None
+
+    audit_doc = audit.model_dump()
+    config = ReportConfig(timezone=zone)
+    try:
+        pdf = await anyio.to_thread.run_sync(lambda: build_model_bias_pdf(audit_doc, bias_doc, config=config))
+    except Exception as e:
+        logger.error(f"Failed to render model bias PDF: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to render model bias PDF")
+
+    fname = f"model_bias_{model_id}_{audit.model_version or 'latest'}.pdf"
+    disposition = "attachment" if download else "inline"
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'{disposition}; filename="{fname}"'})
 
 
 @router.post("/", response_model=BiasReportResponse)
@@ -165,6 +211,7 @@ async def get_bias_report_pdf(
     dataset_id: str,
     version: Optional[str] = Query(None, description="Dataset version of the bias report (default: latest)"),
     include_transformation: bool = Query(True, description="Merge the transformation report when one can be resolved"),
+    include_model_bias: bool = Query(False, description="Append the latest model bias audit trained on this dataset"),
     tz: Optional[str] = Query(None, description="IANA timezone for displayed timestamps (default: REPORT_TIMEZONE)"),
     download: bool = Query(False, description="true = download attachment; false = inline"),
 ):
@@ -175,11 +222,7 @@ async def get_bias_report_pdf(
     if not report:
         raise _bias_not_found(dataset_id, version)
 
-    zone = tz or settings.report_timezone
-    try:
-        ZoneInfo(zone)
-    except (ZoneInfoNotFoundError, ValueError, KeyError):
-        raise HTTPException(status_code=400, detail=f"Unknown timezone: {zone}")
+    zone = _report_zone(tz)
 
     transformation = None
     if include_transformation:
@@ -187,10 +230,14 @@ async def get_bias_report_pdf(
 
     bias_doc = report.model_dump()
     transformation_doc = transformation.model_dump() if transformation else None
+    model_doc = None
+    if include_model_bias:
+        audit = await model_bias_service.get_latest_for_dataset(user_id, dataset_id)
+        model_doc = audit.model_dump() if audit else None
     config = ReportConfig(timezone=zone)
     try:
         pdf = await anyio.to_thread.run_sync(
-            lambda: build_report_pdf(bias_doc, transformation_doc, config=config)
+            lambda: build_report_pdf(bias_doc, transformation_doc, config=config, model_bias=model_doc)
         )
     except Exception as e:
         logger.error(f"Failed to render bias report PDF: {e}", exc_info=True)

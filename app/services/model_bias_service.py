@@ -369,6 +369,17 @@ class ModelBiasService:
         doc["id"] = str(doc.pop("_id"))
         return _to_response(doc)
 
+    async def get_latest_for_dataset(self, user_id: str, dataset_id: str) -> Optional[ModelBiasAuditResponse]:
+        """Latest audit of any model trained/evaluated on this dataset (any dataset version)."""
+        doc = await self.collection.find_one(
+            {"user_id": user_id, "dataset_id": dataset_id},
+            sort=[("created_at", -1)],
+        )
+        if not doc:
+            return None
+        doc["id"] = str(doc.pop("_id"))
+        return _to_response(doc)
+
     async def _load_model(self, user_id: str, model_id: str, version: Optional[str]) -> dict:
         db = get_database()
         if version:

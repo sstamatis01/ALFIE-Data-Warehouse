@@ -211,3 +211,104 @@ def dumbbell(rows: Sequence[Tuple[str, float, float]], *, lo=-0.5, hi=None, w=64
         o += _t(X(tk), H + 14, str(tk), 9.5, "middle", C["mut"])
     o += _t(X(0), H + 28, "0 = symmetric · shaded = |skew| < 0.5 · dashed = 1", 9.5, col=C["mut"])
     return _svg(w, H + 34, o)
+
+
+# --------------------------------------------------------------------------- model bias (Aequitas)
+_STATUS_COL = {"high": C["high"], "medium": C["warn"], "notice": C["info"], "ok": C["ok"], "small": C["na"], "ref": C["mut"]}
+
+
+def disparity_bars(rows: Sequence[Tuple[str, Optional[float], str, str]], band: Tuple[float, float], *,
+                   lo: float = 0.125, hi: float = 8.0, w=640, label_w=130, value_w=120) -> str:
+    """Ratio vs reference group on a log2 axis centred on parity (1).
+
+    rows = (group label, disparity or None, status key, right-hand note). Bars start at 1.
+    Values outside [lo, hi] are clipped and drawn with an arrow; 0 is drawn as "0" at the left edge.
+    """
+    if not rows:
+        return ""
+    pw = w - label_w - value_w
+    rh = 19
+    h = len(rows) * rh + 30
+    L = math.log2
+
+    def X(v: float) -> float:
+        v = min(max(v, lo), hi)
+        return label_w + pw * (L(v) - L(lo)) / (L(hi) - L(lo))
+
+    o = f'<rect x="{X(band[0]):.1f}" y="0" width="{X(band[1]) - X(band[0]):.1f}" height="{h - 22}" fill="{C["band"]}"/>'
+    for b in band:
+        o += f'<line x1="{X(b):.1f}" x2="{X(b):.1f}" y1="0" y2="{h - 22}" stroke="{C["ok"]}" stroke-dasharray="3 2"/>'
+    o += f'<line x1="{X(1):.1f}" x2="{X(1):.1f}" y1="0" y2="{h - 22}" stroke="{C["ink"]}" stroke-width="1.2"/>'
+    for tk in (lo, 0.25, 0.5, band[0], 1, band[1], 2, 4, hi):
+        if lo <= tk <= hi:
+            on = tk in band or tk == 1
+            o += _t(X(tk), h - 8, f"{tk:g}" if tk >= 0.25 else f"≤{tk:g}" if tk == lo else f"{tk:g}", 9,
+                    "middle", C["ok"] if tk in band else (C["ink"] if tk == 1 else C["mut"]), 600 if on else 400)
+    for i, (k, v, st, note) in enumerate(rows):
+        y = i * rh + 6
+        col = _STATUS_COL.get(st, C["c1"])
+        o += _t(label_w - 8, y + 12, k, 10.5, "end", C["mut"] if st == "small" else None, 700 if st == "ref" else 400)
+        if v is None:
+            o += _t(X(1) + 6, y + 12, "not available", 9.5, col=C["mut"])
+        else:
+            x0, x1 = sorted((X(1), X(v)))
+            if st == "ref":
+                o += f'<circle cx="{X(1):.1f}" cy="{y + 8}" r="4" fill="{C["ink"]}"/>'
+            else:
+                op = "0.55" if st == "small" else "1"
+                o += f'<rect x="{x0:.1f}" y="{y + 2}" width="{max(x1 - x0, 2):.1f}" height="12" rx="2" fill="{col}" opacity="{op}"/>'
+                if v > hi or v < lo:
+                    ax = X(v)
+                    d = 6 if v > hi else -6
+                    o += f'<path d="M{ax:.1f},{y + 2} L{ax + d:.1f},{y + 8} L{ax:.1f},{y + 14} Z" fill="{col}"/>'
+        o += _t(w - 2, y + 12, note, 9.5, "end", col if st not in ("ref", "ok") else C["mut"], 600 if st in ("high", "notice") else 400)
+    return _svg(w, h, o)
+
+
+def rate_shift(rows: Sequence[Tuple[str, Optional[float], Optional[float], Optional[int], bool, bool]], *,
+               w=640, label_w=130, value_w=150) -> str:
+    """Actual positive rate (hollow) -> predicted positive rate (filled) per group, 0-100 %.
+
+    rows = (group, actual rate, predicted rate, n, is_reference, is_small).
+    """
+    if not rows:
+        return ""
+    pw = w - label_w - value_w
+    rh = 22
+    h = len(rows) * rh + 44
+    X = lambda v: label_w + pw * v
+    o = ""
+    for tk in (0, 0.25, 0.5, 0.75, 1):
+        o += f'<line x1="{X(tk):.1f}" x2="{X(tk):.1f}" y1="0" y2="{h - 36}" stroke="{C["grid"]}"/>'
+        o += _t(X(tk), h - 24, f"{int(tk * 100)}%", 9, "middle", C["mut"])
+    for i, (k, a, p, n, ref, small) in enumerate(rows):
+        y = i * rh + 10
+        op = "0.5" if small else "1"
+        o += _t(label_w - 8, y + 4, k + (" (ref.)" if ref else ""), 10.5, "end", C["mut"] if small else None, 700 if ref else 400)
+        if a is not None and p is not None:
+            o += f'<g opacity="{op}"><line x1="{X(a):.1f}" x2="{X(p):.1f}" y1="{y}" y2="{y}" stroke="{C["c1"]}" stroke-width="2.5"/>'
+            o += f'<circle cx="{X(a):.1f}" cy="{y}" r="5" fill="#fff" stroke="{C["c1"]}" stroke-width="2"/>'
+            o += f'<circle cx="{X(p):.1f}" cy="{y}" r="5" fill="{C["c1"]}"/></g>'
+            diff = (p - a) * 100
+            o += _t(w - 2, y + 4, f"{pct(a, 0)} → {pct(p, 0)} ({diff:+.0f} pts)" + (f" · n={n}" if n is not None else ""),
+                    9.5, "end", C["mut"], 400)
+    o += f'<circle cx="{label_w + 5}" cy="{h - 6}" r="4" fill="#fff" stroke="{C["c1"]}" stroke-width="2"/>' + _t(label_w + 13, h - 2, "actual positive rate (test labels)", 9, col=C["mut"])
+    o += f'<circle cx="{label_w + 205}" cy="{h - 6}" r="4" fill="{C["c1"]}"/>' + _t(label_w + 213, h - 2, "predicted positive rate (selection rate)", 9, col=C["mut"])
+    return _svg(w, h, o)
+
+
+def confusion(tp: int, fp: int, fn: int, tn: int, *, w=300) -> str:
+    """2x2 confusion matrix; correct cells green-tinted, error cells orange-tinted."""
+    cs = 92
+    x0, y0 = 110, 34
+    cells = [((0, 0), tp, "True positive", "#DFF3EC", C["ok"]), ((1, 0), fn, "False negative", "#FBE7DC", C["high"]),
+             ((0, 1), fp, "False positive", "#FBE7DC", C["high"]), ((1, 1), tn, "True negative", "#DFF3EC", C["ok"])]
+    o = _t(x0 + cs, 12, "Model predicted", 9.5, "middle", C["mut"], 600)
+    o += _t(x0 + cs / 2, 28, "positive (1)", 9, "middle", C["mut"]) + _t(x0 + cs * 1.5, 28, "negative (0)", 9, "middle", C["mut"])
+    o += _t(x0 - 8, y0 + cs / 2 + 4, "actual 1", 9.5, "end", C["mut"]) + _t(x0 - 8, y0 + cs * 1.5 + 4, "actual 0", 9.5, "end", C["mut"])
+    for (cx, cy), v, lab, bg, col in cells:
+        x, y = x0 + cx * cs, y0 + cy * cs
+        o += f'<rect x="{x}" y="{y}" width="{cs - 3}" height="{cs - 3}" rx="6" fill="{bg}" stroke="{col}"/>'
+        o += _t(x + cs / 2 - 1, y + cs / 2, f"{v:,}", 20, "middle", col, 800)
+        o += _t(x + cs / 2 - 1, y + cs / 2 + 18, lab, 8.5, "middle", C["mut"])
+    return _svg(w, y0 + 2 * cs + 4, o)

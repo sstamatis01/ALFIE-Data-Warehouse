@@ -6,4 +6,5 @@
 {% elif mitigation_without_report %}
 <section class="page"><div class="na-box"><b>Transformation report: not available.</b> The bias report says mitigation was performed, but the transformation report could not be loaded.</div></section>
 {% endif %}
+{% if mb %}{% set mb_first = False %}{% set mb_p = 'M' %}{% include "model_bias.html.j2" %}{% endif %}
 </body></html>
