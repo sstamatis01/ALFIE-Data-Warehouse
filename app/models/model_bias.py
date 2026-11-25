@@ -56,5 +56,6 @@ class ModelBiasAuditResponse(BaseModel):
     scorer: str
     n_rows: int
     report: Dict[str, Any]
+    alerts: List[str] = Field(default_factory=list)
     notes: List[str]
     created_at: datetime

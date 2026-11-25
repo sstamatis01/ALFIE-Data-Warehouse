@@ -26,7 +26,7 @@ from ..models.model_bias import ModelBiasAuditRequest, ModelBiasAuditResponse
 from ..utils.public_dataset_link import resolve_storage_path
 from .aequitas_audit import run_aequitas_audit
 from .ai_model_service import ai_model_service
-from .model_archive import safe_extract_zip, unpack_model_archives
+from .model_bias_alerts import build_model_bias_alerts, user_audit_note
 from .model_feature_align import restore_group_columns, select_scoring_frame
 from .bias_report_service import bias_report_service
 from .file_service import file_service
@@ -269,7 +269,7 @@ class ModelBiasService:
         candidates = await self._candidate_tables(request.user_id, dataset, eval_split, table)
         model_version = str(model.get("version") or "v1")
         try:
-            scores, scorer, scored_version, scored_frame, restored_groups = await self._score_model(
+            scores, scorer, scored_version, scored_frame, _restored_groups = await self._score_model(
                 request.user_id,
                 request.model_id,
                 model_version,
@@ -304,27 +304,31 @@ class ModelBiasService:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        notes = list(audited["notes"])
-        if eval_split:
-            notes.insert(0, f"Predictions were scored on the '{eval_split}' split.")
-        else:
-            notes.insert(0, "Predictions were scored on the full dataset table.")
-        notes.insert(1, "Aequitas compares prediction rates across groups. It does not read model weights.")
-        if scorer.startswith("autogluon"):
-            notes.append(
-                "The predictor Python-version check was skipped so a model saved on Python 3.12 can be scored by this API's Python 3.11."
-            )
-        if scored_version != dataset.version:
-            notes.append(
-                f"Scored {scored_version} instead of {dataset.version} because the model was trained on the mitigated columns. "
-                "ethnicity and gender were one-hot encoded, and some numeric columns were transformed."
-            )
-        if restored_groups:
-            notes.append(
-                "Rebuilt "
-                + ", ".join(restored_groups)
-                + f" from the one-hot columns on {scored_version} so the group labels match the dataset bias report."
-            )
+        context_notes = [
+            note
+            for note in audited["notes"]
+            if not note.startswith("Probabilities are turned")
+            and not note.startswith("Scores are already")
+            and not note.startswith("Statistical significance was skipped")
+        ]
+        hard_scores = any(note.startswith("Scores are already") for note in audited["notes"])
+        notes = [
+            user_audit_note(
+                n_rows=audited["n_rows"],
+                eval_split=eval_split,
+                mitigated=scored_version != dataset.version,
+                reference_groups=audited["reference_groups"],
+                score_threshold=request.score_threshold,
+                hard_scores=hard_scores,
+            ),
+            *context_notes,
+        ]
+        alerts = build_model_bias_alerts(
+            audited["metrics"],
+            audited["disparities"],
+            audited["reference_groups"],
+            audited["performance"],
+        )
 
         now = datetime.now(tz=timezone.utc)
         doc = {
@@ -344,7 +348,9 @@ class ModelBiasService:
                 "metrics": audited["metrics"],
                 "disparities": audited["disparities"],
                 "performance": audited["performance"],
+                "alerts": alerts,
             },
+            "alerts": alerts,
             "notes": notes,
             "created_at": now,
         }
@@ -498,6 +504,7 @@ def _to_response(doc: dict) -> ModelBiasAuditResponse:
         scorer=doc["scorer"],
         n_rows=doc["n_rows"],
         report=doc["report"],
+        alerts=list(doc.get("alerts") or doc.get("report", {}).get("alerts") or []),
         notes=doc["notes"],
         created_at=doc["created_at"],
     )
